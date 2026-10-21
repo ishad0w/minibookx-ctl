@@ -1,0 +1,2 @@
+# Hardware protocol, safety boundaries and review assumptions must stay explicit.
+too-many-arguments-threshold = 8

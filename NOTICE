@@ -1,0 +1,13 @@
+minibookx-ctl
+Copyright 2026 minibookx-ctl contributors
+
+Original project code and documentation are licensed under the Apache License, Version 2.0.
+The Linux-source RFC patch in contrib/i915 is distributed under MIT terms.
+Its affected upstream files retain Intel's 2018 and 2023 copyright and MIT
+notices; see contrib/i915/COPYING and contrib/i915/README.md.
+The project does not relicense the Linux kernel as a whole under Apache-2.0.
+This project is independent of CHUWI, Intel, ITE, Texas Instruments and systemd.
+Those names identify hardware or interfaces and do not imply endorsement.
+
+Static distributions include third-party code with its own notices and licenses.
+See THIRD_PARTY.md, packaging/licenses, and the matching dependency source archive.

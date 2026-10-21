@@ -1,0 +1,62 @@
+[Unit]
+Description=Bounded hardware control for the tested MiniBook X U300
+After=systemd-logind.service sys-kernel-debug.mount
+Requires=systemd-logind.service
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=notify
+NotifyAccess=all
+User=root
+Group=root
+ExecStartPre=/usr/local/bin/minibookx-ctl --prepare
+ExecStart=/usr/local/bin/minibookx-ctl --daemon --config /etc/minibookx-ctl/config.conf
+ExecStopPost=/usr/local/bin/minibookx-ctl --recover
+Restart=on-failure
+RestartSec=5s
+WatchdogSec=20s
+WatchdogSignal=SIGTERM
+# Guardian must receive a handled signal and send tablet OFF before destruction.
+TimeoutAbortSec=3s
+TimeoutStartSec=20s
+TimeoutStopSec=10s
+KillMode=control-group
+KillSignal=SIGTERM
+RuntimeDirectory=minibookx-ctl
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_MODULE
+# Preserve the intentional setuid capability through systemd seccomp setup.
+AmbientCapabilities=CAP_SETUID
+PrivateDevices=no
+InaccessiblePaths=/tmp /var/tmp
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ReadWritePaths=/run/minibookx-ctl
+# Keep /sys protected while allowing a late EC leaf in a root-only alias.
+BindPaths=-/sys/kernel/debug:/run/minibookx-ctl/hardware/debugfs
+ReadWritePaths=-/sys/module/ec_sys/parameters/write_support
+# Only the bounded broker can use these files. Configuration keeps power
+# control disabled by default; enabling it requires no additional unit files.
+ReadWritePaths=-/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw
+ReadWritePaths=-/sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw
+ReadWritePaths=-/sys/class/powercap/intel-rapl:0/constraint_2_power_limit_uw
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

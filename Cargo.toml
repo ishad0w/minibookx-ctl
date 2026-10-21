@@ -1,0 +1,27 @@
+[package]
+name = "minibookx-ctl"
+version = "0.1.1"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+description = "Bounded hardware control for the tested CHUWI MiniBook X U300 revision"
+
+[features]
+# Separate hardware-free VM fixture; never part of a normal or release build.
+systemd-test-fixture = []
+
+[[bin]]
+name = "minibookx-systemd-fixture"
+path = "tests/systemd/fixture.rs"
+required-features = ["systemd-test-fixture"]
+
+[dependencies]
+libc = "=0.2.189"
+dbus = { version = "=0.9.12", features = ["stdfd"] }
+serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = true

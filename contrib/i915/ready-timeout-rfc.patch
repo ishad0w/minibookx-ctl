@@ -1,0 +1,114 @@
+Subject: [RFC PATCH] drm/i915/dsi: Allow overriding the LINK_READY timeout
+X-Patch-License: MIT
+
+The gen11+ DSI enable sequence waits up to 2500 us for LINK_READY.
+On a Raptor Lake-U system, panel bring-up exceeds this wait and produces
+visible display corruption. A suspend/resume cycle restores normal output.
+
+Temporary instrumentation observed LINK_READY at 2702.432..2707.946 us
+from entry to the register wait in thirty panel-enable cycles. During a
+boot with the normal polling backoff, the bit was still clear at
+2560.080 us and was first observed set at 4825.256 us. These software
+observations motivate a longer wait; they are not electrical timing
+measurements or proof of the issue on every DSI implementation.
+
+Add a load-time dsi_link_ready_timeout_us display parameter to permit
+an explicit override without rebuilding the driver. Keep the existing
+2500 us default and polling mechanism. Clamp the effective value to
+2500..100000 us to prevent shorter waits and arbitrarily long timeouts.
+The maximum is a proposed policy limit, not a hardware-specification value.
+
+Do not add PCI or DMI matching. The wait completes when LINK_READY is
+observed instead of unconditionally sleeping for the selected timeout.
+
+Assisted-by: LLM
+---
+LOCAL RFC DRAFT. Not submitted. A human author and DCO sign-off must be
+supplied after review; no Signed-off-by or Fixes tag has been invented.
+
+Base: torvalds/linux 32c52ec87d6245ee2d12ed5dd509e40062939b50
+
+Testing and scope:
+- Timing data and runtime validation use downstream CachyOS, not vanilla
+  mainline or drm-tip. The timing instrumentation was removed afterwards.
+- Historical downstream parameter-based modules were tested at 10000 us
+  for boot, panel-enable cycles and S3. A separate 5000 us trial passed
+  one reboot and one S3/deep cycle; the owner confirmed clean output
+  before suspend and after resume. Binary hashes were unchanged during
+  that trial.
+- On 2026-10-21, the packaged CachyOS 7.2.11-1-cachyos i915 driver, without
+  the custom timeout parameter, passed one power-off/button-start test and
+  one supervised S3/deep suspend/resume cycle with an early 60 Hz VBT
+  override. The owner confirmed clean output and correct orientation;
+  the captured kernel journals contain no DSI link-ready failure.
+- Those stock-driver results apply to one U300 and panel. They do not
+  validate this RFC, establish repeated cold-start reliability, or prove
+  that changing refresh rate fixes every instance of the timeout issue.
+- On matching hardware, try the locally tested experimental 60 Hz mode
+  with stock i915 first. This unbuilt RFC remains a developer investigation
+  if that mode is unsuitable or startup corruption persists. No cold-start test
+  of the parameter-based patched module was performed.
+- This exact upstream-base patch passes apply/whitespace/checkpatch checks.
+  It has not been compiled or boot-tested; i915/xe build coverage is pending.
+- The available working-boot log uses normal verbosity. A fresh failing
+  upstream baseline with full DRM debug logging is still missing.
+
+Design questions for the reviewers:
+- Is a permanent opt-in module parameter appropriate, or is there a
+  correct automatic timeout/enable-sequence fix for this condition?
+- What requirement determines the current 2500 us bound?
+- Is 100000 us a suitable maximum? Should invalid values be rejected
+  rather than clamped?
+
+ drivers/gpu/drm/i915/display/icl_dsi.c              | 4 +++-
+ drivers/gpu/drm/i915/display/intel_display_params.c | 3 +++
+ drivers/gpu/drm/i915/display/intel_display_params.h | 1 +
+ 3 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/display/icl_dsi.c b/drivers/gpu/drm/i915/display/icl_dsi.c
+index ea0cdb7822f39f4d46e13f63858ab78055aed4f4..87fc3ae6d552dc793ab032074808369778128d67 100644
+--- a/drivers/gpu/drm/i915/display/icl_dsi.c
++++ b/drivers/gpu/drm/i915/display/icl_dsi.c
+@@ -858,13 +858,15 @@ gen11_dsi_configure_transcoder(struct intel_encoder *encoder,
+ 
+ 	/* wait for link ready */
+ 	for_each_dsi_port(port, intel_dsi->ports) {
++		unsigned int timeout_us = clamp_val(display->params.dsi_link_ready_timeout_us,
++						    2500, 100000);
+ 		int ret;
+ 
+ 		dsi_trans = dsi_port_to_transcoder(port);
+ 
+ 		ret = intel_de_wait_for_set_us(display,
+ 					       DSI_TRANS_FUNC_CONF(dsi_trans),
+-					       LINK_READY, 2500);
++					       LINK_READY, timeout_us);
+ 		if (ret)
+ 			drm_err(display->drm, "DSI link not ready\n");
+ 	}
+diff --git a/drivers/gpu/drm/i915/display/intel_display_params.c b/drivers/gpu/drm/i915/display/intel_display_params.c
+index ca0ef466bb1039fb3600d9b2136f639ba9e39a5a..b57f19fd0be3e52585b1b92500eafe484126fd0e 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_params.c
++++ b/drivers/gpu/drm/i915/display/intel_display_params.c
+@@ -143,6 +143,9 @@ intel_display_param_named_unsafe(enable_dmc_wl, int, 0400,
+ 	"(-1=use per-chip default, 0=disabled, 1=enabled, 2=match any register, 3=always locked) "
+ 	"Default: -1");
+ 
++intel_display_param_named_unsafe(dsi_link_ready_timeout_us, uint, 0400,
++				 "DSI LINK_READY timeout (us; default 2500; clamped 2500..100000)");
++
+ __maybe_unused
+ static void _param_print_bool(struct drm_printer *p, const char *driver_name,
+ 			      const char *name, bool val)
+diff --git a/drivers/gpu/drm/i915/display/intel_display_params.h b/drivers/gpu/drm/i915/display/intel_display_params.h
+index 16759e94c02536436b680974c96ac5ae9ff6e3b0..47e94b243632002b587474a217a3b462ae134ae2 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_params.h
++++ b/drivers/gpu/drm/i915/display/intel_display_params.h
+@@ -51,6 +51,7 @@ struct drm_printer;
+ 	param(bool, psr_safest_params, false, 0400) \
+ 	param(bool, enable_psr2_sel_fetch, true, 0400) \
+ 	param(int, enable_dmc_wl, -1, 0400) \
++	param(unsigned int, dsi_link_ready_timeout_us, 2500, 0400) \
+ 
+ #define MEMBER(T, member, ...) T member;
+ struct intel_display_params {

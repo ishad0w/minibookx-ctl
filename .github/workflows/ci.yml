@@ -1,0 +1,102 @@
+name: Check, build and release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build and verification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools build-essential pkg-config binutils libdbus-1-dev meson ninja-build shellcheck
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy --component rust-docs --target x86_64-unknown-linux-musl
+          rustc -Vv
+      - name: Native checks
+        run: make check
+      - name: RustSec advisory check
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit --deny warnings
+      - name: Build and test fully static x86_64 Linux executable
+        run: make static-test
+      - name: Package identified binary, notices and corresponding sources
+        run: |
+          make package
+          make verify-release COMMIT="$GITHUB_SHA"
+      - name: Upload checked artifacts from this run
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-x86_64-musl
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  distro-runtime:
+    needs: check-and-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [debian, ubuntu24, ubuntu, fedora43, fedora, arch, cachyos]
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download this commit's checked static build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: gh run download "$RUN_ID" --repo "$GH_REPO" --name linux-x86_64-musl --dir dist
+      - name: Check runtime prerequisites and binary installation in Docker
+        env:
+          DISTRO: ${{ matrix.distro }}
+        run: |
+          make verify-release COMMIT="$GITHUB_SHA"
+          chmod 755 dist/minibookx-ctl-x86_64-linux
+          MINIBOOKX_TEST_BINARY=$(realpath dist/minibookx-ctl-x86_64-linux) make distros DISTROS="$DISTRO"
+
+  publish:
+    if: github.repository == 'ishad0w/minibookx-ctl' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: [check-and-build, distro-runtime]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    concurrency:
+      group: publish-${{ github.repository }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download this run's checked artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GH_HOST: github.com
+          RUN_ID: ${{ github.run_id }}
+        run: gh run download "$RUN_ID" --repo "$GH_REPO" --name linux-x86_64-musl --dir dist
+      - name: Verify and publish this immutable build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_HOST: github.com
+        run: python3 scripts/publish_release.py --directory dist --commit "$GITHUB_SHA"

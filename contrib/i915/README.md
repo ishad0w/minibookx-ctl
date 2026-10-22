@@ -5,7 +5,7 @@ candidate, not a verified installation fix.** It has not been submitted upstream
 The controller installer never downloads, builds or installs kernel code.
 
 For the [tested panel](../../docs/hardware/README.md), start with the experimental
-[60 Hz setup using stock i915](../../docs/display-driver-fix.md). A different
+[60 Hz setup using stock i915](../../docs/guide/display.md). A different
 panel may not support these timings. If startup corruption persists, collect
 logs and investigate the readiness failure before choosing a driver change.
 Changing a timeout does not make an unsupported refresh rate usable.

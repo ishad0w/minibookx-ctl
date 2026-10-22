@@ -29,7 +29,7 @@ verification commands live in [AGENTS.md](AGENTS.md); user setup starts in the
 | [src/build_info.rs](src/build_info.rs) | Expose embedded build identity |
 
 For process ownership, startup choices and cleanup order, read
-[the service design](docs/design.md). The root broker owns hardware access; the
+[the service design](docs/development/design.md). The root broker owns hardware access; the
 worker parses configuration after dropping privileges; the guardian owns the
 tablet-switch descriptor. [SECURITY.md](SECURITY.md) describes the installer and
 runtime trust boundaries. Keep the required boundaries in
@@ -51,7 +51,7 @@ runtime trust boundaries. Keep the required boundaries in
 
 [Makefile](Makefile) is the normal command interface; `make help` lists its
 targets. Detailed build/release instructions are in
-[maintenance](docs/maintenance.md).
+[maintenance](docs/development/maintenance.md).
 
 | Path | Responsibility |
 |---|---|
@@ -68,20 +68,34 @@ targets. Detailed build/release instructions are in
 | [tests/fixtures/](tests/fixtures/) | Test-only inputs, including a low-duty simulation fixture |
 
 Container, VM and physical checks prove different things; see
-[evidence boundaries](docs/maintenance.md#evidence-boundaries). Generated
+[evidence boundaries](docs/development/maintenance.md#evidence-boundaries). Generated
 `target/` and `dist/` output is ignored and is not maintained source.
 
-## Manuals and hardware references
+## Documentation ownership
+
+User instructions live together in `docs/guide/`. Technical field descriptions
+and manual file installation belong in `docs/reference/`; hardware observations
+belong in `docs/hardware/`; source and release instructions belong in
+`docs/development/`. `docs/README.md` is the reader-facing index.
+
+Keep mutable facts in one place: shipped defaults in `config/presets.conf`,
+accepted ranges in the configuration reference, sensor timings in the sensor
+reference, and physical results in the hardware qualification record. Other
+pages should summarize and link. An explicitly illustrative config example or
+a dated test observation is not a second specification of current defaults.
 
 | Path | Contents |
 |---|---|
-| [docs/cachyos.md](docs/cachyos.md) | Ordered clean CachyOS/GNOME setup, linking the canonical manual procedures |
-| [packaging/README.md](packaging/README.md), [packaging/manual-install.md](packaging/manual-install.md) | Normal and fully manual installation, update, removal and rollback |
-| [docs/configuration.md](docs/configuration.md), [docs/diagnostics.md](docs/diagnostics.md) | Feature selection, profiles and report/status meanings |
-| [docs/tablet-mode.md](docs/tablet-mode.md) | Posture behavior, input recovery and desktop integration |
-| [docs/distributions.md](docs/distributions.md), [docs/gpu.md](docs/gpu.md) | Runtime/GPU packages and graphics troubleshooting |
-| [docs/display-driver-fix.md](docs/display-driver-fix.md) | Manual VBT, early firmware, refresh selection and validation |
+| [docs/guide/install.md](docs/guide/install.md) | Install, update, remove; runtime package commands by distribution |
+| [docs/guide/configuration.md](docs/guide/configuration.md) | Everyday fan/profile settings and optional power limits |
+| [docs/guide/tablet-mode.md](docs/guide/tablet-mode.md) | Folding, GNOME setup and Mutter requirements |
+| [docs/guide/display.md](docs/guide/display.md) | 60 Hz setup, native initramfs inclusion, validation and rollback |
+| [docs/guide/boot.md](docs/guide/boot.md) | Orientation and persistent arguments; optional appearance tips |
+| [docs/guide/graphics.md](docs/guide/graphics.md) | Intel acceleration packages by distribution |
+| [docs/guide/troubleshooting.md](docs/guide/troubleshooting.md) | First checks, recovery errors and issue reports |
+| [docs/reference/](docs/reference/) | Manual file installation, config/status semantics and kernel support |
 | [docs/hardware/](docs/hardware/) | Tested revision, EC, BIOS catalogue, charging and hardware evidence |
+| [docs/development/](docs/development/) | Architecture, builds, tests and releases |
+| [packaging/README.md](packaging/README.md), [docs/distributions.md](docs/distributions.md) | Short navigation pages retained for paths printed by existing binaries; no duplicate instructions |
 | [contrib/vbt/build_vbt.py](contrib/vbt/build_vbt.py) | Offline, identity-checked timing builder; does not install firmware |
-| [contrib/bootloaders/](contrib/bootloaders/) | Manual GRUB/Limine arguments, rotation and quiet startup |
 | [contrib/i915/](contrib/i915/) | Unbuilt developer RFC and its validation requirements; separate from the controller |

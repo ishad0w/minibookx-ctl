@@ -1,5 +1,7 @@
 # How the service works
 
+Developer reference. For setup, start with the [user guides](../README.md).
+
 The service separates hardware access from configuration and fan policy. It runs
 three single-threaded processes forked from the same executable, within one
 systemd service:
@@ -28,7 +30,7 @@ capabilities before becoming the policy worker, parsing config or connecting to
 D-Bus. Configuration
 can choose bounded settings, but cannot name commands, registers, device paths
 or privileged hooks. systemd further restricts capabilities and writable paths.
-See the [security model](../SECURITY.md) for the trust boundary.
+See the [security model](../../SECURITY.md) for the trust boundary.
 
 After parsing configuration, the worker sends one fixed startup choice to the
 broker. With `fan_control = false`, the broker does not prepare, open or access
@@ -53,31 +55,31 @@ Tablet events use the standard Linux `SW_TABLET_MODE` interface. libinput disabl
 the built-in keyboard and touchpad, and GNOME handles touch mode and its on-screen
 keyboard. The device-specific part is estimating posture from two accelerometers;
 a working firmware/kernel tablet switch could replace it. See
-[tablet mode](tablet-mode.md) for detection and its ambiguous positions.
+[posture sensors](../hardware/tablet-sensors.md) for detection and ambiguous positions.
 
 When enabled, fan control uses the EC's manual duty interface. No supported way
 to upload an autonomous fan curve is available, so the service reads temperature
-and adjusts duty while awake. The [EC reference](hardware/ec.md) defines the
-narrow write interface; the [BIOS guide](hardware/bios.md) explains the available firmware
+and adjusts duty while awake. The [EC reference](../hardware/ec.md) defines the
+narrow write interface; the [BIOS guide](../hardware/bios.md) explains the available firmware
 settings. Neither fan control nor tablet detection requires firmware flashing.
 
 ## Sampling and fan decisions
 
 With managed fan control enabled, the policy follows the
-[configured curve and delays](configuration.md#fan-profiles).
-With the shipped settings, it samples temperature every five seconds at stable
-cold idle and every second while heating, holding or running the fan. Identical
-config reloads preserve pending timers; profile changes preserve the emergency
-latch and the actual fan run time.
+[configured curve and delays](../reference/configuration.md#fan-settings).
+The worker uses the profile's idle sampling interval at stable cold idle and
+its active interval while heating, holding or running the fan. Defaults live in
+[the preset template](../../config/presets.conf). Identical config reloads
+preserve pending timers; profile changes preserve the emergency latch and the
+actual fan run time.
 
-The broker polls on a 250 ms bound. It reads posture at about 250 ms, CPU
-temperature about once a second during manual control, and EC health about every
-five seconds. The worker and broker have independent high-temperature guards.
+The broker polls on a 250 ms bound. It reads CPU temperature about once a second
+during manual control and EC health about every five seconds. Posture sampling
+and confirmation follow the [sensor timing rules](../hardware/tablet-sensors.md#detection).
+The worker and broker have independent high-temperature guards.
 The broker alone evaluates tachometer health and reports the result to the
 worker; the worker cannot suppress that check while managed fan control is
 active. In firmware fan mode there is no EC/tachometer or CPU-temperature polling.
-Posture confirmation uses the same 250 ms sampling interval and discards pending
-dwell after a gap longer than 750 ms.
 The broker reports its applied duty and emergency state in each reply, including
 when a repeated request caused no write. The worker uses that acknowledgement
 to track fan starts and latch its own emergency policy. A broker-only heat pulse
@@ -142,10 +144,9 @@ can send OFF.
 
 ### Base-sensor recovery
 
-The supported base accelerometer may boot with CONTROL `01` (power-down) or
-`00` (awake). After acquiring the hardware lock, the broker records `sensor.lease`
-before changing `01` to `00`. It waits 500 ms and discards the first sample
-before estimating posture. No reset, range or interrupt setting is changed.
+After acquiring the hardware lock, the broker records `sensor.lease` before
+waking a powered-down sensor. The accepted register states, wake sequence and
+startup delay are defined in [base-sensor initialization](../hardware/tablet-sensors.md#base-sensor-initialization).
 An already awake sensor needs no write or recovery record.
 
 Like the other records under `/run`, this ownership record lasts only for the
@@ -154,7 +155,7 @@ of power or reboot.
 
 The lease names a fixed hardware profile and original/applied bytes, never an
 arbitrary bus, path or register. Recovery rediscovers the device and verifies
-identity, ownership and current state before restoring `01`. A conflicting state
+identity, ownership and current state before restoring the recorded state. A conflicting state
 leaves the record for investigation. Sensor recovery also runs when startup
 failed before the fan/module lease existed, and its failure does not skip fan
 or power restoration.
@@ -177,7 +178,7 @@ operations are not atomic with other writers: an external change after a check
 can still race the write. Run only one power-limit controller.
 The single unit allow-lists the package's fixed power-limit files.
 Normal policy writes require `power_control = true` in the
-[configuration](configuration.md#optional-package-power-limits).
+[configuration](../guide/configuration.md#cpu-power-limits).
 
 The config opt-in controls normal policy; it is not a second security boundary
 against a compromised worker. The broker independently enforces the fixed
@@ -195,5 +196,5 @@ checks
 ownership, file type, links and size, then parses and reserializes JSON. This
 keeps worker-controlled output from becoming a privileged file read or terminal
 control sequence. The records update separately; their
-[field meanings](diagnostics.md#service-status) distinguish policy requests,
+[field meanings](../reference/diagnostics.md#service-status) distinguish policy requests,
 broker-applied duty, captured power baseline and current RAPL observations.

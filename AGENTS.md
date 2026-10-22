@@ -65,6 +65,14 @@ musl behavior when changing FFI, signals, file descriptors or C dependencies.
 Edit Markdown directly; do not generate README prose with Python or shell.
 Use Mermaid for architecture and lifecycle diagrams. Link the canonical document
 instead of duplicating curves, installation instructions or validation tables.
+Write user procedures in `docs/guide/`: explain the result, prerequisites,
+necessary actions, verification and rollback in plain language. Put distribution
+differences inside the relevant feature guide, not a second end-to-end walkthrough.
+Keep register maps, field semantics and test evidence in `docs/reference/` or
+`docs/hardware/`, and implementation/release details in `docs/development/`.
+Personal choices such as quiet boot, timeout and menu colors are optional tips,
+never required setup steps. Keep the installation path readable without the
+technical references; do not repeat defensive implementation details at every step.
 Keep observations, inferences and unknowns separate. Do not label downstream
 hardware tests as upstream-kernel tests or old development tests as new passes.
 Container checks cover runtime prerequisites, read-only reports, staged updates
@@ -77,20 +85,11 @@ hardware session/recovery model; it does not validate production lease guards,
 physical devices, RAPL or libinput behavior. Keep hardware qualification separate.
 
 Every new release must bump the patch version in `Cargo.toml` and `Cargo.lock`
-before its final commit, for example `0.1.1` → `0.1.2`. Main-branch publication
-is automatic, so a new release commit must not reuse a published version.
-Use `Release (v<major>.<minor>.<patch>)` for the release commit and release title,
-and `v<major>.<minor>.<patch>` for the tag. Tags do not contain a build hash.
+before its final commit. Follow the canonical
+[release procedure](docs/development/maintenance.md#release-files-and-versions)
+for commit/tag naming, build identity and publication checks. Never relabel an
+old binary or reuse a published version for different source.
 
-Release version and build identity are separate: the binary reports the Cargo
-version plus `+g` and the first 12 characters of the final Git commit; build
-metadata retains the full commit. Changing the commit message also changes that
-identity, so finalize the commit before building and publishing. Never relabel
-an older binary as a new commit or version.
-
-The main-branch workflow publishes only after checks pass, never overwrites a
-published build, and records the compiler and dependency input. History rewrites
-and removal of public release artifacts require an explicit human request;
-normal releases preserve earlier versions. Keep release permissions out of PR
-jobs. Any material change after validation must be checked again before
-publication.
+History rewrites and removal of public release artifacts require an explicit
+human request; normal releases preserve earlier versions. Keep release
+permissions out of PR jobs. Recheck material changes before publication.

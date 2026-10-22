@@ -17,7 +17,7 @@ implementation on this board.
 | Native tablet detection | IUER Slate Enable | Keep the daemon's detector; no working hinge-event source is established |
 | Quiet automatic fan curve | Active Trip Point / fan-speed fields | Use daemon profiles; these fields are not a verified editor for the EC curve |
 | Correct firmware screen direction | Screen Rotation Policy | Relevant only to preboot presentation; keep a known-good setting |
-| Fix boot artifacts or enable 60 Hz | Graphics / LCD fields | Use the separate [display guide](../display-driver-fix.md); no applicable readiness-timeout or panel-clock editor is established |
+| Fix boot artifacts or enable 60 Hz | Graphics / LCD fields | Use the separate [display guide](../guide/display.md); no applicable readiness-timeout or panel-clock editor is established |
 | Stop charging at 90% | Charging Method | Unsupported; Normal/Fast Charging is not a charge ceiling |
 
 ## CPU power limits
@@ -48,13 +48,13 @@ this CPU will accept.
 For example, an explicit 15 W package limit would use `15000` in a BIOS field
 that accepts milliwatts, while the daemon's config uses `15`. Choose one policy
 owner: if using daemon profiles, follow
-[optional package power limits](../configuration.md#optional-package-power-limits)
+[optional package power limits](../guide/configuration.md#cpu-power-limits)
 instead of layering unmeasured BIOS overrides and other power daemons.
 
 The tested laptop explicitly defines PL1/PL2 in BIOS. With the default
 `power_control = false`, the controller preserves that firmware/system policy.
 The configuration word `firmware` means captured RAPL before an override, not
-a direct BIOS Setup read. See [power diagnostics](../diagnostics.md#reading-power-diagnostics)
+a direct BIOS Setup read. See [power diagnostics](../reference/diagnostics.md#reading-power-diagnostics)
 for the distinction between saved values, current readings and enforcement.
 
 The parent CPU power-management page also offers `C states` and `Package C State
@@ -73,7 +73,7 @@ Open `Advanced → Thermal Configuration → Platform Thermal Configuration`.
 
 The EC's automatic curve is stored separately; see
 [firmware fan curve](ec.md#firmware-fan-curve). For quieter operation,
-use the [fan profiles](../configuration.md#fan-profiles), which have explicit PWM
+use the [fan profiles](../guide/configuration.md#fan-profiles), which have explicit PWM
 bounds and recovery behavior.
 
 ### How these fields reach Linux
@@ -157,7 +157,7 @@ ACPI mode setters can also change keyboard state; they are not hinge sensors and
 are not used by the daemon.
 
 There is no recommended BIOS change to replace
-[tablet detection](../tablet-mode.md). A replacement would need actual folding
+[tablet detection](tablet-sensors.md). A replacement would need actual folding
 events, correct startup and S3 state, and reliable input restoration with the
 daemon's tablet backend disabled.
 
@@ -166,18 +166,18 @@ daemon's tablet backend disabled.
 | Path | Setting | Use |
 |---|---|---|
 | `Boot` | Screen Rotation Policy | Normal, Right Rotation, Left Rotation or Reversion for firmware screen presentation |
-| `Advanced → Power & Performance → GT - Power Management Control` | RC6 (Render Standby) | Allows GPU idle power saving; check the [effective GPU state](../gpu.md) |
+| `Advanced → Power & Performance → GT - Power Management Control` | RC6 (Render Standby) | Allows GPU idle power saving; check the [effective GPU state](panel.md#read-only-inspection) |
 | `Advanced → OverClocking Performance Menu → GT` | GPU frequency fields | Generic ratio controls; their presence does not prove unlocked U300 GPU ratios |
 | `Chipset → System Agent (SA) Configuration → Graphics Configuration → LCD Control` | LCD type, scaling, color depth and backlight | Generic panel/VBIOS configuration; use the tested refresh profiles instead |
 
 Screen Rotation Policy affects preboot presentation separately from Linux panel
 orientation. It cannot repair i915 link-readiness failures or the
-[Mutter rotation bug](../tablet-mode.md#sideways-display-after-unfolding).
+[Mutter rotation bug](../guide/tablet-mode.md#setup).
 
 GPU frequency is independent of panel refresh rate. LCD-type entries include
 generic LVDS modes and should not be selected as experimental DSI timings.
 Display-backlight PWM controls also do not set the keyboard-backlight timeout.
-Use the [display guide](../display-driver-fix.md) for the supported refresh profiles.
+Use the [display guide](../guide/display.md) for the supported refresh profiles.
 
 ## Keyboard and charging choices
 

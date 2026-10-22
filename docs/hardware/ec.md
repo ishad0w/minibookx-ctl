@@ -3,7 +3,7 @@
 This reference describes the interface used by `minibookx-ctl` on the
 [supported hardware and firmware](README.md). Register meanings depend
 on the EC firmware; the controller model alone does not establish compatibility.
-Use the [configuration guide](../configuration.md#fan-profiles) to change the fan
+Use the [configuration guide](../guide/configuration.md#fan-profiles) to change the fan
 policy. Raw register access is not a user-facing feature.
 The [firmware reference](ec-firmware.md) records the matching code identity,
 address spaces and function offsets for developers investigating this revision.
@@ -14,7 +14,7 @@ When managed fan control is enabled, the daemon accesses the EC through Linux
 `ec_sys` at
 `/sys/kernel/debug/ec/ec0/io`. Its backend permits reads of six offsets and writes
 to only the duty register and the manual-control flag.
-With [`fan_control = false`](../configuration.md#leave-the-fan-under-firmware-control),
+With [`fan_control = false`](../guide/configuration.md#leave-the-fan-to-firmware),
 the service leaves the fan to firmware and does not open this interface. Pending
 recovery from an earlier managed session remains mandatory.
 
@@ -28,7 +28,7 @@ recovery from an earlier managed session remains mandatory.
 
 The EC temperature is quantized and retained between firmware updates. It does
 not measure heatsink, case or room temperature. The fan policy uses Linux
-`coretemp`; see [configuration](../configuration.md).
+`coretemp`; see [configuration](../guide/configuration.md).
 
 ## Taking and releasing control
 
@@ -112,4 +112,4 @@ protection mechanism.
 Run only one fan controller. The daemon's lock coordinates cooperating tools;
 kernel EC transaction serialization does not make a multi-register sequence
 atomic or protect against another raw writer. Process separation, monitoring and
-recovery are described in [architecture](../design.md).
+recovery are described in [architecture](../development/design.md).

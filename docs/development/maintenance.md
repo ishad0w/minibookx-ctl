@@ -1,6 +1,6 @@
 # Building and maintenance
 
-For installation and updates, use the [prebuilt release](../packaging/README.md).
+For installation and updates, use the [prebuilt release](../guide/install.md).
 This guide covers source builds, release artifacts and checks after system
 updates.
 
@@ -125,7 +125,7 @@ after relevant changes; it does not qualify a new build on the physical laptop.
 | Documented U300 observations | Physical behavior of the recorded software/device combination only |
 
 The current physical-check scope is recorded once in the
-[hardware qualification table](hardware/README.md#hardware-qualification).
+[hardware qualification table](../hardware/README.md#hardware-qualification).
 It distinguishes a controller reinstall from a clean OS installation and
 existing power-policy preservation from untested RAPL overrides.
 
@@ -144,6 +144,27 @@ Re-run the relevant checks after material changes. A VM pass does not qualify a
 new binary on the laptop, and older physical results do not become tests of the
 current checkout. A clean-OS hardware installation and live RAPL write/restore
 under the current unit remain separate qualifications.
+
+### Distribution matrix
+
+`make distros` uses these disposable images:
+
+| Distribution | Image |
+|---|---|
+| Debian 13 | `debian:13-slim` |
+| Ubuntu 24.04 | `ubuntu:24.04` |
+| Ubuntu 26.04 | `ubuntu:26.04` |
+| Fedora 43 | `fedora:43` |
+| Fedora 44 | `fedora:44` |
+| Arch | `archlinux:base` |
+| CachyOS | `cachyos/cachyos:latest` |
+
+Checks install runtime prerequisites, run reports, and exercise account/config
+validation, staged updates and removal with mocked service control. GPU checks
+query candidate metadata and request solver-only transactions; they do not install
+GPU packages. APT media alternatives are checked; Fedora uses its native stack.
+RPM Fusion transactions, codec coverage and real playback are not qualified.
+Python and diffutils are test tools, not runtime dependencies.
 
 ## Release files and versions
 
@@ -190,7 +211,7 @@ that tag's executable and checksums.
 
 Pull requests run checks without publishing. Main-branch builds publish only
 after the native checks, static build/tests, release validation and seven
-container suites pass. The [distribution matrix](distributions.md#what-ci-checks)
+container suites pass. The [distribution matrix](#distribution-matrix)
 lists their versions and scope. Every push to `main` is a release candidate;
 bump the patch version before pushing it. Published versions are immutable:
 retrying the exact same build can verify and resume it, but a different commit
@@ -221,7 +242,7 @@ Keep a working boot entry. Before relying on unattended control:
 5. Suspend and resume; check input and fan control again.
 
 If detection fails, leave the service stopped and compare the device with the
-[supported hardware](hardware/README.md). Do not bypass a revision check to make
+[supported hardware](../hardware/README.md). Do not bypass a revision check to make
 the service start. The same unit runs recovery after a stop or failure and
 before a restart; there is no separate recovery service.
 
@@ -229,12 +250,12 @@ Display modifications are maintained separately:
 
 | Change | Manual guide |
 |---|---|
-| VBT timing and early firmware | [Common manual procedure](display-driver-fix.md#manual-vbt-setup) |
-| i915 timeout investigation | [Unbuilt developer RFC](../contrib/i915/README.md) |
-| Boot menu, console orientation and quiet startup | [GRUB and Limine](../contrib/bootloaders/README.md) |
-| GNOME rotation behavior | [GNOME integration](tablet-mode.md) |
+| VBT timing and early firmware | [Display setup](../guide/display.md) |
+| i915 timeout investigation | [Unbuilt developer RFC](../../contrib/i915/README.md) |
+| Boot menu and console orientation | [Boot settings](../guide/boot.md) |
+| GNOME rotation behavior | [Tablet mode](../guide/tablet-mode.md) |
 
-Start with the [stock-driver 60 Hz setup](display-driver-fix.md) on the tested
+Start with the [stock-driver 60 Hz setup](../guide/display.md) on the tested
 panel. The supplied RFC is not a verified replacement module. Any independently
 qualified replacement must match the distribution
 kernel's exact source, configuration, headers, toolchain requirements and signing

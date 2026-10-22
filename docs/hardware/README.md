@@ -47,12 +47,12 @@ The clean-OS setup was checked on 22 October 2026 with these packages.
 The following supervised checks used a completely reinstalled CachyOS/GNOME
 system on 22 October 2026. Public `install.sh` installed controller build
 `0.1.0+gb1a8bccb67d0`; its binary matched the published checksum. The
-[walkthrough](../cachyos.md) links the manual steps used for desktop, display
-and boot configuration.
+[user guides](../README.md#user-guides) cover the separate desktop, display and
+boot configuration steps.
 
 The runtime implementation is retained for v0.1.1. These are physical results
 for the recorded build, not a new hardware test of the repackaged binary.
-Container and VM results remain [separate evidence](../maintenance.md#evidence-boundaries).
+Container and VM results remain [separate evidence](../development/maintenance.md#evidence-boundaries).
 
 | Check | Result |
 |---|---|
@@ -60,7 +60,7 @@ Container and VM results remain [separate evidence](../maintenance.md#evidence-b
 | Privilege separation | Worker has no effective capabilities, supplementary groups or raw EC/I2C/uinput descriptors; `NoNewPrivs` is enabled |
 | Base-sensor initialization | Starts from CONTROL `01`, wakes to `00` automatically; stopping restores `01` and clears ownership records; starting again detects folded posture |
 | Native display setup | Unmodified packaged kernel/i915; 1200×1920 at 165920 kHz / approximately 60 Hz, RGB888 / 24 bpp; ordinary mkinitcpio inclusion and generated Limine entries |
-| Panel mounting and boot menu | Correct panel mounting and Mutter 51.1; native 90° Limine menu without stretching; final quiet black setup has a one-second timeout |
+| Panel mounting and boot menu | Correct panel mounting and Mutter 51.1; native 90° Limine menu without stretching |
 | Cold power-off/button start | Service starts automatically; clean, correctly oriented login screen before any sleep |
 | Ordinary laptop and approximately flat | Built-in keyboard and touchpad remain usable near 180°; the estimate is not a calibrated hinge measurement |
 | Tent and folded tablet | Built-in input is inhibited; touchscreen, folded landscape/portrait rotation and on-screen keyboard work |
@@ -76,8 +76,9 @@ does not establish a failed resume. This timing is one observation, not a
 latency guarantee.
 
 The LTS 50 Hz profile's arguments, images and hashes were checked, but that LTS
-boot was not physically repeated in this session. The final quiet cold boot
-passed; Esc was not separately pressed in the new one-second window. The
+boot was not physically repeated in this session. The owner's optional quiet
+black menu with a one-second timeout passed a cold boot; Esc was not separately
+pressed in that final window. These appearance choices are not prerequisites. The
 `fan_control = false` startup path, RAPL overrides, raised limits and all
 high-temperature fan stages remain outside this physical qualification.
 
@@ -86,9 +87,9 @@ high-temperature fan stages remain outside this physical qualification.
 | Feature | Status |
 |---|---|
 | Fan profiles | Supported; higher-temperature stages have not all been load-tested |
-| Tablet input and GNOME on-screen keyboard | Supported; see [tablet mode](../tablet-mode.md) |
+| Tablet input and GNOME on-screen keyboard | Supported; see [tablet mode](../guide/tablet-mode.md) |
 | Deep/S3 suspend | Supported; fan control returns to firmware before sleep |
-| Display fixes | Separate manual setup; see the [display guide](../gpu.md) |
+| Display fixes | Separate manual setup; see the [display guide](../guide/display.md) |
 | PL1/PL2 control | Optional; disabled by default. Existing-policy preservation is checked above; live overrides/restoration and raised limits remain untested on the hardware |
 | PL4, voltage and GPU-frequency control | Not implemented |
 | Battery charge limit | Not implemented; see [battery and charging](charging.md) |
@@ -98,7 +99,7 @@ Suspend can log `xHC error in resume, USBSTS 0x401, Reinit` for USB controller
 `0000:00:0d.0`. The controller reinitializes; this is separate from the DSI display
 issue. Physical operation on other distributions and desktop environments has
 not been tested; package/container checks are listed separately in
-[distribution setup](../distributions.md).
+[distribution test matrix](../development/maintenance.md#distribution-matrix).
 
 ## Firmware and controllers
 
@@ -109,6 +110,8 @@ not been tested; package/container checks are listed separately in
 | [BIOS settings](bios.md) | Debug Mode, menu paths, power limits, thermal policy and input settings |
 | [Complete BIOS option catalogue](bios.md#complete-setup-option-catalogue) | Searchable CSV of the captured Setup definitions, including hidden and diagnostic controls |
 | [Battery and charging](charging.md) | Available battery data, charger identity and charge-limit support |
+| [Panel and graphics](panel.md) | Timing tables, fixed modes, i915 and graphics power features |
+| [Posture sensors](tablet-sensors.md) | Detection thresholds, sensor startup and desktop interface |
 
 These references describe the implemented interfaces and useful firmware
 findings. The BIOS catalogue contains static option definitions, not saved

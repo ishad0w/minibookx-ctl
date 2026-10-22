@@ -1,40 +1,42 @@
 # Documentation
 
-New CachyOS/GNOME installation? Start with the
-[clean-install walkthrough](cachyos.md). It orders the controller, desktop,
-60 Hz and Limine instructions used on the tested U300.
+Start with **[installation](guide/install.md)**. Then choose the features or
+fixes you need. Fan control and tablet detection come with the service; display,
+desktop and bootloader changes are manual.
 
-## Choose what to set up
+## User guides
 
-The controller, desktop settings and display fixes are separate choices. Use
-only the features you need; installing the controller does not apply the other
-changes in this checklist.
-
-| Task | Manual guide |
+| I want to… | Guide |
 |---|---|
-| Set up a fresh CachyOS/GNOME installation | [Complete walkthrough](cachyos.md) |
-| Install, update or remove the controller | [Normal installation](../packaging/README.md), or [copy the binary, account and unit yourself](../packaging/manual-install.md) |
-| Keep the fan under firmware control | [Disable managed fan control](configuration.md#leave-the-fan-under-firmware-control) while retaining tablet detection |
-| Select or tune a fan profile | [Profiles, curves and delays](configuration.md#fan-profiles) |
-| Opt into CPU power limits | [PL1/PL2 settings](configuration.md#optional-package-power-limits); disabled by default |
-| Disable built-in input when folded; use rotation and the on-screen keyboard | [Desktop and tablet mode](tablet-mode.md) |
-| Correct sideways orientation after unfolding | [Panel mounting and compositor requirements](tablet-mode.md#sideways-display-after-unfolding) |
-| Try 59.94/60 Hz and address startup corruption | [VBT, early firmware and boot arguments](display-driver-fix.md#manual-vbt-setup) |
-| Rotate the boot menu/console or make startup quiet | [GRUB and Limine](../contrib/bootloaders/README.md) |
-| Install Intel graphics and video-decoding packages | [Distribution setup](distributions.md#intel-graphics-and-hardware-video-decoding) |
-| Investigate corruption that remains at 60 Hz | [i915 developer RFC](../contrib/i915/README.md); an unbuilt proposal, not an installable fix |
-| Check what is actually running | [Doctor, Debug and service status](diagnostics.md) |
+| Install, update or remove the utility | [Installation](guide/install.md) |
+| Change fan behavior or CPU power limits | [Configuration](guide/configuration.md) |
+| Use the laptop as a tablet | [Tablet mode and GNOME](guide/tablet-mode.md) |
+| Try 60 Hz or fix startup display corruption | [Display setup](guide/display.md) |
+| Correct screen, console or boot-menu orientation | [Boot settings](guide/boot.md) |
+| Check Intel video acceleration and packages | [Graphics](guide/graphics.md) |
+| Find out why something is not working | [Troubleshooting](guide/troubleshooting.md) |
 
-Begin with the [runtime prerequisites](distributions.md#runtime-packages). For
-display problems, [choose the relevant graphics guide](gpu.md#choose-the-right-fix)
-before changing panel or kernel settings.
+Each guide includes distribution-specific steps where needed. Quiet startup,
+menu colors and timeout are [optional preferences](guide/boot.md#optional-appearance).
 
-## Hardware and development
+## Technical reference
 
-| Guide | Contents |
+For custom installations and a closer look at the hardware or reported values.
+You do not need to read these to use the controller.
+
+| Reference | Contents |
 |---|---|
-| [Hardware reference](hardware/README.md) | Tested revision, EC, BIOS and charging |
-| [Building and maintenance](maintenance.md) | Source builds, release artifacts, CI scope and system updates |
-| [Service architecture](design.md) | Privilege boundaries, hardware ownership and recovery |
-| [Security](../SECURITY.md) | Installer trust and vulnerability reporting |
-| [Third-party licenses](../THIRD_PARTY.md) | Bundled notices and corresponding sources |
+| [Manual file installation](reference/manual-install.md) | Account, file permissions, systemd unit and manual updates |
+| [Configuration keys](reference/configuration.md) | Accepted values, timers and power-limit semantics |
+| [Diagnostic fields](reference/diagnostics.md) | Status records, readback and their limits |
+| [Kernel requirements](reference/kernel-support.md) | EC access, driver availability and debugfs |
+| [Hardware](hardware/README.md) | Tested revision and software, physical test results, BIOS, EC and charging |
+| [Panel](hardware/panel.md) | Timings, VBT, i915 readiness, GuC/HuC and FBC |
+| [Posture sensors](hardware/tablet-sensors.md) | Detection, ambiguous positions and sensor initialization |
+
+## Development
+
+- [Architecture and recovery](development/design.md)
+- [Building, testing and releases](development/maintenance.md)
+- [i915 timeout RFC](../contrib/i915/README.md) — an unbuilt developer proposal
+- [Security](../SECURITY.md)

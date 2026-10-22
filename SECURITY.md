@@ -21,12 +21,12 @@ directory for lazy EC setup; `/sys` remains protected by the unit. It uses that
 alias only when it identifies the canonical debugfs source. Its fixed register
 implementation remains part of the trust boundary; the worker cannot traverse
 the private parent and receives neither raw descriptors nor capabilities. See
-[feature setup](docs/configuration.md#leave-the-fan-under-firmware-control)
+[feature setup](docs/guide/configuration.md#leave-the-fan-to-firmware)
 for firmware fan mode.
 
 Hardware operations are restricted to the supported profile and fixed protocol.
 The broker and guardian remain trusted components. See the
-[architecture](docs/design.md) for their responsibilities and recovery behavior.
+[architecture](docs/development/design.md) for their responsibilities and recovery behavior.
 
 ## Installer trust
 
@@ -46,6 +46,13 @@ privileges removed. It installs that same validated snapshot. It then stops the
 controller and requires recovery before replacing its
 executable. Staging with `--destdir` does not change live services or accounts.
 
+An invalid saved config blocks an update before stopping the old service.
+A recovery failure keeps the old files in place; a later copy or startup failure
+attempts to restore those files and the previous service state. This rollback
+does not survive power loss or SIGKILL during installation. Keep an independent
+[manual backup](docs/reference/manual-install.md#manual-updates) when needed.
+Local systemd drop-ins remain the administrator's responsibility.
+
 The bootstrap, installer and daemon do not install packages, download drivers,
 compile modules or edit boot files. Doctor can query the installed package
 database through fixed read-only commands; privileged reports run those queries
@@ -60,7 +67,7 @@ release for independent review.
 
 Systemd runs recovery through the same unit after a stop or failure and before
 a restart. Recovery records remain root-owned and are retained when restoration
-fails. The [service design](docs/design.md#recovery-and-sleep) defines its recovery
+fails. The [service design](docs/development/design.md#recovery-and-sleep) defines its recovery
 guarantees and hardware failure limits. Keep hardware thermal protection enabled.
 Update and recovery procedures are in the
-[installation guide](packaging/README.md).
+[installation guide](docs/guide/install.md).

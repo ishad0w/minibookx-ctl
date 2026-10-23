@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import os
 import signal
+import socket
 import subprocess
 import time
 import traceback
@@ -78,10 +79,130 @@ def stopped():
     assert events()[-1] == "0", events()
 
 
-def start():
+def start(tablet=True):
     command("systemctl", "start", UNIT)
     wait_for(started, "service did not become ready")
-    wait_for(lambda: events() and events()[-1] == "1", "tablet ON was not delivered")
+    if tablet:
+        wait_for(lambda: events() and events()[-1] == "1", "tablet ON was not delivered")
+
+
+def reads(pid, operation):
+    for directory in (ROOT, ROOT / "policy"):
+        try:
+            return (directory / f"reads-{pid}").read_text().splitlines().count(operation)
+        except FileNotFoundError:
+            pass
+    return 0
+
+
+def fd_links(pid):
+    links = []
+    for fd in Path(f"/proc/{pid}/fd").iterdir():
+        try:
+            links.append(os.readlink(fd))
+        except FileNotFoundError:
+            pass  # The live worker may close an unrelated status/config file.
+    return links
+
+
+def lid_checks(main):
+    # The broker opens the source after both forks; neither child receives it.
+    inode = next(
+        line.split()[6]
+        for line in Path("/proc/net/unix").read_text().splitlines()
+        if line.endswith(str(ROOT / "lid-events"))
+    )
+    link = f"socket:[{inode}]"
+    assert link in fd_links(main)
+    children = Path(f"/proc/{main}/task/{main}/children").read_text().split()
+    for pid in children:
+        assert link not in fd_links(pid)
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as source:
+        def notify(state):
+            (ROOT / "lid-state").write_text(state)
+            source.sendto(b"event", str(ROOT / "lid-events"))
+
+        notify("closed")
+        wait_for(lambda: events()[-1] == "0", "closed lid did not release tablet")
+        notify("open")
+        wait_for(lambda: events()[-1] == "1", "open lid did not restore posture detection")
+
+        # Frequent unrelated readable-FD wakes must not multiply sensor reads.
+        before = reads(main, "posture")
+        event_count = len(events())
+        started_at = time.monotonic()
+        for _ in range(60):
+            notify("open")
+            time.sleep(0.02)
+        elapsed = time.monotonic() - started_at
+        samples = reads(main, "posture") - before
+        assert 2 <= samples <= int(elapsed / 0.25) + 2, (elapsed, samples)
+        assert len(events()) == event_count, events()[event_count:]
+        print(
+            f"VM_OPERATIONS lid_events=60 elapsed_s={elapsed:.3f} "
+            f"posture_samples={samples} repeated_tablet_commands=0",
+            flush=True,
+        )
+        print("VM_ASSERT PASS lid transitions, descriptor isolation, bounded early-wake sampling", flush=True)
+
+    # Moving -> Valid changes diagnostics while the confirmed tablet bool stays ON.
+    for rotated in (True, False):
+        before = reads(main, "posture")
+        marker = ROOT / "posture-rotated"
+        marker.touch() if rotated else marker.unlink()
+        wait_for(lambda: reads(main, "posture") >= before + 3, "posture sampling stalled")
+        assert len(events()) == event_count, events()[event_count:]
+    print("VM_ASSERT PASS diagnostic changes do not repeat tablet commands", flush=True)
+
+
+def no_tablet_fanless():
+    original = CONFIG.read_text()
+    CONFIG.write_text(original.replace("fan_control = true", "fan_control = false", 1))
+    (ROOT / "forbid-ec").touch()
+    (ROOT / "no-tablet").touch()
+    (ROOT / "lid-events").unlink(missing_ok=True)
+    start(tablet=False)
+    main = int(props()["MainPID"])
+    policy = worker(main)
+    before = len(events())
+    time.sleep(1.3)
+    assert reads(main, "cpu") == reads(main, "posture") == reads(policy, "cpu") == 0
+    assert not (ROOT / "lid-events").exists()
+    assert len(events()) == before
+    print("VM_OPERATIONS no_tablet_fanless_cpu_reads=0 posture_samples=0", flush=True)
+    command("systemctl", "stop", UNIT)
+    assert props()["ActiveState"] == "inactive"
+    assert not (ROOT / "module.lease").exists()
+    (ROOT / "no-tablet").unlink()
+    (ROOT / "forbid-ec").unlink()
+    CONFIG.write_text(original)
+    print("VM_ASSERT PASS no-tablet and fanless need no lid/posture/temperature access", flush=True)
+
+
+def independent_thermal_guard():
+    start()
+    main = int(props()["MainPID"])
+    policy = worker(main)
+    before = reads(main, "cpu")
+    os.kill(policy, signal.SIGSTOP)
+    try:
+        (ROOT / "temperature").write_text("97000")
+        raised_at = time.monotonic()
+        wait_for(lambda: EC.read_bytes()[0x4B] == 74, "broker thermal guard waited for worker", 2)
+        assert reads(main, "cpu") > before
+        assert props()["MainPID"] == str(main)
+        print(
+            f"VM_OPERATIONS stopped_worker_cpu_reads={reads(main, 'cpu') - before} "
+            f"thermal_response_s={time.monotonic() - raised_at:.3f}",
+            flush=True,
+        )
+    finally:
+        os.kill(policy, signal.SIGCONT)
+        (ROOT / "temperature").unlink(missing_ok=True)
+        command("systemctl", "stop", UNIT)
+    stopped()
+    print("VM_ASSERT PASS independent thermal deadline with stopped worker", flush=True)
 
 
 def fanless():
@@ -94,6 +215,7 @@ def fanless():
     start()
     main = int(props()["MainPID"])
     worker(main)
+    lid_checks(main)
     snapshot = json.loads((ROOT / "policy/status.json").read_text())
     fan = json.loads((ROOT / "fan.json").read_text())
     assert snapshot["accepted_config"]["fan_control"] is False, snapshot
@@ -211,6 +333,7 @@ def run():
     assert command("systemctl", "is-active", "sys-kernel-debug.mount", check=False) == "inactive"
     assert not EC.exists()
     fanless()
+    no_tablet_fanless()
     assert command("systemctl", "is-active", "sys-kernel-debug.mount", check=False) == "inactive"
     print("VM_ASSERT PASS fanless unit does not require a mounted debugfs", flush=True)
     # No hardware is passed through. This guest-only filesystem stands in for
@@ -229,6 +352,7 @@ def run():
     command("systemctl", "stop", UNIT)
     stopped()
     print("VM_ASSERT PASS stop, ExecStopPost, fan auto, tablet OFF", flush=True)
+    independent_thermal_guard()
     fail_and_restart("worker SIGKILL", "worker", signal.SIGKILL)
     fail_and_restart("broker SIGKILL", "broker", signal.SIGKILL)
     fail_and_restart("systemd watchdog after worker SIGSTOP", "worker", signal.SIGSTOP)

@@ -106,6 +106,11 @@ error still fails shutdown. Final records may remain, but ordinary status
 reports the stopped state rather than presenting them as live. See
 [tablet recovery](../development/design.md#tablet-switch-recovery).
 
+While running, actual tablet-mode transitions update the tablet record
+immediately. Angle, reliability and reason changes are coalesced into snapshots
+at most five seconds apart; diagnostic churn does not send another switch
+command. Errors still trigger immediate OFF and recovery.
+
 ## Suspend mode
 
 To inspect the selected Linux sleep mode without suspending:

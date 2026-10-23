@@ -19,6 +19,7 @@ verification commands live in [AGENTS.md](AGENTS.md); user setup starts in the
 | [src/power.rs](src/power.rs) | Opt-in bounded PL1/PL2 writes, readback and journaled restoration |
 | [src/rapl.rs](src/rapl.rs) | Shared read-only RAPL package/constraint recognition and observations |
 | [src/tablet.rs](src/tablet.rs) | Revision-specific posture sensors, estimator and virtual tablet switch |
+| [src/lid.rs](src/lid.rs) | Read-only evdev lid identity, notifications, queue recovery and current-state synchronization |
 | [src/tablet/power.rs](src/tablet/power.rs) | Fixed base-sensor wake/restore transaction and bounded ownership journal |
 | [src/systemd.rs](src/systemd.rs) | logind D-Bus, delay inhibitor, systemd notifications, signals and config watches |
 | [src/sensor.rs](src/sensor.rs), [src/thermal.rs](src/thermal.rs) | CPU temperature readings and read-only thermal-capability inventory |

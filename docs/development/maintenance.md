@@ -110,8 +110,10 @@ production hardware lease/recovery guards, libinput consumption, panel output
 or suspend hardware. Production lease and hardware recovery checks remain covered
 by their filesystem/unit tests, not by this VM substitution.
 
-The current 17-assertion suite passed on Debian 13/systemd 257.13 with a prebuilt
-Linux 6.12 guest kernel and KVM. That result covers the fake hardware model and
+The suite also checks lid-event integration and descriptor
+isolation, bounded sampling under early wakes, diagnostic command suppression,
+fanless/no-tablet operation and thermal protection with a stopped worker.
+It covers the fake hardware model and
 namespace mechanics above, not real late loading of `ec_sys`. Re-run the suite
 after relevant changes; it does not qualify a new build on the physical laptop.
 
@@ -175,10 +177,10 @@ minibookx-ctl --build-info
 
 The release version comes from `Cargo.toml`. Each published release increments
 its patch version, with the matching change in `Cargo.lock`. For example,
-`0.1.1` uses commit title **`Release (v0.1.1)`**, tag **`v0.1.1`** and GitHub
-release title **`Release (v0.1.1)`**. Tags use a `v` prefix and no hash suffix.
+`0.1.2` uses commit title **`Release (v0.1.2)`**, tag **`v0.1.2`** and GitHub
+release title **`Release (v0.1.2)`**. Tags use a `v` prefix and no hash suffix.
 
-The executable still reports `0.1.1+g<commit>`, using the source commit's first
+The executable still reports `0.1.2+g<commit>`, using the source commit's first
 12 characters. Asset filenames keep the same build identity; metadata records
 the full commit, compiler and static libdbus identity. Make the final commit
 before building: changing even its message changes the hash and requires a new
@@ -189,8 +191,8 @@ Each release contains five assets:
 | Asset | Contents |
 |---|---|
 | `minibookx-ctl-x86_64-linux` | Static executable used by the bootstrap |
-| `minibookx-ctl-0.1.1-<commit>-x86_64-unknown-linux-musl.tar.gz` | Executable, configuration template, service, documentation and notices |
-| `minibookx-ctl-0.1.1-<commit>-sources.tar.gz` | Corresponding source, locked Cargo dependencies and pinned libdbus source |
+| `minibookx-ctl-0.1.2-<commit>-x86_64-unknown-linux-musl.tar.gz` | Executable, configuration template, service, documentation and notices |
+| `minibookx-ctl-0.1.2-<commit>-sources.tar.gz` | Corresponding source, locked Cargo dependencies and pinned libdbus source |
 | `build-metadata.json` | Build and source identity |
 | `SHA256SUMS` | Checksums of the other four assets |
 
@@ -239,7 +241,8 @@ Keep a working boot entry. Before relying on unattended control:
 2. Stop it and confirm that firmware fan control returns.
 3. Start it again and check the selected profile and observed power limits.
 4. Fold and unfold the laptop; check keyboard, touchpad and screen orientation.
-5. Suspend and resume; check input and fan control again.
+5. Close and open the lid; check the expected sleep/wake behavior.
+6. Suspend and resume; check input and fan control again.
 
 If detection fails, leave the service stopped and compare the device with the
 [supported hardware](../hardware/README.md). Do not bypass a revision check to make

@@ -5,6 +5,7 @@ pub mod ec;
 pub mod hardware;
 pub mod install;
 pub mod ipc;
+pub(crate) mod lid;
 pub mod paths;
 pub(crate) mod platform;
 pub mod policy;

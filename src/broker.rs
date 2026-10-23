@@ -6,10 +6,14 @@
 use crate::{
     ec, hardware,
     ipc::{REQUEST_BYTES, Reply, Request, TachState},
+    lid::Lid,
     power::Manager,
     sensor::CpuSensor,
     service,
-    tablet::{EstimatorConfig, HingeEstimator, SAMPLE_INTERVAL, Sensors, VirtualSwitch},
+    tablet::{
+        Estimate, EstimateReason, EstimatorConfig, HingeEstimator, SAMPLE_INTERVAL, Sensors,
+        VirtualSwitch,
+    },
 };
 use std::{
     ffi::CString,
@@ -39,6 +43,117 @@ struct EmergencyGuard {
 
 const FAN_HEALTH_INTERVAL: Duration = Duration::from_secs(5);
 const TACH_GRACE: Duration = Duration::from_secs(10);
+const CPU_INTERVAL: Duration = Duration::from_secs(1);
+const CHILD_INTERVAL: Duration = Duration::from_secs(1);
+const DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Independent monotonic deadlines: an IPC or lid event cannot advance another
+/// source's cadence. Skip missed slots rather than replaying stale samples.
+struct Periodic {
+    next: Duration,
+    interval: Duration,
+}
+impl Periodic {
+    fn new(now: Duration, interval: Duration) -> Self {
+        Self {
+            next: now + interval,
+            interval,
+        }
+    }
+    fn take(&mut self, now: Duration) -> bool {
+        if now < self.next {
+            return false;
+        }
+        // All intervals are fixed, positive and at most five seconds.
+        let late = (now - self.next).as_nanos() % self.interval.as_nanos();
+        self.next = now + self.interval - Duration::from_nanos(late as u64);
+        true
+    }
+    fn restart(&mut self, now: Duration) {
+        self.next = now + self.interval;
+    }
+}
+
+struct Schedule {
+    children: Periodic,
+    posture: Periodic,
+    heartbeat: Periodic,
+    cpu: Periodic,
+}
+impl Schedule {
+    fn new(now: Duration) -> Self {
+        Self {
+            children: Periodic::new(now, CHILD_INTERVAL),
+            posture: Periodic {
+                next: now,
+                interval: SAMPLE_INTERVAL,
+            },
+            heartbeat: Periodic::new(now, SAMPLE_INTERVAL),
+            cpu: Periodic::new(now, CPU_INTERVAL),
+        }
+    }
+    fn deadline(&self, tablet_active: bool, fan_active: bool, health: &FanHealth) -> Duration {
+        let mut next = self.children.next;
+        if tablet_active {
+            next = next.min(self.posture.next).min(self.heartbeat.next);
+        }
+        if fan_active {
+            next = next.min(self.cpu.next).min(health.deadline());
+        }
+        next
+    }
+}
+
+fn timeout_ms(deadline: Duration, now: Duration) -> i32 {
+    deadline
+        .saturating_sub(now)
+        .as_nanos()
+        .div_ceil(1_000_000)
+        .min(i32::MAX as u128) as i32
+}
+
+/// Both policy requests and the independent guard use this accounting. Record
+/// completion only after a successful fresh read, never on an attempted read.
+fn sample_cpu(
+    read: impl FnOnce() -> io::Result<i32>,
+    deadline: &mut Periodic,
+    clock: impl FnOnce() -> Duration,
+) -> io::Result<i32> {
+    let temperature = read()?;
+    deadline.restart(clock());
+    Ok(temperature)
+}
+
+#[derive(Default)]
+struct TabletReport {
+    commanded: Option<bool>,
+    diagnostic: Option<(bool, EstimateReason)>,
+    next_snapshot: Duration,
+}
+impl TabletReport {
+    /// Only actual switch transitions (including the first OFF) reach IPC.
+    /// Safety OFF/ACK paths deliberately bypass this deduplication.
+    fn update(
+        &mut self,
+        estimate: Estimate,
+        now: Duration,
+        command: impl FnOnce(bool) -> io::Result<()>,
+    ) -> io::Result<(bool, bool)> {
+        let changed = self.commanded != Some(estimate.tablet);
+        if changed {
+            command(estimate.tablet)?;
+            self.commanded = Some(estimate.tablet);
+        }
+        let diagnostic = (estimate.reliable, estimate.reason);
+        let snapshot = changed || now >= self.next_snapshot;
+        let log = changed || (snapshot && self.diagnostic != Some(diagnostic));
+        if snapshot {
+            self.diagnostic = Some(diagnostic);
+            self.next_snapshot = now + DIAGNOSTIC_INTERVAL;
+        }
+        Ok((snapshot, log))
+    }
+}
 
 /// The broker is the sole owner of tach plausibility and spin-up deadlines.
 /// Replies carry this cached result; policy cannot refresh or bypass the guard.
@@ -52,6 +167,10 @@ struct FanHealth {
     state: TachState,
 }
 impl FanHealth {
+    fn deadline(&self) -> Duration {
+        self.last_check
+            .map_or(Duration::ZERO, |last| last + FAN_HEALTH_INTERVAL)
+    }
     fn duty(&mut self, now: Duration, raw: u8) {
         if raw == 0 {
             self.spin_started = None;
@@ -534,16 +653,6 @@ fn spawn_policy(
     }
     Ok(Child { pid, status: None })
 }
-fn lid_closed() -> Option<bool> {
-    let s = fs::read_to_string("/proc/acpi/button/lid/LID0/state").ok()?;
-    if s.split_whitespace().last() == Some("closed") {
-        Some(true)
-    } else if s.split_whitespace().last() == Some("open") {
-        Some(false)
-    } else {
-        None
-    }
-}
 fn tablet_status_text(
     tablet: Option<bool>,
     angle: Option<f64>,
@@ -675,6 +784,7 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
     install_signals();
     let (fan_control, sequence) = await_startup(&parent, &mut child)?;
     // Fork both children before opening any hardware/ownership descriptor.
+    let mut lid = tablet_enabled.then(Lid::discover).transpose()?;
     // A shared guard serializes sensor wake and all later EC/RAPL operations.
     let control = hardware::Control::open()?;
     let mut sensors = if tablet_enabled {
@@ -707,11 +817,9 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
     );
     let epoch = Instant::now();
     let mut last_request = Instant::now();
-    let mut last_cpu = Instant::now();
+    let mut schedule = Schedule::new(epoch.elapsed());
     let mut health = FanHealth::default();
-    let mut last_tablet_sample: Option<Instant> = None;
-    let mut last_tablet: Option<(bool, bool, String)> = None;
-    let mut tablet_log = Instant::now();
+    let mut tablet_report = TabletReport::default();
     let mut paused = false;
     let mut emergency = EmergencyGuard::default();
     let mut rate_epoch = Instant::now();
@@ -724,30 +832,73 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                     libc::kill(child.pid, libc::SIGHUP);
                 }
             }
-            if let Some(status) = child.exited()? {
-                if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
-                    break;
+            if schedule.children.take(epoch.elapsed()) {
+                if let Some(status) = child.exited()? {
+                    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                        break;
+                    }
+                    return Err(io::Error::other("policy process exited unexpectedly"));
                 }
-                return Err(io::Error::other("policy process exited unexpectedly"));
+                if let Some(g) = &mut guardian
+                    && g.child.exited()?.is_some()
+                {
+                    return Err(io::Error::other("tablet guardian exited"));
+                }
             }
-            if let Some(g) = &mut guardian
-                && g.child.exited()?.is_some()
-            {
-                return Err(io::Error::other("tablet guardian exited"));
-            }
-            if !paused && last_request.elapsed() > Duration::from_secs(12) {
+            if !paused && last_request.elapsed() >= Duration::from_secs(12) {
                 return Err(io::Error::other("policy heartbeat expired"));
             }
-            let mut poll = libc::pollfd {
-                fd: parent.as_raw_fd(),
-                events: libc::POLLIN,
+            let mut deadline = schedule.deadline(
+                guardian.is_some() && !paused,
+                !paused && session.fan.as_ref().is_some_and(|fan| fan.may_be_manual()),
+                &health,
+            );
+            if !paused {
+                deadline =
+                    deadline.min(last_request.duration_since(epoch) + Duration::from_secs(12));
+            }
+            let source = |fd, events| libc::pollfd {
+                fd,
+                events,
                 revents: 0,
             };
-            let n = unsafe { libc::poll(&mut poll, 1, SAMPLE_INTERVAL.as_millis() as i32) };
-            if n < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-                return Err(io::Error::last_os_error());
+            let mut sources = [
+                source(parent.as_raw_fd(), libc::POLLIN),
+                source(
+                    if paused {
+                        -1
+                    } else {
+                        lid.as_ref().map_or(-1, Lid::fd)
+                    },
+                    libc::POLLIN,
+                ),
+                // No guardian data is unsolicited; watch only disconnects.
+                source(guardian.as_ref().map_or(-1, |g| g.socket.as_raw_fd()), 0),
+            ];
+            // SAFETY: all descriptors remain owned outside this bounded poll.
+            let n = unsafe {
+                libc::poll(
+                    sources.as_mut_ptr(),
+                    sources.len() as libc::nfds_t,
+                    timeout_ms(deadline, epoch.elapsed()),
+                )
+            };
+            if n < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
             }
-            if poll.revents & libc::POLLIN != 0 {
+            for index in [0, 2] {
+                if sources[index].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                    return Err(io::Error::other("broker child connection lost"));
+                }
+            }
+            if sources[1].revents != 0 {
+                lid.as_mut().unwrap().drain(sources[1].revents)?;
+            }
+            if sources[0].revents & libc::POLLIN != 0 {
                 let mut bytes = [0; REQUEST_BYTES + 1];
                 let n = parent.recv(&mut bytes)?;
                 let (request, sequence) = Request::decode(&bytes[..n])?;
@@ -779,9 +930,15 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                             } else {
                                 None
                             };
+                            if let Some(lid) = &mut lid {
+                                lid.resync()?;
+                            }
                             if let Some(g) = &mut guardian {
                                 g.off()?;
                             }
+                            schedule.posture.next = epoch.elapsed();
+                            schedule.heartbeat.restart(epoch.elapsed());
+                            schedule.cpu.next = epoch.elapsed();
                         }
                         paused = false;
                         session.activate()
@@ -791,10 +948,11 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                             .fan
                             .as_mut()
                             .ok_or_else(|| io::Error::other("fan control is disabled"))?;
-                        let temperature = cpu
+                        let sensor = cpu
                             .as_ref()
-                            .ok_or_else(|| io::Error::other("fan CPU sensor is unavailable"))?
-                            .read_mc()?;
+                            .ok_or_else(|| io::Error::other("fan CPU sensor is unavailable"))?;
+                        let temperature =
+                            sample_cpu(|| sensor.read_mc(), &mut schedule.cpu, || epoch.elapsed())?;
                         let target = if emergency.observe(epoch.elapsed(), temperature) {
                             ec::MAX_RAW
                         } else {
@@ -828,7 +986,7 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                         };
                         restore_results([fan, rapl, sensor, off])?;
                         tablet_status(Some(false), None, true, "Paused")?;
-                        last_tablet = None;
+                        tablet_report = TabletReport::default();
                         Ok(())
                     }
                     Request::Power(config) => power.apply(&config),
@@ -858,17 +1016,16 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
             }
             if !paused
                 && session.fan.as_ref().is_some_and(|fan| fan.may_be_manual())
-                && last_cpu.elapsed() >= Duration::from_secs(1)
+                && epoch.elapsed() >= schedule.cpu.next
             {
-                let temp = cpu
+                let sensor = cpu
                     .as_ref()
-                    .ok_or_else(|| io::Error::other("fan CPU sensor is unavailable"))?
-                    .read_mc()?;
+                    .ok_or_else(|| io::Error::other("fan CPU sensor is unavailable"))?;
+                let temp = sample_cpu(|| sensor.read_mc(), &mut schedule.cpu, || epoch.elapsed())?;
                 if emergency.observe(epoch.elapsed(), temp) {
                     session.fan.as_mut().unwrap().apply(ec::MAX_RAW)?;
                     health.duty(epoch.elapsed(), ec::MAX_RAW);
                 }
-                last_cpu = Instant::now();
             }
             if !paused
                 && let Some(fan) = &session.fan
@@ -877,10 +1034,7 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                 health.refresh(fan, epoch.elapsed())?;
             }
             if let Some(g) = &mut guardian {
-                if paused || last_tablet_sample.is_some_and(|t| t.elapsed() < SAMPLE_INTERVAL) {
-                    g.send(b'.')?;
-                } else {
-                    last_tablet_sample = Some(Instant::now());
+                if !paused && schedule.posture.take(epoch.elapsed()) {
                     let sample = match sensors.as_ref().map(Sensors::sample).transpose() {
                         Ok(sample) => sample,
                         Err(error) => {
@@ -889,40 +1043,31 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                             return Err(io::Error::other(format!("tablet sensor failed: {error}")));
                         }
                     };
-                    let estimate = estimator.update(sample, lid_closed(), epoch.elapsed());
-                    let reason = format!("{:?}", estimate.reason);
-                    let state = (estimate.tablet, estimate.reliable, reason.clone());
-                    if last_tablet.as_ref() != Some(&state) {
-                        g.send(if estimate.tablet { b'1' } else { b'0' })?;
-                        // Consume acknowledgement only for an actual OFF message.
-                        if !estimate.tablet {
-                            let mut ack = [0];
-                            g.socket.read_exact(&mut ack)?;
-                            if ack != *b"0" {
-                                return Err(io::Error::other("tablet OFF not acknowledged"));
-                            }
-                        }
+                    let estimate = estimator.update(
+                        sample,
+                        lid.as_ref().and_then(Lid::closed),
+                        epoch.elapsed(),
+                    );
+                    let (snapshot, log) =
+                        tablet_report.update(estimate, epoch.elapsed(), |tablet| {
+                            if tablet { g.send(b'1') } else { g.off() }
+                        })?;
+                    if log {
                         eprintln!(
-                            "tablet={} angle={:?} reliable={} reason={reason}",
-                            estimate.tablet, estimate.angle_deg, estimate.reliable
+                            "tablet={} angle={:?} reliable={} reason={:?}",
+                            estimate.tablet, estimate.angle_deg, estimate.reliable, estimate.reason
                         );
-                        last_tablet = Some(state);
-                        tablet_log = Instant::now();
-                        tablet_status(
-                            Some(estimate.tablet),
-                            estimate.angle_deg,
-                            estimate.reliable,
-                            &reason,
-                        )?;
-                    } else if tablet_log.elapsed() >= Duration::from_secs(5) {
-                        tablet_status(
-                            Some(estimate.tablet),
-                            estimate.angle_deg,
-                            estimate.reliable,
-                            &reason,
-                        )?;
-                        tablet_log = Instant::now();
                     }
+                    if snapshot {
+                        tablet_status(
+                            Some(estimate.tablet),
+                            estimate.angle_deg,
+                            estimate.reliable,
+                            &format!("{:?}", estimate.reason),
+                        )?;
+                    }
+                }
+                if !paused && schedule.heartbeat.take(epoch.elapsed()) {
                     g.send(b'.')?;
                 }
             }
@@ -1008,6 +1153,186 @@ mod tests {
     use super::*;
     use crate::policy::{Config, Controller};
     use std::{cell::RefCell, rc::Rc};
+
+    fn estimate(tablet: bool, reason: EstimateReason) -> Estimate {
+        Estimate {
+            tablet,
+            reason,
+            reliable: reason == EstimateReason::Valid,
+            angle_deg: None,
+        }
+    }
+
+    #[test]
+    fn diagnostics_do_not_repeat_switch_commands_and_real_transitions_are_immediate() {
+        let mut report = TabletReport::default();
+        let mut commands = Vec::new();
+        let mut logs = 0;
+        let mut snapshots = 0;
+        for milliseconds in (0..10_000).step_by(250) {
+            let reason = if milliseconds % 500 == 0 {
+                EstimateReason::Moving
+            } else {
+                EstimateReason::Valid
+            };
+            let (snapshot, log) = report
+                .update(
+                    estimate(false, reason),
+                    Duration::from_millis(milliseconds),
+                    |value| {
+                        commands.push(value);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            logs += usize::from(log);
+            snapshots += usize::from(snapshot);
+        }
+        assert_eq!(commands, [false]); // Includes the first explicit OFF/ACK.
+        assert_eq!(snapshots, 2);
+        assert!(logs <= 2);
+        for tablet in [true, false] {
+            assert_eq!(
+                report
+                    .update(
+                        estimate(tablet, EstimateReason::Valid),
+                        Duration::from_millis(10_001),
+                        |value| {
+                            commands.push(value);
+                            Ok(())
+                        }
+                    )
+                    .unwrap(),
+                (true, true)
+            );
+        }
+        assert_eq!(commands, [false, true, false]);
+    }
+
+    #[test]
+    fn first_off_requires_ack_and_failed_commands_are_not_cached() {
+        let mut report = TabletReport::default();
+        let first = estimate(false, EstimateReason::Moving);
+        assert!(
+            report
+                .update(first, Duration::ZERO, |_| Err(io::Error::other("no ACK")))
+                .is_err()
+        );
+        assert_eq!(report.commanded, None);
+        let mut guardian = guardian_fixture(GuardianBehavior::Acknowledge);
+        report
+            .update(first, Duration::ZERO, |value| {
+                assert!(!value);
+                guardian.off()
+            })
+            .unwrap();
+        assert_eq!(report.commanded, Some(false));
+        // The fixture exits cleanly only after it received OFF and supplied ACK.
+        guardian.socket.shutdown(std::net::Shutdown::Both).unwrap();
+        let status = guardian.child.stop().unwrap();
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    }
+
+    #[test]
+    fn early_wakes_do_not_multiply_posture_cpu_or_heartbeat_work() {
+        let mut schedule = Schedule::new(Duration::ZERO);
+        let mut counts = [0; 4];
+        // Fake hardware sees 60,001 wakes (e.g. IPC/lid), but only due sources
+        // may run. No wall clock sleeps or physical sensor reads are involved.
+        for milliseconds in 0..=60_000 {
+            let now = Duration::from_millis(milliseconds);
+            if schedule.posture.take(now) {
+                counts[0] += 1;
+            }
+            if now >= schedule.cpu.next {
+                sample_cpu(
+                    || {
+                        counts[1] += 1;
+                        Ok(45_000)
+                    },
+                    &mut schedule.cpu,
+                    || now,
+                )
+                .unwrap();
+            }
+            if schedule.heartbeat.take(now) {
+                counts[2] += 1;
+            }
+            if schedule.children.take(now) {
+                counts[3] += 1;
+            }
+        }
+        assert_eq!(counts, [241, 60, 240, 60]);
+    }
+
+    #[test]
+    fn periodic_deadlines_skip_missed_slots_without_drift_or_zero_timeout_spin() {
+        let mut periodic = Periodic::new(Duration::ZERO, SAMPLE_INTERVAL);
+        assert!(!periodic.take(Duration::from_millis(249)));
+        assert!(periodic.take(Duration::from_millis(751)));
+        assert_eq!(periodic.next, Duration::from_secs(1));
+        assert!(!periodic.take(Duration::from_millis(751)));
+        assert_eq!(
+            timeout_ms(periodic.next, Duration::from_nanos(999_999_999)),
+            1
+        );
+        assert_eq!(timeout_ms(periodic.next, periodic.next), 0);
+        assert_eq!(timeout_ms(Duration::MAX, Duration::ZERO), i32::MAX);
+    }
+
+    #[test]
+    fn inactive_sources_cannot_force_busy_polling() {
+        let mut schedule = Schedule::new(Duration::ZERO);
+        let health = FanHealth::default();
+        // --no-tablet with fan_control=false, and all paused modes: the stale
+        // zero posture/health deadlines are excluded. Only supervision remains.
+        for seconds in 0..60 {
+            let now = Duration::from_secs(seconds);
+            schedule.children.take(now);
+            assert_eq!(
+                timeout_ms(schedule.deadline(false, false, &health), now),
+                1000
+            );
+        }
+        assert_eq!(schedule.posture.next, Duration::ZERO);
+        assert_eq!(schedule.cpu.next, CPU_INTERVAL);
+    }
+
+    #[test]
+    fn fresh_duty_sample_defers_only_one_second_and_failed_reads_never_defer_guard() {
+        use std::cell::Cell;
+        let mut next = Periodic::new(Duration::ZERO, CPU_INTERVAL);
+        let reads = Cell::new(0);
+        let temperature = Cell::new(45_000);
+        let read = || {
+            reads.set(reads.get() + 1);
+            Ok(temperature.get())
+        };
+        // Duty arrives just before the independent deadline. Even with no more
+        // worker messages, the broker must read again one second later.
+        sample_cpu(read, &mut next, || Duration::from_millis(999)).unwrap();
+        assert_eq!(next.next, Duration::from_millis(1999));
+        assert!(Duration::from_secs(1) < next.next);
+        temperature.set(95_000);
+        let mut guard = EmergencyGuard::default();
+        let now = next.next;
+        let temp = sample_cpu(read, &mut next, || now).unwrap();
+        assert!(guard.observe(now, temp));
+        assert_eq!(reads.get(), 2);
+        let before_failure = next.next;
+        assert!(
+            sample_cpu(
+                || Err(io::Error::other("sensor failed")),
+                &mut next,
+                || Duration::from_secs(10)
+            )
+            .is_err()
+        );
+        assert_eq!(next.next, before_failure);
+        // Completion, rather than read start, anchors the fresh-sample bound.
+        sample_cpu(read, &mut next, || Duration::from_secs(11)).unwrap();
+        assert_eq!(next.next, Duration::from_secs(12));
+    }
 
     #[test]
     fn startup_mode_requires_an_explicit_bounded_initialization_request() {

@@ -43,6 +43,30 @@ Status reasons `HingeVertical` and `NearZeroHallOpen` describe those ambiguities
 Tilt away from a vertical hinge to obtain a new estimate. Briefly hold still
 after moving or resuming.
 
+## Lid notifications
+
+The broker discovers the native ACPI `Lid Switch` by its name, physical identity,
+host bus and `SW_LID` capability. It opens evdev read-only after forking both
+children; neither child receives the descriptor. There is no input grab.
+
+Initial setup and resume drain queued notifications and query the current switch
+state with `EVIOCGSW`. Events are notifications, not values to replay over a newer
+snapshot. `SYN_DROPPED` makes the state unknown until the next `SYN_REPORT` has
+been discarded; only then is current state queried. An unfinished dropped
+sequence remains unknown across resume. Unknown is never treated as open.
+
+Normal operation reads this descriptor only when poll reports an event. It does
+not repeatedly evaluate ACPI `_LID` or run a second ACPI fallback poller.
+Missing or ambiguous devices fail startup. Disconnects and read/query failures
+fault the service and trigger normal OFF/recovery, rather than silently assuming
+an open lid. `--no-tablet` does not open a lid device.
+
+After kernel or firmware updates, check lid opening, closing and resume again:
+evdev depends on the kernel and firmware reporting those transitions. Disable
+desktop sleep inhibitors, such as Caffeine, when checking lid-triggered sleep.
+Linux documents the overflow protocol in
+[input event codes](https://www.kernel.org/doc/html/latest/input/event-codes.html#ev-syn).
+
 ## Base-sensor initialization
 
 The base sensor is found by its ACPI controller path and address `0x15`, not

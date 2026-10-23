@@ -73,9 +73,16 @@ its active interval while heating, holding or running the fan. Defaults live in
 preserve pending timers; profile changes preserve the emergency latch and the
 actual fan run time.
 
-The broker polls on a 250 ms bound. It reads CPU temperature about once a second
-during manual control and EC health about every five seconds. Posture sampling
-and confirmation follow the [sensor timing rules](../hardware/tablet-sensors.md#detection).
+The broker waits for IPC, lid notifications or the nearest active monotonic
+deadline. Posture samples and guardian heartbeats have separate deadlines;
+early events do not resample sensors or send extra heartbeats. Missed posture
+slots are skipped rather than replayed. Posture sampling and confirmation follow
+the [sensor timing rules](../hardware/tablet-sensors.md#detection).
+
+During manual control, a successful fresh CPU-temperature read schedules the
+next independent check one second after its completion. A Duty request uses the
+same accounting, avoiding a second read in that iteration. A failed read cannot
+defer protection. EC health retains its five-second cache and deadline.
 The worker and broker have independent high-temperature guards.
 The broker alone evaluates tachometer health and reports the result to the
 worker; the worker cannot suppress that check while managed fan control is
@@ -86,7 +93,17 @@ to track fan starts and latch its own emergency policy. A broker-only heat pulse
 therefore cannot bypass the policy's minimum run time; its timer starts
 conservatively when the worker first observes the start.
 Unchanged fan commands are not rewritten; sampling does not launch subprocesses.
-Disabling tablet detection currently leaves the broker's polling bound unchanged.
+With tablet detection disabled, inactive sensor/guardian deadlines are excluded.
+Child exit checks run at most one second apart; guardian socket disconnection
+wakes the broker immediately. Paused operation excludes sensor, thermal and
+guardian-heartbeat deadlines; the guardian's timeout is disarmed until resume.
+
+Only a changed tablet boolean sends a guardian command. The first estimate
+always sends an explicit command, including OFF/ACK, to arm guardian supervision.
+Stop, faults and sleep preparation still require unconditional OFF/ACK. Noisy
+diagnostic changes are coalesced into five-second snapshots/logs; actual tablet
+transitions and failures are reported immediately. This does not change the
+estimator's thresholds or confirmation delays.
 
 ## Recovery and sleep
 

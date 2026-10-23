@@ -20,6 +20,87 @@ mod systemd;
 
 const ROOT: &str = "/run/minibookx-ctl";
 
+fn count(operation: &str) -> io::Result<()> {
+    use std::io::Write;
+    // The broker has dropped DAC capabilities and cannot write in the worker's
+    // directory. Each process records in its own writable ownership domain.
+    let directory = if unsafe { libc::geteuid() } == 0 {
+        ROOT.to_owned()
+    } else {
+        format!("{ROOT}/policy")
+    };
+    writeln!(
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("{directory}/reads-{}", std::process::id()))?,
+        "{operation}"
+    )
+}
+
+// Pollable stand-in only: production lid.rs tests cover the evdev protocol.
+mod lid {
+    use super::{ROOT, fs, io};
+    use std::os::{
+        fd::{AsRawFd, RawFd},
+        unix::net::UnixDatagram,
+    };
+
+    pub struct Lid {
+        socket: UnixDatagram,
+        closed: Option<bool>,
+    }
+    impl Lid {
+        pub fn discover() -> io::Result<Self> {
+            let path = format!("{ROOT}/lid-events");
+            match fs::remove_file(&path) {
+                Ok(()) => (),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e),
+            }
+            let socket = UnixDatagram::bind(path)?;
+            socket.set_nonblocking(true)?;
+            let mut lid = Self {
+                socket,
+                closed: None,
+            };
+            lid.resync()?;
+            Ok(lid)
+        }
+        pub fn fd(&self) -> RawFd {
+            self.socket.as_raw_fd()
+        }
+        pub fn closed(&self) -> Option<bool> {
+            self.closed
+        }
+        pub fn drain(&mut self, revents: libc::c_short) -> io::Result<()> {
+            if revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                self.closed = None;
+                return Err(io::Error::other("fake lid disconnected"));
+            }
+            let mut byte = [0];
+            loop {
+                match self.socket.recv(&mut byte) {
+                    Ok(_) => (),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            self.resync()
+        }
+        pub fn resync(&mut self) -> io::Result<()> {
+            self.closed = None;
+            self.closed = Some(match fs::read_to_string(format!("{ROOT}/lid-state")) {
+                Ok(value) if value.trim() == "closed" => true,
+                Ok(value) if value.trim() == "open" => false,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+                _ => return Err(io::Error::other("invalid fake lid state")),
+            });
+            Ok(())
+        }
+    }
+}
+
 mod ec {
     pub use minibookx_ctl::ec::*;
     use std::{fs::File, io, os::unix::fs::FileExt};
@@ -198,13 +279,20 @@ mod sensor {
             Ok(Self)
         }
         pub fn read_mc(&self) -> io::Result<i32> {
-            Ok(60_000)
+            super::count("cpu")?;
+            match std::fs::read_to_string("/run/minibookx-ctl/temperature") {
+                Ok(value) => value.trim().parse().map_err(io::Error::other),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(60_000),
+                Err(e) => Err(e),
+            }
         }
     }
 }
 
 mod tablet {
-    pub use minibookx_ctl::tablet::{EstimatorConfig, HingeEstimator, SAMPLE_INTERVAL, Sample};
+    pub use minibookx_ctl::tablet::{
+        Estimate, EstimateReason, EstimatorConfig, HingeEstimator, SAMPLE_INTERVAL, Sample,
+    };
     use std::{
         fs::{File, OpenOptions},
         io::{self, Write},
@@ -220,6 +308,14 @@ mod tablet {
         }
         pub fn retain_for_recovery(&mut self) {}
         pub fn sample(&self) -> io::Result<Sample> {
+            super::count("posture")?;
+            if std::path::Path::new("/run/minibookx-ctl/posture-rotated").exists() {
+                // Same hinge angle after rotating both gravity vectors.
+                return Ok(Sample {
+                    primary: [0.0, 0.0, -1000.0],
+                    secondary: [-1000.0, 0.0, 0.0],
+                });
+            }
             // Synthetic 270-degree hinge, fixed numerical input only.
             Ok(Sample {
                 primary: [1000.0, 0.0, 0.0],
@@ -253,7 +349,10 @@ fn run() -> io::Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("--prepare") => hardware::prepare(),
         Some("--recover") => hardware::recover(),
-        Some("--daemon") => broker::run("/etc/minibookx-ctl/config.conf".into(), true),
+        Some("--daemon") => broker::run(
+            "/etc/minibookx-ctl/config.conf".into(),
+            !Path::new(&format!("{ROOT}/no-tablet")).exists(),
+        ),
         _ => Err(io::Error::other("fixture lifecycle command required")),
     }
 }

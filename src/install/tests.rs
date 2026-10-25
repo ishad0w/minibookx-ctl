@@ -650,7 +650,7 @@ fn config_snapshot_parser_rejects_empty_oversized_invalid_and_out_of_bounds_data
         b"unknown_config_key = true\n".to_vec(),
         String::from_utf8(valid.to_vec())
             .unwrap()
-            .replace("70:35", "70:10")
+            .replace("60:35", "60:10")
             .into_bytes(),
     ] {
         assert!(check_config_reader(invalid.as_slice()).is_err());

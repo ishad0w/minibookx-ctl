@@ -30,7 +30,7 @@ impl Default for Config {
             // to the runtime. PWM is electrical duty, not a fraction of RPM.
             steps: vec![
                 Step {
-                    at_mc: 70_000,
+                    at_mc: 60_000,
                     pwm_percent: 35,
                 },
                 Step {
@@ -482,7 +482,7 @@ mod tests {
 
     #[test]
     fn first_start_needs_a_continuous_threshold_condition() {
-        trace("0,70,70,0\n11,69,69,0\n12,70,70,0\n23,70,70,0\n24,70,70,35");
+        trace("0,60,60,0\n11,59,59,0\n12,60,60,0\n23,60,60,0\n24,60,60,35");
     }
 
     #[test]
@@ -511,30 +511,30 @@ mod tests {
 
     #[test]
     fn minimum_on_and_continuous_cooling_hold_both_apply() {
-        trace("0,70,70,0\n12,70,70,35\n13,60,60,35\n43,60,60,35\n56,60,60,35\n57,60,60,0");
+        trace("0,60,60,0\n12,60,60,35\n13,50,50,35\n43,50,50,35\n56,50,50,35\n57,50,50,0");
     }
 
     #[test]
     fn cooling_hold_resets_inside_the_hysteresis_band() {
         trace(
-            "0,70,70,0\n12,70,70,35\n20,60,60,35\n40,66,66,35\n41,60,60,35\n70,60,60,35\n71,60,60,0",
+            "0,60,60,0\n12,60,60,35\n20,50,50,35\n40,56,56,35\n41,50,50,35\n70,50,50,35\n71,50,50,0",
         );
     }
 
     #[test]
     fn normal_cooling_obeys_every_hysteresis_boundary_and_down_hold() {
         trace(
-            "0,93,93,0\n12,93,93,35\n32,93,93,70\n33,89,89,70\n34,87,87,70\n63,87,87,70\n64,87,87,50\n65,85,85,50\n66,84,84,50\n95,84,84,50\n96,84,84,40\n97,80,80,40\n98,79,79,40\n128,79,79,35\n129,65,65,35\n130,64,64,35\n160,64,64,0",
+            "0,93,93,0\n12,93,93,35\n32,93,93,70\n33,89,89,70\n34,87,87,70\n63,87,87,70\n64,87,87,50\n65,85,85,50\n66,84,84,50\n95,84,84,50\n96,84,84,40\n97,80,80,40\n98,79,79,40\n128,79,79,35\n129,55,55,35\n130,54,54,35\n160,54,54,0",
         );
     }
 
     #[test]
     fn noise_near_start_threshold_does_not_cycle_running_fan() {
         let mut c = Controller::new(Config::default()).unwrap();
-        at(&mut c, 0, 70);
-        at(&mut c, 12, 70);
+        at(&mut c, 0, 60);
+        at(&mut c, 12, 60);
         for s in 13..150 {
-            assert_eq!(at(&mut c, s, 68 + (s % 3) as i32).pwm_percent, 35);
+            assert_eq!(at(&mut c, s, 58 + (s % 3) as i32).pwm_percent, 35);
         }
     }
 

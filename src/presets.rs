@@ -273,7 +273,7 @@ mod tests {
         let dir = env::temp_dir().join(format!("fand-presets-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.conf");
-        let custom = SAMPLE.replace("70:35", "71:35");
+        let custom = SAMPLE.replace("60:35", "71:35");
         fs::write(&path, &custom).unwrap();
         let d = load(&path).unwrap();
         assert_eq!(d.preset, Some(Preset::Balance));

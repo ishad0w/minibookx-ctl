@@ -33,10 +33,10 @@ To customize a profile, edit its existing `curve` line. For example:
 
 ```ini
 [balance]
-curve = 70:35,85:40,90:50,93:70
+curve = 60:35,85:40,90:50,93:70
 ```
 
-This means 35% duty at 70°C, 40% at 85°C, 50% at 90°C and 70% at 93°C, subject
+This means 35% duty at 60°C, 40% at 85°C, 50% at 90°C and 70% at 93°C, subject
 to the profile's delays. Keep the other settings in that section.
 Duty is the fan's electrical PWM setting, **not a percentage of maximum RPM**.
 Keep the values within the [accepted ranges](../reference/configuration.md#fan-settings).

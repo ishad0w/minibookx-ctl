@@ -7,7 +7,7 @@ use minibookx_ctl::{
     sensor::CpuSensor,
     thermal,
 };
-use std::{env, path::PathBuf, process::ExitCode};
+use std::{env, io::Write, path::PathBuf, process::ExitCode};
 #[cfg(feature = "dev-tools")]
 use std::{
     io::{self, BufRead},
@@ -278,7 +278,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("minibookx-ctl: {e}");
+            let _ = writeln!(std::io::stderr(), "minibookx-ctl: {e}");
             ExitCode::FAILURE
         }
     }

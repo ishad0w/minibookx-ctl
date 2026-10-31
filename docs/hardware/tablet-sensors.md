@@ -27,12 +27,13 @@ flowchart LR
 | Estimated angle ≥185° | Enter tablet mode after 500 ms stable classification |
 | Estimated angle ≤175° | Exit tablet mode after stable classification |
 | Between thresholds | Retain the prior mode |
-| Movement | Delay a new transition |
+| Fresh, plausible movement | Retain the last mode and restart confirmation of a new transition |
 | Hinge exactly vertical | Angle is unobservable; retain prior mode, defaulting to laptop at startup |
 | Nearly closed with Hall still open | Can resemble the fully folded boundary |
 | Closed lid | Clear tablet mode immediately |
 | Invalid/missing gravity | Clear after 1.5 seconds |
-| Sensor I/O or identity error | Request OFF immediately and fault for supervised recovery |
+| Transient I/O timeout/read failure | Treat as a missing sample, with the same 1.5 s budget |
+| Identity, ownership or lid error | Confirm OFF and suspend detection; keep cooling active and retry |
 
 Sampling is normally every 250 ms. A gap longer than 750 ms resets pending
 confirmation and motion history. These are gravity estimates, not measurements
@@ -49,17 +50,20 @@ The broker discovers the native ACPI `Lid Switch` by its name, physical identity
 host bus and `SW_LID` capability. It opens evdev read-only after forking both
 children; neither child receives the descriptor. There is no input grab.
 
-Initial setup and resume drain queued notifications and query the current switch
+Initial setup and resume open a fresh reader, drain its notifications and query the current switch
 state with `EVIOCGSW`. Events are notifications, not values to replay over a newer
 snapshot. `SYN_DROPPED` makes the state unknown until the next `SYN_REPORT` has
 been discarded; only then is current state queried. An unfinished dropped
-sequence remains unknown across resume. Unknown is never treated as open.
+sequence on that reader stays unknown until synchronization completes. A fresh
+reader has its own queue and initial synchronization. Unknown is never treated as open.
 
 Normal operation reads this descriptor only when poll reports an event. It does
 not repeatedly evaluate ACPI `_LID` or run a second ACPI fallback poller.
-Missing or ambiguous devices fail startup. Disconnects and read/query failures
-fault the service and trigger normal OFF/recovery, rather than silently assuming
-an open lid. `--no-tablet` does not open a lid device.
+Missing or ambiguous devices disable tablet detection. Disconnects and
+read/query failures require OFF, rather than silently assuming an open lid.
+Cooling continues when OFF is confirmed; failures to prove OFF enter common
+service recovery. Detection retries after 30 s, doubling up to five minutes,
+and on resume. `--no-tablet` does not open a lid device.
 
 After kernel or firmware updates, check lid opening, closing and resume again:
 evdev depends on the kernel and firmware reporting those transitions. Disable
@@ -79,8 +83,10 @@ changing `01` to `00`, waits 500 ms and discards the first sample. It changes
 no reset, range, interrupt or test setting. An already awake sensor is left
 awake; a kernel-bound device is never unbound.
 
-Stop and sleep restore the original state if the broker woke it. Resume
-initializes a fresh estimate. The lease, locking and fault behavior are detailed
+Stop and sleep attempt to restore the original state if the broker woke it.
+An unavailable sensor retains its lease; sleep can proceed with an explicit
+deferred-recovery result after cooling and tablet OFF are verified. Resume
+retries restoration before discovery and initializes a fresh estimate. The lease, locking and fault behavior are detailed
 in [base-sensor recovery](../development/design.md#base-sensor-recovery).
 
 ## Desktop integration

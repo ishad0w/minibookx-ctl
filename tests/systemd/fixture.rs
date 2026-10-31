@@ -20,6 +20,24 @@ mod presets {
             ));
         }
         let loaded = super::actual_presets::load(path)?;
+        let watchdog = std::path::Path::new("/run/minibookx-ctl/spoof-watchdog");
+        if watchdog.exists() {
+            let endpoint = std::fs::read_to_string("/run/minibookx-ctl/notify-endpoint")?;
+            unsafe {
+                std::env::set_var("NOTIFY_SOCKET", endpoint);
+            }
+            let notify = super::systemd::Notifier::from_environment()?;
+            unsafe {
+                std::env::remove_var("NOTIFY_SOCKET");
+            }
+            // Deliberately stop policy IPC while continuing forged manager
+            // notifications from the actual unprivileged service child.
+            while watchdog.exists() {
+                notify.send("WATCHDOG=1")?;
+                super::count("spoof-watchdog")?;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
         if std::path::Path::new("/run/minibookx-ctl/spoof-notify").exists() {
             // Simulate a compromised worker knowing the manager's endpoint.
             // NotifyAccess=main must reject it even without environment secrecy.
@@ -41,6 +59,8 @@ mod presets {
 }
 #[path = "../../src/runtime.rs"]
 mod runtime;
+#[path = "../../src/tablet/power.rs"]
+mod sensor_power;
 #[path = "../../src/service.rs"]
 mod service;
 #[path = "../../src/systemd.rs"]
@@ -180,11 +200,19 @@ mod hardware {
         .join("ec/ec0/io"))
     }
     #[derive(Clone)]
-    pub struct Control;
+    pub struct Control(String);
     impl Control {
         pub fn open() -> io::Result<Self> {
             check_profile()?;
-            Ok(Self)
+            Ok(Self(
+                std::env::var("INVOCATION_ID").map_err(io::Error::other)?,
+            ))
+        }
+        pub fn directory(&self) -> &Path {
+            Path::new(ROOT)
+        }
+        pub fn invocation(&self) -> &str {
+            &self.0
         }
     }
     pub fn check_profile() -> io::Result<()> {
@@ -213,9 +241,13 @@ mod hardware {
             format!("{ROOT}/hardware"),
             fs::Permissions::from_mode(0o700),
         )?;
-        recover()
+        recover_fan()?;
+        if let Err(error) = super::tablet::recover_sensor(Path::new(ROOT), None) {
+            eprintln!("VM sensor recovery quarantined: {error}");
+        }
+        Ok(())
     }
-    pub fn recover() -> io::Result<()> {
+    fn recover_fan() -> io::Result<()> {
         check_profile()?;
         eprintln!("VM_RECOVER invoked");
         let fan = match fs::read_to_string(format!("{ROOT}/module.lease")) {
@@ -239,6 +271,13 @@ mod hardware {
                 Err(e) => return Err(e),
             }
         }
+        Ok(())
+    }
+    pub fn recover() -> io::Result<()> {
+        let fan = recover_fan();
+        let sensor = super::tablet::recover_sensor(Path::new(ROOT), None);
+        fan?;
+        sensor?;
         eprintln!("VM_RECOVER completed");
         Ok(())
     }
@@ -322,6 +361,7 @@ mod sensor {
 }
 
 mod tablet {
+    use super::{ROOT, sensor_power};
     pub use minibookx_ctl::tablet::{
         Estimate, EstimateReason, HingeEstimator, SAMPLE_INTERVAL, Sample,
     };
@@ -330,15 +370,54 @@ mod tablet {
         io::{self, Write},
         os::unix::fs::OpenOptionsExt,
     };
-    pub struct Sensors;
+    struct Sensor;
+    impl sensor_power::SensorIo for Sensor {
+        fn control(&self) -> io::Result<u8> {
+            std::fs::read_to_string(format!("{ROOT}/sensor-control"))?
+                .trim()
+                .parse()
+                .map_err(io::Error::other)
+        }
+        fn write_control(&self, value: u8) -> Result<(), sensor_power::WriteFailure> {
+            if std::path::Path::new(&format!("{ROOT}/fail-sensor-restore")).exists() && value == 1 {
+                return Err(sensor_power::WriteFailure::before(io::Error::other(
+                    "injected sensor restore failure",
+                )));
+            }
+            std::fs::write(format!("{ROOT}/sensor-control"), value.to_string())
+                .map_err(sensor_power::WriteFailure::attempted)
+        }
+    }
+    pub struct Sensors(sensor_power::Ownership);
     impl Sensors {
-        pub fn discover(_: &super::hardware::Control) -> io::Result<Self> {
-            Ok(Self)
+        pub fn discover(control: &super::hardware::Control) -> io::Result<Self> {
+            if std::path::Path::new(&format!("{ROOT}/slow-discovery")).exists() {
+                std::thread::sleep(std::time::Duration::from_millis(2300));
+            }
+            let once = std::path::Path::new("/run/minibookx-ctl/fail-discovery-once");
+            if once.exists() {
+                std::fs::remove_file(once)?;
+                return Err(io::Error::other("injected one-shot discovery failure"));
+            }
+            if !std::path::Path::new(&format!("{ROOT}/sensor-control")).exists() {
+                std::fs::write(format!("{ROOT}/sensor-control"), "1")?;
+            }
+            let lease = sensor_power::Lease::acquire(
+                &Sensor,
+                control.directory(),
+                control.invocation(),
+                0,
+                std::thread::sleep,
+            )?;
+            Ok(Self(sensor_power::Ownership::new(lease)))
         }
         pub fn restore(&mut self) -> io::Result<()> {
-            super::count("sensor-restore")
+            super::count("sensor-restore")?;
+            self.0.restore(&Sensor)
         }
-        pub fn retain_for_recovery(&mut self) {}
+        pub fn retain_for_recovery(&mut self) {
+            self.0.retain();
+        }
         pub fn sample(&self) -> io::Result<Sample> {
             super::count("posture")?;
             if std::path::Path::new("/run/minibookx-ctl/fail-posture").exists() {
@@ -358,8 +437,33 @@ mod tablet {
             })
         }
     }
+    impl Drop for Sensors {
+        fn drop(&mut self) {
+            if self.0.restore_on_drop() {
+                let _ = self.restore();
+            }
+        }
+    }
+    pub fn recover_sensor(dir: &std::path::Path, expected: Option<&str>) -> io::Result<()> {
+        if let Some(lease) = sensor_power::Lease::read(dir, expected, 0)? {
+            lease.restore(&Sensor)?;
+        }
+        Ok(())
+    }
+    pub fn sensor_recovery_pending(dir: &std::path::Path) -> bool {
+        sensor_power::recovery_pending(dir)
+    }
     pub struct VirtualSwitch(File);
     impl VirtualSwitch {
+        pub fn into_fd(self) -> std::os::fd::OwnedFd {
+            self.0.into()
+        }
+        pub fn from_fd(fd: std::os::fd::OwnedFd) -> Self {
+            Self(fd.into())
+        }
+        pub fn force_off(&mut self) -> io::Result<()> {
+            self.send(false)
+        }
         pub fn create() -> io::Result<Self> {
             let file = OpenOptions::new()
                 .create(true)

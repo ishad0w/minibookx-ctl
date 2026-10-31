@@ -88,6 +88,9 @@ struct FakeHost {
     leave_lease: Option<PathBuf>,
     edit_config_after_validation: Option<PathBuf>,
     interrupt_on_start: bool,
+    interrupt_during_rollback: bool,
+    corrupt_on_failed_start: Option<PathBuf>,
+    exit_after_observations: Option<u32>,
 }
 impl FakeHost {
     fn running() -> Self {
@@ -107,6 +110,9 @@ impl FakeHost {
             leave_lease: None,
             edit_config_after_validation: None,
             interrupt_on_start: false,
+            interrupt_during_rollback: false,
+            corrupt_on_failed_start: None,
+            exit_after_observations: None,
         }
     }
 }
@@ -125,6 +131,12 @@ impl Host for FakeHost {
     }
     fn state(&mut self, unit: &str) -> io::Result<State> {
         if unit == UNIT {
+            if let Some(remaining) = &mut self.exit_after_observations {
+                *remaining = remaining.saturating_sub(1);
+                if *remaining == 0 {
+                    self.state.active = false;
+                }
+            }
             Ok(self.state)
         } else if unit == RECOVERY_UNIT {
             Ok(self.recovery)
@@ -138,6 +150,10 @@ impl Host for FakeHost {
         if self.fail == Some(event.as_str()) {
             self.fail = None;
             if args[0] == "start" {
+                if let Some(path) = self.corrupt_on_failed_start.take() {
+                    fs::remove_file(&path)?;
+                    fs::create_dir(path)?;
+                }
                 // A failed Restart=on-failure start normally leaves systemd
                 // activating/auto-restart, rather than stably inactive.
                 self.state = parse_state(
@@ -161,7 +177,15 @@ impl Host for FakeHost {
             self.interrupt_on_start = false;
             // The isolated helper below targets only its own blocked thread.
             assert_eq!(
-                unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGINT) },
+                unsafe {
+                    libc::pthread_kill(
+                        libc::pthread_self(),
+                        std::env::var("MINIBOOKX_TEST_SIGNAL")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(libc::SIGINT),
+                    )
+                },
                 0
             );
         }
@@ -170,6 +194,12 @@ impl Host for FakeHost {
     fn recover(&mut self, _: &Path) -> io::Result<()> {
         self.events.push("recover".into());
         self.recoveries += 1;
+        if self.recoveries == 2 && self.interrupt_during_rollback {
+            assert_eq!(
+                unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGUSR2) },
+                0
+            );
+        }
         if self.fail_recovery || self.fail_recovery_number == Some(self.recoveries) {
             return Err(refuse("injected recovery failure"));
         }
@@ -579,19 +609,22 @@ fn an_initially_transitioning_service_is_left_untouched() {
 
 #[test]
 fn interrupted_install_restores_previous_files_and_service() {
-    let status = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "install::tests::interrupted_install_helper",
-            "--ignored",
-        ])
-        .env("MINIBOOKX_TEST_INSTALL_INTERRUPT", "1")
-        .status()
-        .unwrap();
-    assert!(
-        status.success(),
-        "isolated interrupt/rollback test failed: {status}"
-    );
+    for signal in [libc::SIGINT, libc::SIGUSR1, libc::SIGQUIT, libc::SIGPIPE] {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "install::tests::interrupted_install_helper",
+                "--ignored",
+            ])
+            .env("MINIBOOKX_TEST_INSTALL_INTERRUPT", "1")
+            .env("MINIBOOKX_TEST_SIGNAL", signal.to_string())
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "isolated interrupt/rollback test failed: {status}"
+        );
+    }
 }
 
 #[test]
@@ -600,12 +633,14 @@ fn interrupted_install_helper() {
     if std::env::var_os("MINIBOOKX_TEST_INSTALL_INTERRUPT").is_none() {
         return;
     }
+    let _signals = crate::systemd::Signals::installer_process().unwrap();
     let mut fixture = Fixture::new();
     fixture.install();
     fixture.write(BINARY, b"\x7fELFold-image", 0o755);
     fixture.target.live = true;
     let mut host = FakeHost::running();
     host.interrupt_on_start = true;
+    host.interrupt_during_rollback = true;
     let error = apply(
         true,
         &Options::default(),
@@ -631,11 +666,15 @@ fn failed_new_recovery_keeps_new_binary_available_and_never_restarts_old_runtime
     fixture.write(BINARY, b"\x7fELFold-image", 0o755);
     fixture.target.live = true;
     let mut host = FakeHost::running();
+    host.state.enabled = Enabled::No;
     host.fail = Some("start minibookx-ctl.service");
     host.fail_recovery_number = Some(2);
     let error = apply(
         true,
-        &Options::default(),
+        &Options {
+            enable: true,
+            ..Options::default()
+        },
         &fixture.target,
         &fixture.source,
         &mut host,
@@ -654,6 +693,47 @@ fn failed_new_recovery_keeps_new_binary_available_and_never_restarts_old_runtime
         1
     );
     assert!(!host.state.active);
+    assert_eq!(host.state.enabled, Enabled::No);
+}
+
+#[test]
+fn enablement_is_restored_even_when_file_rollback_fails() {
+    let mut fixture = Fixture::new();
+    fixture.install();
+    fixture.target.live = true;
+    let mut host = FakeHost::running();
+    host.state.enabled = Enabled::No;
+    host.fail = Some("start minibookx-ctl.service");
+    host.corrupt_on_failed_start = Some(fixture.target.path(UNIT_FILE).unwrap());
+    let error = apply(
+        true,
+        &Options {
+            enable: true,
+            ..Options::default()
+        },
+        &fixture.target,
+        &fixture.source,
+        &mut host,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("rollback incomplete"), "{error}");
+    assert_eq!(host.state.enabled, Enabled::No);
+    assert!(!host.state.active);
+    assert_eq!(
+        host.events
+            .iter()
+            .filter(|event| event.starts_with("start "))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn startup_is_checked_beyond_the_first_active_observation() {
+    let mut host = FakeHost::running();
+    host.exit_after_observations = Some(2);
+    assert!(start_service(&mut host).is_err());
+    assert_eq!(host.exit_after_observations, Some(0));
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! Tablet posture support for the inspected MiniBook X U300 revision only.
 //!
 //! The privileged broker owns the sensors and estimator; its independent
-//! guardian owns the virtual switch. No raw sensor/device descriptor crosses
+//! guardian drives the virtual switch; the broker retains its recovery FD. No raw sensor/device descriptor crosses
 //! into the policy worker. Sensor access never unbinds a driver, sets an
 //! I2C address globally. The only functional sensor write is an attributed
 //! base-sensor PD-bit wake, restored before sleep, stop or independent recovery.
@@ -20,7 +20,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     os::{
-        fd::AsRawFd,
+        fd::{AsRawFd, OwnedFd},
         unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
@@ -43,16 +43,7 @@ fn invalid(message: &str) -> io::Error {
 /// An additional independent gate before any raw hardware descriptor is opened.
 /// This is intentionally a revision profile, not support for every MiniBook X.
 pub fn check_hardware_profile() -> io::Result<()> {
-    let vendor = fs::read_to_string("/sys/class/dmi/id/sys_vendor")?;
-    let model = fs::read_to_string("/sys/class/dmi/id/product_name")?;
-    let bios = fs::read_to_string("/sys/class/dmi/id/bios_version")?;
-    let cpu = fs::read_to_string("/proc/cpuinfo")?;
-    if !platform::supported_profile(&vendor, &model, &bios, &cpu) {
-        return Err(invalid(
-            "tablet backend requires the inspected U300/BIOS profile",
-        ));
-    }
-    Ok(())
+    platform::check_profile()
 }
 
 fn acpi_is(path: &Path, controller: &str) -> bool {
@@ -125,7 +116,7 @@ struct I2cTransfer {
 pub struct Sensors {
     primary: [File; 3],
     secondary: Secondary,
-    power: Option<power::Lease>,
+    power: power::Ownership,
     _control: Control,
 }
 
@@ -186,16 +177,16 @@ impl Sensors {
         let mut sensor = Self {
             primary,
             secondary,
-            power: None,
+            power: power::Ownership::new(None),
             _control: control.clone(),
         };
-        sensor.power = power::Lease::acquire(
+        sensor.power = power::Ownership::new(power::Lease::acquire(
             &sensor.secondary,
             control.directory(),
             control.invocation(),
             0,
             std::thread::sleep,
-        )?;
+        )?);
         // Discard the first complete post-settling sample. The broker starts
         // with a fresh estimator, so warm-up cannot establish a posture.
         sensor.sample()?;
@@ -203,17 +194,13 @@ impl Sensors {
     }
 
     pub fn restore(&mut self) -> io::Result<()> {
-        if let Some(lease) = &self.power {
-            lease.restore(&self.secondary)?;
-            self.power = None;
-        }
-        Ok(())
+        self.power.restore(&self.secondary)
     }
 
     /// A guardian that could not confirm OFF must be gone before standalone
     /// recovery powers the sensor down. Leave its durable attribution intact.
     pub fn retain_for_recovery(&mut self) {
-        self.power = None;
+        self.power.retain();
     }
 
     /// One attempt only. I2C latency is bounded by the kernel adapter timeout;
@@ -238,10 +225,17 @@ impl Sensors {
 
 impl Drop for Sensors {
     fn drop(&mut self) {
-        if let Err(error) = self.restore() {
+        if self.power.restore_on_drop()
+            && let Err(error) = self.restore()
+        {
             eprintln!("secondary sensor restoration retained for recovery: {error}");
         }
     }
+}
+
+/// Include orphaned attribution when no live sensor object was acquired.
+pub(crate) fn sensor_recovery_pending(dir: &Path) -> bool {
+    power::recovery_pending(dir)
 }
 
 /// Must be called while the runtime control lock is held, independently of
@@ -599,7 +593,16 @@ impl HingeEstimator {
                     || largest_step(base, old_base) > self.config.max_direction_step_deg)
             {
                 self.last_vectors = Some((lid, base, now));
-                return self.invalid(now, EstimateReason::Moving);
+                // Fresh, plausible vectors during motion are not missing
+                // data. Keep the last posture while preventing a new latch.
+                self.pending = None;
+                self.last_good = Some(now);
+                return Estimate {
+                    tablet: self.tablet,
+                    angle_deg: None,
+                    reliable: false,
+                    reason: EstimateReason::Moving,
+                };
             }
         }
         self.last_vectors = Some((lid, base, now));
@@ -675,7 +678,6 @@ const UI_SET_EVBIT: libc::c_ulong = iow(100, std::mem::size_of::<libc::c_int>())
 const UI_SET_SWBIT: libc::c_ulong = iow(109, std::mem::size_of::<libc::c_int>());
 const UI_DEV_SETUP: libc::c_ulong = iow(3, std::mem::size_of::<UinputSetup>());
 const UI_DEV_CREATE: libc::c_ulong = 0x5501;
-const UI_DEV_DESTROY: libc::c_ulong = 0x5502;
 const EV_SW: u16 = 0x05;
 const SW_TABLET_MODE: u16 = 0x01;
 
@@ -712,6 +714,20 @@ pub struct VirtualSwitch {
 }
 
 impl VirtualSwitch {
+    pub(crate) fn into_fd(self) -> OwnedFd {
+        self.file.into()
+    }
+    pub(crate) fn from_fd(fd: OwnedFd) -> Self {
+        Self {
+            file: fd.into(),
+            tablet: false,
+            known: false,
+        }
+    }
+    pub(crate) fn force_off(&mut self) -> io::Result<()> {
+        self.known = false;
+        self.send(false)
+    }
     pub fn create() -> io::Result<Self> {
         check_hardware_profile()?;
         let file = OpenOptions::new()
@@ -803,7 +819,7 @@ impl VirtualSwitch {
             std::slice::from_raw_parts(events.as_ptr().cast::<u8>(), std::mem::size_of_val(&events))
         };
         // Mark a possible ON before writing: even an indeterminate short/error
-        // result must make Drop attempt OFF rather than assume it stayed off.
+        // result must make shutdown attempt OFF rather than assume it stayed off.
         if tablet {
             self.tablet = true;
         }
@@ -815,21 +831,9 @@ impl VirtualSwitch {
     }
 }
 
-impl Drop for VirtualSwitch {
-    fn drop(&mut self) {
-        if self.tablet || !self.known {
-            if let Err(error) = self.send(false) {
-                eprintln!("tablet switch OFF failed in Drop: {error}");
-            } else {
-                // Best effort only: allow libinput to consume OFF before
-                // device removal. Guardian delivery is still best effort, not a consumer ACK.
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-        // SAFETY: this object owns a created uinput device and a live fd.
-        unsafe { libc::ioctl(self.file.as_raw_fd(), UI_DEV_DESTROY as _) };
-    }
-}
+// Closing the last shared file description destroys the uinput device. Neither
+// fork owner issues UI_DEV_DESTROY: the broker must retain the original device
+// long enough to send OFF after guardian SIGKILL.
 
 #[cfg(test)]
 mod tests {
@@ -900,6 +904,22 @@ mod tests {
         assert!(estimator.update(Some(LAPTOP), Some(false), at(1000)).tablet);
         assert!(estimator.update(Some(LAPTOP), Some(false), at(1250)).tablet);
         assert!(!estimator.update(Some(LAPTOP), Some(false), at(1500)).tablet);
+    }
+
+    #[test]
+    fn prolonged_fresh_motion_preserves_tablet_but_missing_samples_expire() {
+        let mut estimator = estimator();
+        for t in [0, 250, 500] {
+            estimator.update(Some(TENT), Some(false), at(t));
+        }
+        for i in 1..=24 {
+            let sample = if i % 2 == 0 { TENT } else { LAPTOP };
+            let estimate = estimator.update(Some(sample), Some(false), at(500 + i * 250));
+            assert!(estimate.tablet);
+            assert_eq!(estimate.reason, EstimateReason::Moving);
+        }
+        assert!(estimator.update(None, Some(false), at(6750)).tablet);
+        assert!(!estimator.update(None, Some(false), at(8000)).tablet);
     }
 
     #[test]

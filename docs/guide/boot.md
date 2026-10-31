@@ -47,8 +47,8 @@ interface_resolution: 1200x1920
 interface_rotation: 90
 ```
 
-Keep the portrait framebuffer dimensions. Setting them to 1920×1200 stretched
-the menu on this panel. Check the visible menu once after the change; another
+Keep the portrait framebuffer dimensions to avoid stretching the menu.
+Check the visible menu once after the change; another
 panel mounting may need the other quarter-turn.
 
 ### Optional appearance
@@ -85,8 +85,8 @@ splash screens depend on the distribution.
 
 ## GRUB menu
 
-The tested stock GRUB did not support rotating its menu. `GRUB_GFXMODE` changes
-resolution, not orientation. Linux's panel and console arguments still work
+`GRUB_GFXMODE` changes resolution, not menu orientation; this project provides
+no GRUB rotation build. Linux's panel and console arguments still work
 after GRUB hands over to the kernel.
 
 Limine supports menu rotation natively; changing bootloaders is a separate choice.

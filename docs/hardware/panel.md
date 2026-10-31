@@ -16,7 +16,7 @@ clock divided by horizontal total and vertical total:
 | Mode | Pixel clock | Horizontal total | Vertical total | Evidence |
 |---|---:|---:|---:|---|
 | Original 50 Hz | 138267 kHz | 1272 | 2174 | Startup corruption observed with stock i915 |
-| 59.94 Hz | 165754 kHz | 1272 | 2174 | Boot and S3 passed with a downstream patched driver |
+| 59.94 Hz | 165754 kHz | 1272 | 2174 | Experimental; not qualified for the recommended stock-driver procedure |
 | 60 Hz | 165920 kHz | 1272 | 2174 | Stock-driver cold start and S3 passed on the matching panel |
 | Above 60 Hz | — | — | — | 70 Hz corrupted the physical output; unsupported |
 
@@ -50,10 +50,10 @@ are the 60 Hz and 59.94 Hz `.bin` files, a manifest, and an alternative
 `vbt-modes.cpio` archive. The user guide uses the `.bin` with the distribution's
 normal initramfs integration; the alternative archive is not required.
 
-To investigate the older 59.94 Hz mode, its file is `chuwi-u300-59-94.bin`.
+To investigate the experimental 59.94 Hz mode, its file is `chuwi-u300-59-94.bin`.
 Use that filename consistently in the firmware location, inclusion rule and
-`i915.vbt_firmware` argument from the display guide. Its recorded tests used a
-patched driver; they do not qualify it as an alternative stock-driver fix.
+`i915.vbt_firmware` argument from the display guide. It is not a qualified
+alternative to the documented 60 Hz fix.
 
 The native inclusion rules persist across image regeneration. Limine's generated
 image digests use BLAKE2b-512; its normal generator should maintain them.

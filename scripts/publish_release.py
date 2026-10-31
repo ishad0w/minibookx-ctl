@@ -124,6 +124,10 @@ def upload_missing_assets(release, folder, names):
 def publish(folder, commit):
     metadata, names = checked_assets(folder, commit)
     tag = metadata["tag"]
+    title = "Release (" + tag + ")"
+    message = api("commits/" + commit)["commit"]["message"]
+    if message.split("\n", 1)[0] != title:
+        raise ValueError("publication requires the canonical commit title: " + title)
     repository = api("")
     if repository.get("default_branch") != "main":
         raise ValueError("publication requires main as the default branch")
@@ -139,6 +143,8 @@ def publish(folder, commit):
         )
     release = release_info(tag, missing=True)
     if release is not None and not release["draft"]:
+        if release.get("immutable") is not True:
+            raise ValueError("existing published release is not immutable")
         if release.get("prerelease"):
             raise ValueError("existing release is a prerelease; refusing to rewrite it")
         verify_existing_release(release, folder, names)
@@ -162,7 +168,6 @@ def publish(folder, commit):
             "the controller does not patch the kernel or change panel timings.\n"
         )
         if release is None:
-            title = "Release (" + tag + ")"
             gh(
                 "release",
                 "create",

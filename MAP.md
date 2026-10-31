@@ -31,8 +31,8 @@ verification commands live in [AGENTS.md](AGENTS.md); user setup starts in the
 
 For process ownership, startup choices and cleanup order, read
 [the service design](docs/development/design.md). The root broker owns hardware access; the
-worker parses configuration after dropping privileges; the guardian owns the
-tablet-switch descriptor. [SECURITY.md](SECURITY.md) describes the installer and
+worker parses configuration after dropping privileges; the guardian and broker
+retain the same tablet-switch descriptor for recovery. [SECURITY.md](SECURITY.md) describes the installer and
 runtime trust boundaries. Keep the required boundaries in
 [AGENTS.md](AGENTS.md#required-boundaries) when changing these interfaces.
 

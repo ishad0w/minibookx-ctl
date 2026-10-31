@@ -82,14 +82,7 @@ fn root() -> io::Result<()> {
     Ok(())
 }
 pub fn check_profile() -> io::Result<()> {
-    let bios = fs::read_to_string("/sys/class/dmi/id/bios_version")?;
-    let model = fs::read_to_string("/sys/class/dmi/id/product_name")?;
-    let vendor = fs::read_to_string("/sys/class/dmi/id/sys_vendor")?;
-    let cpu = fs::read_to_string("/proc/cpuinfo")?;
-    if !platform::supported_profile(&vendor, &model, &bios, &cpu) {
-        return Err(error("unsupported hardware/BIOS; refusing EC access"));
-    }
-    Ok(())
+    platform::check_profile()
 }
 fn invocation() -> io::Result<String> {
     let id = env::var("INVOCATION_ID")
@@ -153,12 +146,10 @@ impl Control {
         let dir = directory()?;
         let lock = Lock::take(&dir)?;
         require_no_unowned_records(&dir)?;
-        for name in ["module.lease", "sensor.lease"] {
-            match fs::symlink_metadata(dir.join(name)) {
-                Ok(_) => return Err(error("pending hardware ownership requires recovery")),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-                Err(e) => return Err(e),
-            }
+        match fs::symlink_metadata(dir.join("module.lease")) {
+            Ok(_) => return Err(error("pending hardware ownership requires recovery")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e),
         }
         Ok(Self(Rc::new(ControlState {
             dir,
@@ -246,7 +237,7 @@ pub fn prepare() -> io::Result<()> {
     prepare_private_alias(&directory()?)?;
     // systemd retries this same unit after a failed start or runtime fault.
     // Restore any attributable orphaned state before creating a new lease.
-    recover()?;
+    cleanup_owned(None, true)?;
     for module in ["uinput", "i2c-dev"] {
         if !Command::new(platform::system_tool("modprobe")?)
             .arg(module)
@@ -388,9 +379,9 @@ impl<T: EcIo> Drop for Session<T> {
 /// Root-only orphan recovery. The exclusive lock proves no cooperating runtime
 /// is alive; persistent root-owned lease/marker identify this controller's state.
 pub fn recover() -> io::Result<()> {
-    cleanup_owned(None)
+    cleanup_owned(None, false)
 }
-fn cleanup_owned(expected_id: Option<String>) -> io::Result<()> {
+fn cleanup_owned(expected_id: Option<String>, startup: bool) -> io::Result<()> {
     root()?;
     let dir = match directory() {
         Ok(p) => p,
@@ -400,10 +391,30 @@ fn cleanup_owned(expected_id: Option<String>) -> io::Result<()> {
     let _lock = Lock::take(&dir)?;
     // This journal may precede module.lease, including when sensor wake or EC
     // setup failed. It is an independent domain even if another lease is bad.
-    recover_independently(
-        || cleanup_module(&dir, expected_id.as_deref()),
-        || crate::tablet::recover_sensor(&dir, expected_id.as_deref()),
-    )
+    let fan = cleanup_module(&dir, expected_id.as_deref());
+    let power = crate::power::restore_journal();
+    let sensor = crate::tablet::recover_sensor(&dir, expected_id.as_deref());
+    recovery_result(startup, fan, power, sensor)
+}
+
+fn recovery_result(
+    startup: bool,
+    fan: io::Result<()>,
+    power: io::Result<()>,
+    sensor: io::Result<()>,
+) -> io::Result<()> {
+    if startup {
+        // Optional domains retain their records and remain unavailable. An
+        // unresolved fan owner is different: firmware cooling must be proven.
+        for (name, result) in [("power", power), ("sensor", sensor)] {
+            if let Err(error) = result {
+                eprintln!("{name} recovery pending; that feature is quarantined: {error}");
+            }
+        }
+        fan
+    } else {
+        recover_independently(|| fan, || recover_independently(|| power, || sensor))
+    }
 }
 
 fn recover_independently(
@@ -434,7 +445,7 @@ fn cleanup_module(dir: &Path, expected_id: Option<&str>) -> io::Result<()> {
         eprintln!("foreign lease: cleanup performs no writes");
         return Ok(());
     }
-    recover_components(
+    restore_then_release(
         || {
             if lease.fan_control {
                 restore_owned_fan(dir, &lease.id)
@@ -442,7 +453,6 @@ fn cleanup_module(dir: &Path, expected_id: Option<&str>) -> io::Result<()> {
                 require_no_manual_owner(dir)
             }
         },
-        crate::power::restore_journal,
         || {
             if lease.fan_control {
                 if Path::new(SUPPORT).exists() {
@@ -471,37 +481,23 @@ fn require_no_manual_owner(dir: &Path) -> io::Result<()> {
 }
 
 fn require_no_unowned_records(dir: &Path) -> io::Result<()> {
-    for name in ["manual.owner", "power.lease"] {
-        match fs::symlink_metadata(dir.join(name)) {
-            Ok(_) => {
-                return Err(error(
-                    "hardware recovery record has no module ownership lease; retain records for review",
-                ));
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-            Err(e) => return Err(e),
-        }
+    match fs::symlink_metadata(dir.join("manual.owner")) {
+        Ok(_) => Err(error(
+            "manual fan record has no module ownership lease; retain records for review",
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
     }
-    Ok(())
 }
 
-/// Independent hardware domains must not prevent each other's recovery.
-/// Keep the module lease and write access for a retry if either domain fails.
-fn recover_components(
+/// Only fan restoration owns EC/module access. An independent RAPL journal
+/// must not hold that access open after the fan is back under firmware control.
+fn restore_then_release(
     restore_fan: impl FnOnce() -> io::Result<()>,
-    restore_power: impl FnOnce() -> io::Result<()>,
     release_module: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
-    let fan = restore_fan();
-    let power = restore_power();
-    match (fan, power) {
-        (Ok(()), Ok(())) => release_module(),
-        (Err(fan), Ok(())) => Err(error(&format!("fan recovery failed: {fan}"))),
-        (Ok(()), Err(power)) => Err(error(&format!("power recovery failed: {power}"))),
-        (Err(fan), Err(power)) => Err(error(&format!(
-            "fan recovery failed: {fan}; power recovery failed: {power}"
-        ))),
-    }
+    restore_fan()?;
+    release_module()
 }
 
 fn restore_owned_fan(dir: &Path, id: &str) -> io::Result<()> {
@@ -535,6 +531,29 @@ pub fn write_status(text: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_quarantines_optional_recovery_but_never_unresolved_manual_fan() {
+        assert!(
+            recovery_result(
+                true,
+                Ok(()),
+                Err(error("foreign power")),
+                Err(error("sensor busy"))
+            )
+            .is_ok()
+        );
+        assert!(recovery_result(true, Err(error("fan uncertain")), Ok(()), Ok(())).is_err());
+        let error = recovery_result(
+            false,
+            Ok(()),
+            Err(error("foreign power")),
+            Err(error("sensor busy")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("foreign power") && error.contains("sensor busy"));
+    }
     use std::{
         cell::{Cell, RefCell},
         rc::Rc,
@@ -762,13 +781,17 @@ mod tests {
         assert!(session.activate().is_err());
         assert!(session.restore().is_err());
         let attempted_power = Cell::new(false);
-        let failure = recover_components(
-            || require_no_manual_owner(&fixture.dir),
+        let failure = recover_independently(
+            || {
+                restore_then_release(
+                    || require_no_manual_owner(&fixture.dir),
+                    || panic!("inconsistent fan ownership must retain its lease"),
+                )
+            },
             || {
                 attempted_power.set(true);
                 Ok(())
             },
-            || panic!("inconsistent fan ownership must retain its lease"),
         )
         .unwrap_err();
         assert!(attempted_power.get());
@@ -903,7 +926,10 @@ mod tests {
         for name in ["power.lease", "manual.owner"] {
             let path = dir.join(name);
             fs::write(&path, "preserve recovery evidence").unwrap();
-            assert!(require_no_unowned_records(&dir).is_err());
+            assert_eq!(
+                require_no_unowned_records(&dir).is_err(),
+                name == "manual.owner"
+            );
             assert_eq!(
                 fs::read_to_string(&path).unwrap(),
                 "preserve recovery evidence"
@@ -929,33 +955,41 @@ mod tests {
     }
 
     #[test]
-    fn failed_power_recovery_still_clears_real_manual_bit_and_retains_retry_access() {
+    fn failed_power_recovery_does_not_hold_completed_fan_access() {
         let mut ec = TestEc(ec::MANUAL | 0x08);
         let module_released = Cell::new(false);
-        let failure = recover_components(
-            || ec::restore_auto(&mut ec),
-            || Err(error("foreign RAPL limit")),
+        let failure = recover_independently(
             || {
-                module_released.set(true);
-                Ok(())
+                restore_then_release(
+                    || ec::restore_auto(&mut ec),
+                    || {
+                        module_released.set(true);
+                        Ok(())
+                    },
+                )
             },
+            || Err(error("foreign RAPL limit")),
         )
         .unwrap_err();
         assert_eq!(ec.0, 0x08);
-        assert!(!module_released.get());
+        assert!(module_released.get());
         assert!(failure.to_string().contains("foreign RAPL limit"));
     }
 
     #[test]
     fn failed_fan_recovery_does_not_skip_power_and_reports_both_failures() {
         let attempted_power = Cell::new(false);
-        let failure = recover_components(
-            || Err(error("EC unavailable")),
+        let failure = recover_independently(
+            || {
+                restore_then_release(
+                    || Err(error("EC unavailable")),
+                    || panic!("must retain recovery access"),
+                )
+            },
             || {
                 attempted_power.set(true);
                 Err(error("RAPL unavailable"))
             },
-            || panic!("must retain recovery access"),
         )
         .unwrap_err()
         .to_string();

@@ -14,6 +14,59 @@ pub(crate) fn supported_profile(vendor: &str, model: &str, bios: &str, cpuinfo: 
         && cpuinfo.contains("Intel(R) Processor U300")
 }
 
+pub(crate) fn profile_mismatch(
+    vendor: &str,
+    model: &str,
+    bios: &str,
+    cpuinfo: &str,
+) -> Option<String> {
+    if supported_profile(vendor, model, bios, cpuinfo) {
+        return None;
+    }
+    let mut mismatches = Vec::new();
+    if !vendor.starts_with("CHUWI") {
+        mismatches.push(format!("manufacturer {:?}, expected CHUWI", vendor.trim()));
+    }
+    if model.trim() != "MiniBook X" {
+        mismatches.push(format!("model {:?}, expected MiniBook X", model.trim()));
+    }
+    if !cpuinfo.contains("Intel(R) Processor U300") {
+        let name = cpuinfo
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                (key.trim() == "model name").then_some(value.trim())
+            })
+            .unwrap_or("unknown");
+        mismatches.push(format!("CPU {name:?}, expected Intel U300"));
+    }
+    // A BIOS revision is meaningful only for this board/CPU profile. Never
+    // suggest the U300 firmware to an N100/N150 owner with the same model name.
+    if mismatches.is_empty() && bios.trim() != KNOWN_BIOS {
+        mismatches.push(format!(
+            "BIOS {:?}, supported revision {KNOWN_BIOS}",
+            bios.trim()
+        ));
+    }
+    (!mismatches.is_empty()).then(|| {
+        format!(
+            "unsupported profile: {}; do not flash a BIOS to bypass this check",
+            mismatches.join("; ")
+        )
+    })
+}
+
+pub(crate) fn check_profile() -> io::Result<()> {
+    let vendor = fs::read_to_string("/sys/class/dmi/id/sys_vendor")?;
+    let model = fs::read_to_string("/sys/class/dmi/id/product_name")?;
+    let bios = fs::read_to_string("/sys/class/dmi/id/bios_version")?;
+    let cpu = fs::read_to_string("/proc/cpuinfo")?;
+    match profile_mismatch(&vendor, &model, &bios, &cpu) {
+        Some(reason) => Err(io::Error::new(io::ErrorKind::InvalidData, reason)),
+        None => Ok(()),
+    }
+}
+
 /// Distribution package tools may live in either bin or sbin. Never consult
 /// an inherited PATH; symlinks in these administrator-controlled directories
 /// are normal on merged-/usr distributions.

@@ -84,8 +84,9 @@ The [sensor reference](../hardware/tablet-sensors.md) explains these limits.
 
 - **No tablet mode:** check `minibookx-ctl --doctor` and the service journal.
   The service wakes the supported base sensor automatically. `Unavailable`
-  means a sensor or lid fault disabled detection; resolve the journal error,
-  then restart the service. Cooling continues if tablet OFF was confirmed.
+  means a sensor or lid fault disabled detection. Read the journal error;
+  discovery retries with backoff and after resume. `RecoveryPending` means
+  restoration is still needed. Cooling continues if tablet OFF was confirmed.
 - **Input returns but the image stays sideways:** check both Mutter and the
   panel-orientation hint above.
 - **Input stays disabled:** return to an ordinary laptop angle, then hold still.

@@ -124,6 +124,9 @@ pub struct Reply {
     pub actual_raw: Option<u8>,
     pub emergency: bool,
     pub tach_state: TachState,
+    /// Optional power application or restoration is explicitly deferred.
+    /// This must never be reported to the caller as an applied power override.
+    pub recovery_pending: bool,
 }
 impl Reply {
     pub fn encode(&self) -> [u8; REPLY_BYTES] {
@@ -139,6 +142,7 @@ impl Reply {
         b[12] = u8::from(self.emergency);
         b[13] = self.tach_state as u8;
         b[14] = u8::from(self.temperature.is_some());
+        b[15] = u8::from(self.recovery_pending);
         b
     }
     pub fn decode(b: &[u8], sequence: u32) -> io::Result<Self> {
@@ -154,7 +158,7 @@ impl Reply {
             || TachState::decode(b[13]).is_none()
             || b[14] > 1
             || (b[14] == 0 && b[4] != 0)
-            || b[15] != 0
+            || b[15] > 1
             || u32::from_le_bytes(b[8..12].try_into().unwrap()) != sequence
         {
             return Err(io::Error::other("invalid hardware reply"));
@@ -174,6 +178,7 @@ impl Reply {
             actual_raw: (b[5] != u8::MAX).then_some(b[5]),
             emergency: b[12] != 0,
             tach_state: TachState::decode(b[13]).unwrap(),
+            recovery_pending: b[15] != 0,
         })
     }
 }

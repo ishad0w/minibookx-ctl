@@ -9,6 +9,16 @@ use std::{
     path::Path,
 };
 
+macro_rules! doc_url {
+    ($path:literal) => {
+        concat!(
+            "https://github.com/ishad0w/minibookx-ctl/blob/v",
+            env!("CARGO_PKG_VERSION"),
+            "/docs/",
+            $path
+        )
+    };
+}
 #[path = "doctor_graphics.rs"]
 mod graphics;
 
@@ -25,20 +35,10 @@ struct FileInfo {
     bytes: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Missing {
-    Absent,
-    Permission,
-    Invalid,
-    Other,
-}
+use crate::rapl::ReadError as Missing;
 impl Missing {
     fn from_io(error: io::Error) -> Self {
-        match error.kind() {
-            io::ErrorKind::NotFound => Self::Absent,
-            io::ErrorKind::PermissionDenied => Self::Permission,
-            _ => Self::Other,
-        }
+        Self::from(error)
     }
     fn code(self) -> &'static str {
         match self {
@@ -50,8 +50,8 @@ impl Missing {
     }
     fn description(self) -> &'static str {
         match self {
-            Self::Absent => "not exposed by this system",
-            Self::Permission => "permission denied; try sudo for this field",
+            Self::Absent => "not currently available in this snapshot",
+            Self::Permission => "permission denied by the current access policy",
             Self::Invalid => "unrecognized or oversized data",
             Self::Other => "could not read this source",
         }
@@ -79,6 +79,48 @@ trait Sources {
     }
     fn link_target(&self, _path: &str) -> Result<String, Missing> {
         Err(Missing::Absent)
+    }
+}
+
+/// Reuse kernel observations within one report. Trusted reads remain separate
+/// so a cached ordinary read can never bypass their ownership checks.
+struct Snapshot<'a, T> {
+    source: &'a T,
+    reads: std::cell::RefCell<BTreeMap<String, Result<String, Missing>>>,
+    clock: std::cell::OnceCell<Result<u64, Missing>>,
+}
+impl<T: Sources> Sources for Snapshot<'_, T> {
+    fn read(&self, path: &str) -> Result<String, Missing> {
+        if let Some(value) = self.reads.borrow().get(path) {
+            return value.clone();
+        }
+        let value = self.source.read(path);
+        self.reads.borrow_mut().insert(path.into(), value.clone());
+        value
+    }
+    fn boottime_ms(&self) -> Result<u64, Missing> {
+        *self.clock.get_or_init(|| self.source.boottime_ms())
+    }
+    fn entries(&self, path: &str) -> Result<Vec<String>, Missing> {
+        self.source.entries(path)
+    }
+    fn trusted(&self, path: &str) -> Result<String, Missing> {
+        self.source.trusted(path)
+    }
+    fn info(&self, path: &str) -> Result<FileInfo, Missing> {
+        self.source.info(path)
+    }
+    fn runtime(&self) -> Result<Value, Missing> {
+        self.source.runtime()
+    }
+    fn packages(&self, backend: graphics::PackageBackend) -> Result<graphics::Inventory, String> {
+        self.source.packages(backend)
+    }
+    fn module_loader(&self) -> Result<String, Missing> {
+        self.source.module_loader()
+    }
+    fn link_target(&self, path: &str) -> Result<String, Missing> {
+        self.source.link_target(path)
     }
 }
 
@@ -344,16 +386,15 @@ fn system(sources: &impl Sources, os: &Result<OsRelease, Missing>) -> Value {
             text(sources, &format!("/sys/class/dmi/id/{key}")),
         ));
     }
-    let known_profile = (|| {
-        Ok::<_, Missing>(platform::supported_profile(
+    let profile = (|| {
+        Ok::<_, Missing>(platform::profile_mismatch(
             &sources.read("/sys/class/dmi/id/sys_vendor")?,
             &sources.read("/sys/class/dmi/id/product_name")?,
             &sources.read("/sys/class/dmi/id/bios_version")?,
             &sources.read("/proc/cpuinfo")?,
         ))
-    })()
-    .unwrap_or(false);
-    fields.push(if known_profile {
+    })();
+    fields.push(if matches!(profile, Ok(None)) {
         field(
             "hardware_profile",
             "Controller profile",
@@ -363,10 +404,9 @@ fn system(sources: &impl Sources, os: &Result<OsRelease, Missing>) -> Value {
         warning(
             "hardware_profile",
             "Controller profile",
-            &format!(
-                "supported U300 DMI/BIOS/CPU profile not confirmed (requires BIOS {}); hardware control must remain disabled",
-                platform::KNOWN_BIOS
-            ),
+            &profile.ok().flatten().unwrap_or_else(|| {
+                "hardware identity is incomplete; supported profile cannot be confirmed".into()
+            }),
         )
     });
     section("system", "System", fields)
@@ -465,7 +505,7 @@ fn fan(sources: &impl Sources, snapshot: &Result<Value, Missing>) -> Value {
     fields.push(note(
         "scope",
         "EC access check",
-        "No raw EC file was opened or write attempted. An absent interface may be unloaded or unavailable; check the exact running kernel. fan_control=false does not require ec_sys. See https://github.com/ishad0w/minibookx-ctl/blob/main/docs/reference/kernel-support.md",
+        concat!("No raw EC file was opened or write attempted. An absent interface may be unloaded or unavailable; check the exact running kernel. fan_control=false does not require ec_sys. See ", doc_url!("reference/kernel-support.md")),
     ));
     section("fan", "Fan control", fields)
 }
@@ -995,9 +1035,9 @@ fn runtime(sources: &impl Sources, snapshot: &Result<Value, Missing>) -> Value {
         .and_then(|v| v.pointer("/policy/active"))
         .and_then(Value::as_bool)
         == Some(true)
-        && unit_population(sources) == Ok(false)
+        && unit_population(sources) != Ok(true)
     {
-        fields.push(warning("record_liveness", "Status consistency", "record says active but unit cgroup is empty; records may be left from a stopped service"));
+        fields.push(warning("record_liveness", "Status consistency", "record says active but a populated unit cgroup is not confirmed; records may be left from a stopped service"));
     }
     match snapshot {
         Err(error) => fields.push(field("service", "Controller records", Err(*error))),
@@ -1063,46 +1103,78 @@ fn accepted(snapshot: &Result<Value, Missing>) -> Result<&Value, Missing> {
 }
 
 fn accepted_limit(value: &Value, index: usize) -> Result<Option<i64>, Missing> {
-    if value["pl1_w"]
-        .as_i64()
-        .zip(value["pl2_w"].as_i64())
-        .is_some_and(|(a, b)| a > b)
-    {
-        return Err(Missing::Invalid);
+    let limit = |key| {
+        let field = value.get(key).ok_or(Missing::Invalid)?;
+        if field.is_null() {
+            return Ok(None);
+        }
+        u32::try_from(field.as_u64().ok_or(Missing::Invalid)?)
+            .map(Some)
+            .map_err(|_| Missing::Invalid)
+    };
+    let config = crate::power::PowerConfig {
+        enabled: true,
+        pl1_w: limit("pl1_w")?,
+        pl2_w: limit("pl2_w")?,
+    };
+    config.validate().map_err(|_| Missing::Invalid)?;
+    Ok(if index == 0 {
+        config.pl1_w
+    } else {
+        config.pl2_w
     }
-    let key = if index == 0 { "pl1_w" } else { "pl2_w" };
-    let field = value.get(key).ok_or(Missing::Invalid)?;
-    if field.is_null() {
-        return Ok(None);
-    }
-    field
-        .as_i64()
-        .filter(|v| (5..=if index == 0 { 28 } else { 30 }).contains(v))
-        .map(Some)
-        .ok_or(Missing::Invalid)
+    .map(i64::from))
 }
 
-fn accepted_curve(value: &Value) -> Result<String, Missing> {
+fn accepted_fan_config(value: &Value) -> Result<crate::policy::Config, Missing> {
+    use crate::policy::{Config, MAX_STEPS, Step};
     let steps = value["fan_curve"]
         .as_array()
-        .filter(|a| !a.is_empty() && a.len() <= 16)
+        .filter(|a| !a.is_empty() && a.len() <= MAX_STEPS)
         .ok_or(Missing::Invalid)?;
-    let mut previous = (0, 0);
-    let mut result = Vec::new();
-    for step in steps {
-        let at = step["at_mc"].as_i64().ok_or(Missing::Invalid)?;
-        let pwm = step["pwm_percent"].as_i64().ok_or(Missing::Invalid)?;
-        if !(20_000..=100_000).contains(&at)
-            || !(35..=80).contains(&pwm)
-            || at <= previous.0
-            || pwm < previous.1
-        {
-            return Err(Missing::Invalid);
+    let mut config = Config {
+        steps: steps
+            .iter()
+            .map(|step| {
+                Ok(Step {
+                    at_mc: i32::try_from(step["at_mc"].as_i64().ok_or(Missing::Invalid)?)
+                        .map_err(|_| Missing::Invalid)?,
+                    pwm_percent: u8::try_from(
+                        step["pwm_percent"].as_u64().ok_or(Missing::Invalid)?,
+                    )
+                    .map_err(|_| Missing::Invalid)?,
+                })
+            })
+            .collect::<Result<_, Missing>>()?,
+        ..Config::default()
+    };
+    // Defaults are only used to validate sparse older records. Missing fields
+    // below are still reported as unavailable, never as observed defaults.
+    for (key, target) in [
+        ("hysteresis_mc", &mut config.hysteresis_mc),
+        ("emergency_mc", &mut config.emergency_mc),
+    ] {
+        if let Some(field) = value.get(key) {
+            *target = i32::try_from(field.as_i64().ok_or(Missing::Invalid)?)
+                .map_err(|_| Missing::Invalid)?;
         }
-        result.push(format!("{:.1}°C→{pwm}%", at as f64 / 1000.));
-        previous = (at, pwm);
     }
-    Ok(result.join(", "))
+    for (key, target) in [
+        ("start_hold_ms", &mut config.start_hold),
+        ("up_hold_ms", &mut config.up_hold),
+        ("down_hold_ms", &mut config.down_hold),
+        ("min_on_ms", &mut config.min_on),
+        ("idle_interval_ms", &mut config.idle_interval),
+        ("active_interval_ms", &mut config.active_interval),
+    ] {
+        if let Some(field) = value.get(key) {
+            *target = std::time::Duration::from_millis(field.as_u64().ok_or(Missing::Invalid)?);
+        }
+    }
+    config
+        .validate_for_hardware()
+        .map_err(|_| Missing::Invalid)?;
+    Ok(config)
 }
 
 fn configuration(
@@ -1117,6 +1189,15 @@ fn configuration(
         "Configuration file metadata",
     )];
     fields.push(note("source", "Configuration source", "values below are the worker's LAST ACCEPTED configuration; current on-disk contents are not read or compared"));
+    if snapshot
+        .as_ref()
+        .ok()
+        .and_then(|v| v.pointer("/policy/power_deferred"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        fields.push(warning("power_deferred", "Last power request", "not applied; optional power control is unavailable or awaiting recovery. Fan/tablet control continues; inspect the service journal"));
+    }
     let rejected = snapshot
         .as_ref()
         .ok()
@@ -1145,6 +1226,7 @@ fn configuration(
             Err(error),
         )),
         Ok(value) => {
+            let config = accepted_fan_config(value);
             fields.push(field(
                 "fan_control",
                 "Accepted fan control",
@@ -1166,7 +1248,23 @@ fn configuration(
             fields.push(field(
                 "fan_curve",
                 "Accepted fan curve (PWM, not RPM)",
-                accepted_curve(value),
+                config
+                    .as_ref()
+                    .map(|config| {
+                        config
+                            .steps
+                            .iter()
+                            .map(|step| {
+                                format!(
+                                    "{:.1}°C→{}%",
+                                    f64::from(step.at_mc) / 1000.,
+                                    step.pwm_percent
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .map_err(|error| *error),
             ));
             fields.push(field(
                 "power_control",
@@ -1192,24 +1290,27 @@ fn configuration(
                 ));
             }
             if expanded {
-                for (key, label, max) in [
-                    ("hysteresis_mc", "Accepted hysteresis m°C", 15_000),
-                    ("emergency_mc", "Accepted emergency threshold m°C", 95_000),
-                    ("start_hold_ms", "Accepted start hold ms", 120_000),
-                    ("up_hold_ms", "Accepted speed-increase hold ms", 120_000),
-                    ("down_hold_ms", "Accepted cooling hold ms", 120_000),
-                    ("min_on_ms", "Accepted minimum run ms", 300_000),
-                    ("idle_interval_ms", "Accepted idle sampling ms", 10_000),
-                    ("active_interval_ms", "Accepted active sampling ms", 10_000),
+                for (key, label) in [
+                    ("hysteresis_mc", "Accepted hysteresis m°C"),
+                    ("emergency_mc", "Accepted emergency threshold m°C"),
+                    ("start_hold_ms", "Accepted start hold ms"),
+                    ("up_hold_ms", "Accepted speed-increase hold ms"),
+                    ("down_hold_ms", "Accepted cooling hold ms"),
+                    ("min_on_ms", "Accepted minimum run ms"),
+                    ("idle_interval_ms", "Accepted idle sampling ms"),
+                    ("active_interval_ms", "Accepted active sampling ms"),
                 ] {
                     fields.push(field(
                         key,
                         label,
-                        value[key]
-                            .as_u64()
-                            .filter(|v| *v <= max)
-                            .map(|v| v.to_string())
-                            .ok_or(Missing::Invalid),
+                        config.as_ref().map_err(|error| *error).and_then(|_| {
+                            value
+                                .get(key)
+                                .ok_or(Missing::Absent)?
+                                .as_u64()
+                                .map(|v| v.to_string())
+                                .ok_or(Missing::Invalid)
+                        }),
                     ));
                 }
             }
@@ -1219,23 +1320,7 @@ fn configuration(
 }
 
 fn rapl_read(sources: &impl Sources, path: &Path) -> Result<String, rapl::ReadError> {
-    sources
-        .read(path.to_str().ok_or(rapl::ReadError::Invalid)?)
-        .map_err(|error| match error {
-            Missing::Absent => rapl::ReadError::Absent,
-            Missing::Permission => rapl::ReadError::Permission,
-            Missing::Invalid => rapl::ReadError::Invalid,
-            Missing::Other => rapl::ReadError::Other,
-        })
-}
-
-fn rapl_error(error: rapl::ReadError) -> Missing {
-    match error {
-        rapl::ReadError::Absent => Missing::Absent,
-        rapl::ReadError::Permission => Missing::Permission,
-        rapl::ReadError::Invalid => Missing::Invalid,
-        rapl::ReadError::Other => Missing::Other,
-    }
+    sources.read(path.to_str().ok_or(rapl::ReadError::Invalid)?)
 }
 
 #[cfg(test)]
@@ -1244,7 +1329,7 @@ fn rapl_limits(sources: &impl Sources) -> [Result<i64, Missing>; 2] {
         rapl_read(sources, path)
     })
     .limits_uw
-    .map(|value| value.map(|v| v as i64).map_err(rapl_error))
+    .map(|value| value.map(|v| v as i64))
 }
 
 fn broker_power(snapshot: &Result<Value, Missing>) -> Result<&Value, Missing> {
@@ -1277,9 +1362,7 @@ fn broker_pair(snapshot: &Result<Value, Missing>, key: &str) -> Result<[u64; 2],
         values[0].as_u64().ok_or(Missing::Invalid)?,
         values[1].as_u64().ok_or(Missing::Invalid)?,
     ];
-    if !(5_000_000..=28_000_000).contains(&pair[0]) || pair[1] < pair[0] || pair[1] > 30_000_000 {
-        return Err(Missing::Invalid);
-    }
+    crate::power::validate_pair(pair).map_err(|_| Missing::Invalid)?;
     Ok(pair)
 }
 
@@ -1297,7 +1380,7 @@ fn power(sources: &impl Sources, snapshot: &Result<Value, Missing>) -> Value {
     });
     for (index, current) in observed.limits_uw.iter().enumerate() {
         let label = if index == 0 { "PL1" } else { "PL2" };
-        let actual = current.map_err(rapl_error);
+        let actual = *current;
         fields.push(field(
             &format!("actual_{label}"),
             &format!("Current RAPL {label}"),
@@ -1326,9 +1409,7 @@ fn power(sources: &impl Sources, snapshot: &Result<Value, Missing>) -> Value {
         fields.push(field(
             &format!("window_{label}"),
             &format!("Current {label} time window"),
-            observed.windows_us[index]
-                .map(|v| format!("{v} µs"))
-                .map_err(rapl_error),
+            observed.windows_us[index].map(|v| format!("{v} µs")),
         ));
         let comparison = match accepted(snapshot) {
             Err(error) => field(
@@ -1336,6 +1417,24 @@ fn power(sources: &impl Sources, snapshot: &Result<Value, Missing>) -> Value {
                 &format!("{label} numeric readback"),
                 Err(error),
             ),
+            Ok(_)
+                if snapshot
+                    .as_ref()
+                    .ok()
+                    .and_then(|v| v.pointer("/policy/power_deferred"))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                    || broker_power(snapshot)
+                        .ok()
+                        .and_then(|v| v["error"].as_str())
+                        .is_some() =>
+            {
+                warning(
+                    &format!("compare_{label}"),
+                    &format!("{label} numeric readback"),
+                    "last power request deferred; numeric equality does not confirm it was applied",
+                )
+            }
             Ok(value) if value["power_control"].as_bool() == Some(false) => field(
                 &format!("compare_{label}"),
                 &format!("{label} numeric readback"),
@@ -1402,19 +1501,25 @@ fn power(sources: &impl Sources, snapshot: &Result<Value, Missing>) -> Value {
     fields.push(field(
         "package_enabled",
         "Package powercap enabled",
-        observed
-            .package_enabled
-            .map(|v| v.to_string())
-            .map_err(rapl_error),
+        observed.package_enabled.map(|v| v.to_string()),
     ));
     for key in ["restoration_pending", "uncertain"] {
         fields.push(if !live_policy(sources, snapshot) {
             note(key, if key == "uncertain" { "Broker write state" } else { "Broker restoration state" }, "no recent live policy confirmed; saved broker record cannot establish current override or restoration state")
+        } else if key == "restoration_pending" && broker_power(snapshot).ok().and_then(|value| value[key].as_bool()) == Some(true) {
+            warning(key, "Broker restoration pending", "retain the power journal; unresolved recovery can quarantine new overrides without stopping fan/tablet control")
         } else if key == "uncertain" && broker_power(snapshot).ok().and_then(|value| value[key].as_bool()) == Some(true) {
             warning(key, "Broker write state uncertain", "write or restoration could not be confirmed; inspect journalctl -u minibookx-ctl and preserve recovery records")
         } else {
             field(key, if key == "uncertain" { "Broker write state uncertain" } else { "Broker restoration pending" }, broker_power(snapshot).and_then(|value| value[key].as_bool().map(|v| v.to_string()).ok_or(Missing::Invalid)))
         });
+    }
+    if live_policy(sources, snapshot)
+        && let Some(error) = broker_power(snapshot)
+            .ok()
+            .and_then(|value| value["error"].as_str())
+    {
+        fields.push(warning("power_error", "Last broker power error", error));
     }
     fields.push(note("broker_record_scope", "Broker record scope", "saved baseline and last readback describe the broker's last published record. Recovery after process loss may happen later; use live status and the service journal to establish current ownership"));
     fields.push(note("enforcement", "RAPL verification limits", "numeric readback is not proof of hardware enforcement. Package enabled is not independent PL1/PL2 enable status; per-limit enable and firmware lock are unknown through this report's powercap ABI"));
@@ -1449,6 +1554,23 @@ fn integrations(sources: &impl Sources, snapshot: &Result<Value, Missing>) -> Va
             .map(|v| format!("{v} (reported state; not a fresh physical-posture test)"))
             .ok_or(Missing::Absent),
     ));
+    if let Some(reason) = snapshot
+        .as_ref()
+        .ok()
+        .and_then(|value| value.pointer("/tablet/reason"))
+        .and_then(Value::as_str)
+    {
+        if ["Unavailable", "RecoveryPending"].contains(&reason) {
+            fields.push(warning("tablet_detection", "Tablet detection unavailable",
+                "physical input has been released; inspect the sensor/lid recovery and retry status in the service journal"));
+        } else {
+            fields.push(field(
+                "tablet_reason",
+                "Tablet detection state",
+                Ok(reason.into()),
+            ));
+        }
+    }
     fields.push(field(
         "sensor_proxy",
         "iio-sensor-proxy unit",
@@ -1479,6 +1601,12 @@ fn collect(sources: &impl Sources) -> Value {
 }
 
 fn collect_mode(sources: &impl Sources, expanded: bool) -> Value {
+    let cached = Snapshot {
+        source: sources,
+        reads: Default::default(),
+        clock: Default::default(),
+    };
+    let sources = &cached;
     let snapshot = sources.runtime();
     let os = os_release(sources);
     let mut display = display(sources);
@@ -1508,14 +1636,14 @@ fn collect_mode(sources: &impl Sources, expanded: bool) -> Value {
         }
     }
     json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "mode": if expanded { "debug" } else { "doctor" },
         "binary_version": build_info::VERSION,
         "read_only": true,
         "sections": sections,
         "notes": [
             "No hardware writes, raw EC/I2C probes, module loads or configuration changes were made.",
-            "Unavailable fields are expected on some kernels. Use sudo only to read fields marked permission-denied.",
+            "Unavailable fields may reflect a stopped service or a missing interface. Fields marked permission-denied require access allowed by host policy.",
             "Serial numbers, MAC addresses, user names and the kernel command line are not collected. Review the report before sharing it."
         ]
     })
@@ -1597,12 +1725,19 @@ fn concise(section: &mut Value) {
         "service" => Some((
             "service_action",
             "Service help",
-            "if startup failed, run systemctl status minibookx-ctl and journalctl -u minibookx-ctl; see https://github.com/ishad0w/minibookx-ctl/blob/main/docs/guide/troubleshooting.md",
+            concat!(
+                "if startup failed, run systemctl status minibookx-ctl and journalctl -u minibookx-ctl; see ",
+                doc_url!("guide/troubleshooting.md")
+            ),
         )),
         "graphics" => Some((
             "graphics_action",
             "Graphics help",
-            "graphics/media packages are optional to the controller. See https://github.com/ishad0w/minibookx-ctl/blob/main/docs/guide/graphics.md for manual setup; debug includes installed versions and codec advice",
+            concat!(
+                "graphics/media packages are optional to the controller. See ",
+                doc_url!("guide/graphics.md"),
+                " for manual setup; debug includes installed versions and codec advice"
+            ),
         )),
         _ => None,
     };
@@ -1709,6 +1844,7 @@ mod tests {
             self.infos.get(path).cloned().ok_or(Missing::Absent)
         }
         fn boottime_ms(&self) -> Result<u64, Missing> {
+            self.reads.borrow_mut().push("<boottime>".into());
             self.clock_ms.ok_or(Missing::Absent)
         }
         fn link_target(&self, path: &str) -> Result<String, Missing> {
@@ -1761,6 +1897,96 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn stopped_reports_do_not_misidentify_unavailable_state_as_kernel_support() {
+        let report = collect(&Fixture::default());
+        assert_eq!(report["schema_version"], 3);
+        for name in ["service", "fan", "power", "tablet"] {
+            let section = report["sections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|section| section["key"] == name)
+                .unwrap();
+            assert!(!section.to_string().contains("not exposed by this system"));
+        }
+    }
+
+    #[test]
+    fn another_cpu_is_never_given_the_u300_bios_as_a_fix() {
+        let mut fixture = Fixture::default();
+        fixture.put("/sys/class/dmi/id/sys_vendor", "CHUWI");
+        fixture.put("/sys/class/dmi/id/product_name", "MiniBook X");
+        fixture.put("/sys/class/dmi/id/bios_version", "Other board firmware");
+        fixture.put("/proc/cpuinfo", "model name : Intel(R) N100");
+        let report = collect(&fixture);
+        let row = report_row(&report, "system", "hardware_profile");
+        assert_eq!(row["state"], "warning");
+        let message = row["message"].as_str().unwrap();
+        assert!(!message.contains(platform::KNOWN_BIOS));
+        assert!(message.contains("CPU"));
+        assert!(message.contains("do not flash"));
+    }
+
+    #[test]
+    fn report_reuses_clock_cgroup_and_dmi_observations() {
+        let mut fixture = Fixture {
+            snapshot: Some(Ok(policy_snapshot(10_000))),
+            clock_ms: Some(11_000),
+            ..Fixture::default()
+        };
+        fixture.put(&format!("{UNIT_CGROUP}/cgroup.events"), "populated 1\n");
+        collect_mode(&fixture, true);
+        let reads = fixture.reads.borrow();
+        for path in [
+            "<boottime>",
+            "/proc/cpuinfo",
+            "/sys/class/dmi/id/bios_version",
+            "/sys/class/dmi/id/sys_vendor",
+        ] {
+            assert_eq!(
+                reads.iter().filter(|read| read.as_str() == path).count(),
+                1,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            reads
+                .iter()
+                .filter(|read| read.ends_with("/cgroup.events"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn old_active_records_warn_when_the_cgroup_is_absent() {
+        let fixture = Fixture {
+            snapshot: Some(Ok(policy_snapshot(10_000))),
+            ..Fixture::default()
+        };
+        let report = collect(&fixture);
+        assert_eq!(
+            report_row(&report, "service", "record_liveness")["state"],
+            "warning"
+        );
+    }
+
+    #[test]
+    fn tablet_failure_is_visible_in_the_concise_report() {
+        let fixture = Fixture {
+            snapshot: Some(Ok(
+                json!({"tablet":{"tablet":false,"reason":"Unavailable"}}),
+            )),
+            ..Fixture::default()
+        };
+        let report = collect(&fixture);
+        assert_eq!(
+            report_row(&report, "tablet", "tablet_detection")["state"],
+            "warning"
+        );
     }
 
     #[test]
@@ -2030,6 +2256,40 @@ mod tests {
         assert_eq!(
             record_age(&fixture, &fixture.runtime()),
             Err(Missing::Invalid)
+        );
+    }
+    #[test]
+    fn deferred_power_is_visible_and_never_certifies_a_numeric_match() {
+        let mut snapshot = policy_snapshot(10_000);
+        snapshot["policy"]["power_deferred"] = json!(true);
+        snapshot["power"] = json!({"schema_version":1,"source":"broker-power-state","error":"pending power recovery","restoration_pending":true,"uncertain":false});
+        let mut fixture = Fixture {
+            snapshot: Some(Ok(snapshot)),
+            clock_ms: Some(12_000),
+            ..Fixture::default()
+        };
+        fixture.put(
+            &format!("{UNIT_CGROUP}/cgroup.events"),
+            "populated 1\nfrozen 0\n",
+        );
+        rapl_fixture(&mut fixture, "12000000", "15000000");
+        let report = power(&fixture, &fixture.runtime());
+        let rows = report["fields"].as_array().unwrap();
+        for key in ["compare_PL1", "compare_PL2", "power_error"] {
+            assert_eq!(
+                rows.iter().find(|row| row["key"] == key).unwrap()["state"],
+                "warning"
+            );
+        }
+        let config = configuration(&fixture, &fixture.runtime(), false);
+        assert_eq!(
+            config["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["key"] == "power_deferred")
+                .unwrap()["state"],
+            "warning"
         );
     }
     #[test]

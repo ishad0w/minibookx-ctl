@@ -40,7 +40,7 @@ fn read_number(path: &Path) -> io::Result<u64> {
         .parse()
         .map_err(io::Error::other)
 }
-fn validate_pair(pair: [u64; 2]) -> io::Result<()> {
+pub(crate) fn validate_pair(pair: [u64; 2]) -> io::Result<()> {
     if pair[0] < 5_000_000
         || pair[0] > u64::from(MAX_PL1_W) * 1_000_000
         || pair[1] < pair[0]
@@ -83,6 +83,7 @@ pub struct Manager {
     last: Option<[u64; 2]>,
     owns_journal: bool,
     uncertain: bool,
+    last_error: Option<String>,
 }
 impl Manager {
     pub fn new() -> Self {
@@ -95,6 +96,7 @@ impl Manager {
             last: None,
             owns_journal: false,
             uncertain: false,
+            last_error: None,
         }
     }
     fn discover(&mut self) -> io::Result<()> {
@@ -111,7 +113,9 @@ impl Manager {
         Ok(())
     }
     pub fn apply(&mut self, config: &PowerConfig) -> io::Result<()> {
-        self.apply_with(config, write_pair)
+        let result = self.apply_with(config, write_pair);
+        self.last_error = result.as_ref().err().map(ToString::to_string);
+        result
     }
     fn apply_with(
         &mut self,
@@ -121,6 +125,11 @@ impl Manager {
         config.validate().map_err(io::Error::other)?;
         if !config.enabled {
             return self.restore();
+        }
+        if !self.owns_journal && self.pending_record()? {
+            return Err(io::Error::other(
+                "pending power recovery; limits left untouched until recovery succeeds",
+            ));
         }
         self.discover()?;
         let original = self.original.unwrap();
@@ -171,6 +180,16 @@ impl Manager {
     pub fn uncertain(&self) -> bool {
         self.uncertain
     }
+    fn pending_record(&self) -> io::Result<bool> {
+        match fs::symlink_metadata(&self.journal) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+    pub fn restoration_pending(&self) -> bool {
+        self.owns_journal || self.pending_record().unwrap_or(true)
+    }
     /// Broker-owned attribution, not a fresh hardware reading. A successful
     /// write/readback proves the number was accepted, not thermal enforcement.
     pub fn diagnostic_status(&self) -> serde_json::Value {
@@ -179,8 +198,9 @@ impl Manager {
             "source": "broker-power-state",
             "baseline_uw": self.original,
             "last_applied_uw": self.last,
-            "restoration_pending": self.owns_journal,
+            "restoration_pending": self.restoration_pending(),
             "uncertain": self.uncertain,
+            "error": self.last_error,
         })
     }
     pub fn restore(&mut self) -> io::Result<()> {
@@ -316,6 +336,36 @@ fn restore_at(package: &Path, journal: &Path, owner: u32) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn orphaned_or_foreign_power_state_quarantines_only_opt_in_writes() {
+        let fixture = ConstraintFixture::new(&["long_term", "short_term"]);
+        let mut manager = fixture.manager();
+        let journal = manager.journal.clone();
+        write_journal(
+            &journal,
+            [12_000_000, 15_000_000],
+            [12_000_000, 15_000_000],
+            [14_000_000, 18_000_000],
+        )
+        .unwrap();
+        let paths = constraint_paths(&fixture.0).unwrap();
+        fs::write(&paths[0], "13000000").unwrap();
+        assert!(restore_at(&fixture.0, &journal, unsafe { libc::geteuid() }).is_err());
+        assert!(journal.exists());
+        assert!(
+            manager
+                .apply(&PowerConfig {
+                    enabled: true,
+                    pl1_w: Some(14),
+                    pl2_w: Some(18)
+                })
+                .is_err()
+        );
+        manager.apply(&PowerConfig::default()).unwrap();
+        assert_eq!(fs::read_to_string(&paths[0]).unwrap(), "13000000");
+        assert_eq!(manager.diagnostic_status()["restoration_pending"], true);
+    }
 
     struct ConstraintFixture(PathBuf);
 

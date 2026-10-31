@@ -54,7 +54,7 @@ import json
 from pathlib import Path
 for mode in ('doctor', 'debug'):
     report = json.loads(Path('/tmp/' + mode + '.json').read_text())
-    assert report['schema_version'] == 2
+    assert report['schema_version'] == 3
     assert report['mode'] == mode
     assert report['read_only'] is True
     assert {'system', 'display', 'graphics', 'service', 'configuration', 'fan', 'power', 'tablet'} <= {

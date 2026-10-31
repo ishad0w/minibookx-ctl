@@ -102,12 +102,17 @@ impl<T: EcIo> Fan<T> {
         // Read again after latching manual mode: firmware may have raised its
         // duty between baseline and takeover. Never acknowledge an assumed 0.
         let current = self.io.read(0x4b)?;
-        if current != 0 && !(MIN_RAW..=MAX_RAW).contains(&current) {
+        if current > MAX_RAW {
             return Err(io::Error::other(
                 "unsupported takeover duty; recovery required",
             ));
         }
         self.current = Some(current);
+        if current != 0 && current < MIN_RAW {
+            // Raise a low firmware ramp to the validated minimum. Never
+            // reduce an unknown high firmware duty during takeover.
+            self.apply(MIN_RAW)?;
+        }
         Ok(())
     }
     pub fn apply(&mut self, raw: u8) -> io::Result<bool> {
@@ -281,20 +286,25 @@ mod tests {
     }
     #[test]
     fn takeover_acknowledges_the_last_firmware_update_and_rejects_unknown_duty() {
-        for duty in [MAX_RAW, 1] {
+        for duty in [MAX_RAW, 1, MAX_RAW + 1] {
             let io = Fake::new();
             io.0.borrow_mut().duty_at_takeover = Some(duty);
             let mut fan = Fan::new(io.clone());
-            if duty == MAX_RAW {
+            if duty <= MAX_RAW {
                 fan.activate().unwrap();
-                assert_eq!(fan.current_raw(), Some(MAX_RAW));
-                assert!(!fan.apply(MAX_RAW).unwrap());
+                assert_eq!(fan.current_raw(), Some(duty.max(MIN_RAW)));
+                assert!(!fan.apply(duty.max(MIN_RAW)).unwrap());
             } else {
                 assert!(fan.activate().is_err());
                 assert!(fan.may_be_manual());
             }
             fan.restore().unwrap();
-            assert_eq!(io.0.borrow().writes, [(0x4f, 0x45), (0x4f, 0x05)]);
+            let writes = io.0.borrow().writes.clone();
+            if duty < MIN_RAW {
+                assert_eq!(writes, [(0x4f, 0x45), (0x4b, MIN_RAW), (0x4f, 0x05)]);
+            } else {
+                assert_eq!(writes, [(0x4f, 0x45), (0x4f, 0x05)]);
+            }
         }
     }
     #[test]

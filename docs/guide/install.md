@@ -13,7 +13,7 @@ account. It does not install packages or change your display and bootloader.
   does not, you can still [install with firmware fan control](#without-fan-control).
 
 Managed fan control also needs [debugfs mounted](../reference/kernel-support.md#debugfs),
-which is normally already available on the tested desktop setup.
+and permitted by the host security policy.
 
 The prebuilt binary needs no compiler, kernel headers, DKMS, Python or Git.
 GNOME/Wayland is the tested desktop; see [tablet mode](tablet-mode.md) for its
@@ -55,22 +55,11 @@ For immutable Fedora variants, use their own package-layering procedure.
 
 Leave the laptop in its ordinary working position. Run as your ordinary user:
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/ishad0w/minibookx-ctl/a3e6c07d64128a3add1b9490c17518b4b73b3d0d/install.sh | sh
-```
-
-The bootstrap URL pins a reviewed source commit. It downloads the latest
-release and checks its checksum, then asks for
-sudo to install and start it. If you prefer to read the script first:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/ishad0w/minibookx-ctl/a3e6c07d64128a3add1b9490c17518b4b73b3d0d/install.sh -o install.sh
-less install.sh
-sh install.sh
-```
-
-As with other downloaded software, you are trusting the publisher; a checksum
-is not an independent signature. [Security details](../../SECURITY.md#installer-trust).
+Use the single [installation command in the README](../../README.md#install).
+Its URL pins the reviewed bootstrap; it downloads the latest release and asks
+for sudo to install and start it. To inspect it first, save that URL with
+`curl -fsSL URL -o install.sh`, read `install.sh`, then run `sh install.sh`.
+See [installer trust](../../SECURITY.md#installer-trust) before running it.
 
 The defaults enable **Balance fan control** and **tablet detection**. CPU power
 limits remain unchanged. Check that the service started:
@@ -126,7 +115,7 @@ the latest example is saved at `/usr/local/share/doc/minibookx-ctl/presets.conf`
 To select a published version with the downloaded script:
 
 ```sh
-sh install.sh --release v0.1.5
+sh install.sh --release vX.Y.Z
 ```
 
 To remove the binary and service:

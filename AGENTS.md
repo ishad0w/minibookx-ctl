@@ -103,6 +103,15 @@ markers. Publishing requires an explicit manual run on main with `publish=true`
 after the version bump. Native/musl fixture checks, the systemd VM and all
 distribution suites must pass before publication.
 
+The `Required CI checks` GitHub ruleset protects `main` without bypasses. Open a
+pull request and wait for its required checks before merging. Manual workflow
+runs alone do not satisfy this ruleset. Keep all nine required job names in
+sync with the workflow matrix. Squash a release PR with the canonical commit
+title, then build and publish from the resulting main commit.
+Release immutability is enabled for new releases starting with v0.1.5; verify
+the published release's immutable flag. Do not give CI an administration token
+to read or change repository settings.
+
 History rewrites and removal of public release artifacts require an explicit
 human request; normal releases preserve earlier versions. Keep release
 permissions out of PR jobs. Recheck material changes before publication.

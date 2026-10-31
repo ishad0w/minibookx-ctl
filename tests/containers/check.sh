@@ -34,6 +34,18 @@ cp /test-binary /tmp/minibookx-ctl
 chmod 755 /tmp/minibookx-ctl
 /tmp/minibookx-ctl --version
 /tmp/minibookx-ctl --help
+if /tmp/minibookx-ctl --check-config /source/config/presets.conf > /tmp/root-config-check 2>&1; then
+    echo 'Config parsing must not run as root.' >&2
+    exit 1
+fi
+grep -q 'ordinary user or the service account' /tmp/root-config-check
+for command in --inspect --monitor --simulate --capabilities; do
+    if /tmp/minibookx-ctl "$command" > /tmp/dev-tools-check 2>&1; then
+        echo 'Release unexpectedly includes a development command.' >&2
+        exit 1
+    fi
+    grep -q 'unknown command' /tmp/dev-tools-check
+done
 python3 /source/tests/tooling/verify_units.py
 /tmp/minibookx-ctl --doctor --json > /tmp/doctor.json
 /tmp/minibookx-ctl --debug --json > /tmp/debug.json

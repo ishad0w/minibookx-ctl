@@ -217,7 +217,7 @@ security and pin-routing effects.
 
 ## Complete Setup option catalogue
 
-[Download the BIOS option catalogue](bios-options.csv) to search the captured
+[Download the BIOS option catalogue](https://github.com/ishad0w/minibookx-ctl/blob/main/contrib/bios/setup-options.csv) to search the captured
 Setup module beyond the settings discussed above. Open it in a spreadsheet,
 import every column as **text**, and filter by `form` or `prompt`. For example,
 search for `Power Limit`, `Voltage`, `LCD`, `DCI` or `Charging`. Importing as text
@@ -286,6 +286,5 @@ value. Password rows describe the firmware's password controls only.
 | Original IFR text listing | `4465fa93e58838d2601af350b9dc80451b0f7cdb548e302a3d710b578933e273` |
 
 These identities distinguish this firmware from other MiniBook X revisions.
-They do not establish compatibility with a later BIOS. The CSV is an archived
-reference; it is not generated during installation or maintained by rewriting
-this guide.
+Re-extract and check the catalogue when the firmware changes. The CSV is kept
+in the repository and corresponding source archive, outside the runtime bundle.

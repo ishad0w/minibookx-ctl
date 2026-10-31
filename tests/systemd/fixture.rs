@@ -323,7 +323,7 @@ mod sensor {
 
 mod tablet {
     pub use minibookx_ctl::tablet::{
-        Estimate, EstimateReason, EstimatorConfig, HingeEstimator, SAMPLE_INTERVAL, Sample,
+        Estimate, EstimateReason, HingeEstimator, SAMPLE_INTERVAL, Sample,
     };
     use std::{
         fs::{File, OpenOptions},

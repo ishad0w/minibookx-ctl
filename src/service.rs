@@ -37,7 +37,7 @@ impl Client {
 }
 pub struct ProxyFan {
     client: Client,
-    manual: bool,
+    release_on_drop: bool,
 }
 pub struct AppliedFan {
     pub raw: u8,
@@ -63,13 +63,13 @@ impl ProxyFan {
     }
     pub fn restore(&mut self) -> io::Result<()> {
         self.client.call(Request::Restore)?;
-        self.manual = false;
+        self.release_on_drop = false;
         Ok(())
     }
 }
 impl Drop for ProxyFan {
     fn drop(&mut self) {
-        if self.manual {
+        if self.release_on_drop {
             let _ = self.restore();
         }
     }
@@ -92,7 +92,7 @@ impl Session {
                     socket,
                     sequence: 0,
                 },
-                manual: false,
+                release_on_drop: false,
             },
             fan_control,
         };
@@ -100,6 +100,7 @@ impl Session {
             .fan
             .client
             .call(Request::Initialize { fan_control })?;
+        session.fan.release_on_drop = true;
         session
             .fan
             .client
@@ -108,8 +109,8 @@ impl Session {
         Ok(session)
     }
     pub fn activate(&mut self) -> io::Result<Option<u8>> {
+        self.fan.release_on_drop = true;
         let reply = self.fan.client.call(Request::Activate)?;
-        self.fan.manual = self.fan_control;
         if self.fan_control && reply.actual_raw.is_none() {
             return Err(io::Error::other("broker omitted takeover duty"));
         }
@@ -123,6 +124,9 @@ impl Session {
     }
     pub fn apply_power(&mut self, config: &PowerConfig) -> io::Result<()> {
         config.validate().map_err(io::Error::other)?;
+        // A failed reply cannot prove that a partial power transaction did not
+        // happen. The fallback must also cover fan_control=false sessions.
+        self.fan.release_on_drop = true;
         self.fan
             .client
             .call(Request::Power(config.clone()))
@@ -159,6 +163,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn failed_power_request_still_releases_a_fanless_session_on_drop() {
+        let (worker, broker) = UnixDatagram::pair().unwrap();
+        for socket in [&worker, &broker] {
+            socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+        }
+        let server = std::thread::spawn(move || {
+            let mut bytes = [0; crate::ipc::REQUEST_BYTES + 1];
+            let count = broker.recv(&mut bytes).unwrap();
+            let (request, sequence) = Request::decode(&bytes[..count]).unwrap();
+            assert!(matches!(request, Request::Power(_)));
+            broker
+                .send(
+                    &Reply {
+                        sequence,
+                        rejected: true,
+                        ..Reply::default()
+                    }
+                    .encode(),
+                )
+                .unwrap();
+            let count = broker.recv(&mut bytes).unwrap();
+            let (request, sequence) = Request::decode(&bytes[..count]).unwrap();
+            assert_eq!(request, Request::Restore);
+            broker
+                .send(
+                    &Reply {
+                        sequence,
+                        ..Reply::default()
+                    }
+                    .encode(),
+                )
+                .unwrap();
+        });
+        let mut session = Session {
+            fan: ProxyFan {
+                client: Client {
+                    socket: worker,
+                    sequence: 0,
+                },
+                release_on_drop: false,
+            },
+            fan_control: false,
+        };
+        assert!(
+            session
+                .apply_power(&PowerConfig {
+                    enabled: true,
+                    pl1_w: Some(12),
+                    pl2_w: Some(15)
+                })
+                .is_err()
+        );
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn unchanged_reply_still_reports_a_broker_override_to_the_worker() {
         let (worker, broker) = UnixDatagram::pair().unwrap();
         worker
@@ -193,7 +256,7 @@ mod tests {
                 socket: worker,
                 sequence: 0,
             },
-            manual: false,
+            release_on_drop: false,
         };
         let applied = fan.apply(0).unwrap();
         assert!(!applied.changed);

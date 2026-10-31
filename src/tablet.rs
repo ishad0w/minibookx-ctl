@@ -406,16 +406,16 @@ impl power::SensorIo for Secondary {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct EstimatorConfig {
-    pub tablet_enter_deg: f64,
-    pub tablet_exit_deg: f64,
-    pub folded_window_deg: f64,
-    pub min_projected_ratio: f64,
-    pub max_direction_step_deg: f64,
+struct EstimatorConfig {
+    tablet_enter_deg: f64,
+    tablet_exit_deg: f64,
+    folded_window_deg: f64,
+    min_projected_ratio: f64,
+    max_direction_step_deg: f64,
     /// A longer gap breaks continuity; it cannot contribute to settling time.
-    pub max_sample_gap: Duration,
-    pub settle: Duration,
-    pub invalid_timeout: Duration,
+    max_sample_gap: Duration,
+    settle: Duration,
+    invalid_timeout: Duration,
 }
 
 impl Default for EstimatorConfig {
@@ -430,31 +430,6 @@ impl Default for EstimatorConfig {
             settle: Duration::from_millis(500),
             invalid_timeout: Duration::from_millis(1500),
         }
-    }
-}
-
-impl EstimatorConfig {
-    pub fn validate(&self) -> io::Result<()> {
-        if !self.tablet_enter_deg.is_finite()
-            || !self.tablet_exit_deg.is_finite()
-            || !self.folded_window_deg.is_finite()
-            || !self.min_projected_ratio.is_finite()
-            || !self.max_direction_step_deg.is_finite()
-            || !(180.0..=250.0).contains(&self.tablet_enter_deg)
-            || !(120.0..180.0).contains(&self.tablet_exit_deg)
-            || self.tablet_exit_deg >= self.tablet_enter_deg
-            || !(1.0..=30.0).contains(&self.folded_window_deg)
-            || !(0.15..=0.7).contains(&self.min_projected_ratio)
-            || !(5.0..=45.0).contains(&self.max_direction_step_deg)
-            || !(SAMPLE_INTERVAL..=Duration::from_secs(1)).contains(&self.max_sample_gap)
-            || !(Duration::from_millis(200)..=Duration::from_secs(2)).contains(&self.settle)
-            || !(Duration::from_millis(500)..=Duration::from_secs(5))
-                .contains(&self.invalid_timeout)
-            || self.max_sample_gap >= self.invalid_timeout
-        {
-            return Err(invalid("invalid U300 tablet estimator configuration"));
-        }
-        Ok(())
     }
 }
 
@@ -518,6 +493,7 @@ fn geometry(
     Ok((lid, base, angle))
 }
 
+#[derive(Default)]
 pub struct HingeEstimator {
     config: EstimatorConfig,
     tablet: bool,
@@ -528,18 +504,6 @@ pub struct HingeEstimator {
 }
 
 impl HingeEstimator {
-    pub fn new(config: EstimatorConfig) -> io::Result<Self> {
-        config.validate()?;
-        Ok(Self {
-            config,
-            tablet: false,
-            pending: None,
-            last_good: None,
-            last_now: None,
-            last_vectors: None,
-        })
-    }
-
     pub fn reset(&mut self) {
         self.tablet = false;
         self.pending = None;
@@ -893,7 +857,7 @@ mod tests {
     }
 
     fn estimator() -> HingeEstimator {
-        HingeEstimator::new(EstimatorConfig::default()).unwrap()
+        HingeEstimator::default()
     }
 
     fn synthetic(angle: f64) -> Sample {
@@ -990,7 +954,7 @@ mod tests {
         assert!(!stale.tablet && !stale.reliable);
         assert_eq!(stale.reason, EstimateReason::Stale);
 
-        let mut startup = super::HingeEstimator::new(EstimatorConfig::default()).unwrap();
+        let mut startup = super::HingeEstimator::default();
         assert!(!startup.update(Some(vertical), Some(false), at(0)).tablet);
         assert!(
             !startup

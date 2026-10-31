@@ -57,9 +57,10 @@ the suggested changes.
 
 Checksums detect inconsistent downloads; they are not independent signatures
 and do not protect against a compromised publisher. The publishing tool refuses
-to replace existing public assets. That is a project policy, not a claim that
-GitHub's immutable-release setting is enabled. Source and checksum files are
-included with each release for independent review.
+to replace existing public assets. GitHub release immutability is enabled for
+new releases starting with v0.1.5; older releases are not retroactively locked.
+The publisher verifies the immutable flag after publication. Source and checksum
+files are included with each release.
 
 ## Recovery limits
 

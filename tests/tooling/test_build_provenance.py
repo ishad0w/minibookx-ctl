@@ -247,7 +247,8 @@ else:
                 self.assertEqual(environment["PKG_CONFIG_ALLOW_CROSS"], "1")
                 self.assertIn("target-feature=+crt-static", environment["RUSTFLAGS"])
             self.assertIn("--features", calls[3][1])
-            self.assertIn("systemd-test-fixture", calls[3][1])
+            features = calls[3][1][calls[3][1].index("--features") + 1].split(",")
+            self.assertEqual(set(features), {"systemd-test-fixture", "dev-tools"})
 
             log.unlink()
             result = subprocess.run(

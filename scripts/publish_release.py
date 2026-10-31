@@ -191,6 +191,11 @@ def publish(folder, commit):
             "--draft=false",
             "--latest=" + latest,
         )
+        published = release_info(tag)
+        if published.get("draft") or published.get("immutable") is not True:
+            raise ValueError(
+                "published release is not immutable; inspect repository release settings"
+            )
     print("https://github.com/" + REPO + "/releases/tag/" + tag)
 
 

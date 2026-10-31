@@ -17,8 +17,10 @@ help:
 
 check:
 	cargo fmt --all -- --check
-	cargo clippy --locked --all-targets --features systemd-test-fixture -- -D warnings
-	cargo test --locked --features systemd-test-fixture
+	cargo clippy --locked --bin minibookx-ctl -- -D warnings
+	cargo clippy --locked --all-targets --features systemd-test-fixture,dev-tools -- -D warnings
+	cargo test --locked --bin minibookx-ctl
+	cargo test --locked --features systemd-test-fixture,dev-tools
 	PYTHONPATH=scripts python3 -m unittest discover -s tests/tooling -p 'test_*.py'
 	python3 tests/tooling/verify_units.py
 	python3 tests/tooling/check_docs.py

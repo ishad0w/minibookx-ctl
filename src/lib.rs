@@ -18,4 +18,5 @@ pub mod service;
 pub mod status;
 pub mod systemd;
 pub mod tablet;
+#[cfg(feature = "dev-tools")]
 pub mod thermal;

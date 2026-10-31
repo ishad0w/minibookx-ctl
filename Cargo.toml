@@ -1,12 +1,14 @@
 [package]
 name = "minibookx-ctl"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 publish = false
 license = "Apache-2.0"
 description = "Bounded hardware control for the tested CHUWI MiniBook X U300 revision"
 
 [features]
+# Read-only policy experiments for source builds, excluded from release binaries.
+dev-tools = []
 # Separate hardware-free VM fixture; never part of a normal or release build.
 systemd-test-fixture = []
 

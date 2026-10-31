@@ -725,8 +725,18 @@ def run():
     wait_for(started, "restart failed")
     assert int(props()["MainPID"]) != main
     print("VM_ASSERT PASS restart", flush=True)
+    main = int(props()["MainPID"])
     command("systemctl", "stop", UNIT)
     stopped()
+    shutdown_journal = command(
+        "journalctl", "-b", f"_PID={main}", "--no-pager", "-o", "cat"
+    )
+    assert "policy worker exited cleanly" in shutdown_journal, shutdown_journal
+    assert "policy worker shutdown:" not in shutdown_journal, shutdown_journal
+    print(
+        "VM_ASSERT PASS normal stop reaps a clean worker exit without SIGKILL",
+        flush=True,
+    )
     print("VM_ASSERT PASS stop, ExecStopPost, fan auto, tablet OFF", flush=True)
     hot_takeover()
     tablet_faults()

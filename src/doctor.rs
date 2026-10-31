@@ -2,6 +2,7 @@
 use crate::{build_info, hardware, paths, platform, rapl, status};
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
@@ -231,7 +232,72 @@ fn section(key: &str, title: &str, fields: Vec<Value>) -> Value {
     json!({"key": key, "title": title, "fields": fields})
 }
 
-fn system(sources: &impl Sources) -> Value {
+#[derive(Debug, PartialEq, Eq)]
+struct OsRelease {
+    id: String,
+    version: String,
+    like: String,
+    pretty_name: String,
+}
+
+impl OsRelease {
+    fn parse(input: &str) -> Result<Self, Missing> {
+        let mut values = BTreeMap::new();
+        for line in input.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if !["ID", "VERSION_ID", "ID_LIKE", "PRETTY_NAME"].contains(&key) {
+                continue;
+            }
+            let value = value.trim();
+            let value = match value.as_bytes().first() {
+                Some(quote @ (b'\"' | b'\'')) => value
+                    .strip_prefix(char::from(*quote))
+                    .and_then(|v| v.strip_suffix(char::from(*quote)))
+                    .ok_or(Missing::Invalid)?,
+                _ => value,
+            };
+            let max_bytes = if key == "PRETTY_NAME" { 256 } else { 128 };
+            if value.len() > max_bytes
+                || (key != "PRETTY_NAME"
+                    && !value.bytes().all(|b| {
+                        b.is_ascii_alphanumeric()
+                            || b"._-".contains(&b)
+                            || (key == "ID_LIKE" && b == b' ')
+                    }))
+                || values.insert(key, value.to_owned()).is_some()
+            {
+                return Err(Missing::Invalid);
+            }
+        }
+        let os = Self {
+            id: values.remove("ID").unwrap_or_default(),
+            version: values.remove("VERSION_ID").unwrap_or_default(),
+            like: values.remove("ID_LIKE").unwrap_or_default(),
+            pretty_name: values.remove("PRETTY_NAME").unwrap_or_default(),
+        };
+        if os.id.is_empty() && os.pretty_name.is_empty() {
+            return Err(Missing::Invalid);
+        }
+        Ok(os)
+    }
+}
+
+fn os_release(sources: &impl Sources) -> Result<OsRelease, Missing> {
+    // /etc/os-release may be a symlink rejected by the bounded source reader.
+    // Both reports must use the same selected file and parsed identity.
+    sources
+        .read("/etc/os-release")
+        .or_else(|_| sources.read("/usr/lib/os-release"))
+        .and_then(|text| OsRelease::parse(&text))
+}
+
+fn system(sources: &impl Sources, os: &Result<OsRelease, Missing>) -> Value {
     let mut fields = vec![field(
         "kernel",
         "Kernel",
@@ -242,17 +308,19 @@ fn system(sources: &impl Sources) -> Value {
         "Module loader",
         sources.module_loader(),
     ));
-    let os = sources
-        .read("/etc/os-release")
-        .or_else(|_| sources.read("/usr/lib/os-release"))
-        .and_then(|s| {
-            s.lines()
-                .find_map(|line| line.strip_prefix("PRETTY_NAME="))
-                .map(|name| clean(name.trim_matches(['\'', '"'])))
-                .filter(|s| !s.is_empty())
-                .ok_or(Missing::Invalid)
-        });
-    fields.push(field("distribution", "Distribution", os));
+    fields.push(field(
+        "distribution",
+        "Distribution",
+        os.as_ref()
+            .map(|os| {
+                clean(if os.pretty_name.is_empty() {
+                    &os.id
+                } else {
+                    &os.pretty_name
+                })
+            })
+            .map_err(|error| *error),
+    ));
     let cpu = sources.read("/proc/cpuinfo").and_then(|s| {
         s.lines()
             .find_map(|line| {
@@ -289,13 +357,16 @@ fn system(sources: &impl Sources) -> Value {
         field(
             "hardware_profile",
             "Controller profile",
-            Ok("matches the supported U300 DMI/CPU profile; EC identity not probed".into()),
+            Ok("matches the supported U300 DMI/BIOS/CPU profile; EC identity not probed".into()),
         )
     } else {
         warning(
             "hardware_profile",
             "Controller profile",
-            "supported U300 DMI/CPU profile not confirmed; hardware control must remain disabled",
+            &format!(
+                "supported U300 DMI/BIOS/CPU profile not confirmed (requires BIOS {}); hardware control must remain disabled",
+                platform::KNOWN_BIOS
+            ),
         )
     });
     section("system", "System", fields)
@@ -506,7 +577,30 @@ fn sensors(sources: &impl Sources) -> Value {
                 let root = format!("/sys/class/hwmon/{device}");
                 let driver =
                     text(sources, &format!("{root}/name")).unwrap_or_else(|_| device.clone());
-                for index in 1..=8 {
+                let entries = match sources.entries(&root) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        fields.push(field(
+                            device,
+                            &format!("{driver}: temperature inputs"),
+                            Err(error),
+                        ));
+                        continue;
+                    }
+                };
+                let mut indices: Vec<u16> = entries
+                    .iter()
+                    .filter_map(|name| {
+                        name.strip_prefix("temp")?
+                            .strip_suffix("_input")?
+                            .parse()
+                            .ok()
+                    })
+                    .filter(|index| (1..=4095).contains(index))
+                    .collect();
+                indices.sort_unstable();
+                indices.dedup();
+                for index in indices.into_iter().take(32) {
                     let key = format!("temp{index}");
                     let result = number(sources, &format!("{root}/{key}_input"));
                     if result == Err(Missing::Absent) {
@@ -537,33 +631,23 @@ fn sensors(sources: &impl Sources) -> Value {
             }
         }
     }
-    for (key, path, label) in [
-        ("iio", "/sys/bus/iio/devices", "IIO accelerometers"),
-        ("input", "/sys/class/input", "Tablet switch"),
-    ] {
-        let result = sources.entries(path).and_then(|entries| {
-            let names: Vec<_> = entries
-                .iter()
-                .filter(|name| {
-                    if key == "input" {
-                        name.starts_with("input")
-                    } else {
-                        name.starts_with("iio:device")
-                    }
-                })
-                .take(32)
-                .filter_map(|name| text(sources, &format!("{path}/{name}/name")).ok())
-                .filter(|name| key != "input" || name == crate::tablet::SWITCH_NAME)
-                .collect();
-            if names.is_empty() {
-                Err(Missing::Absent)
-            } else {
-                Ok(names.join(", "))
-            }
-        });
-        fields.push(field(key, label, result));
-    }
-    section("sensors", "Sensors and input", fields)
+    // Tablet-switch discovery belongs to integrations(), including in debug.
+    let path = "/sys/bus/iio/devices";
+    let result = sources.entries(path).and_then(|entries| {
+        let names: Vec<_> = entries
+            .iter()
+            .filter(|name| name.starts_with("iio:device"))
+            .take(32)
+            .filter_map(|name| text(sources, &format!("{path}/{name}/name")).ok())
+            .collect();
+        if names.is_empty() {
+            Err(Missing::Absent)
+        } else {
+            Ok(names.join(", "))
+        }
+    });
+    fields.push(field("iio", "IIO accelerometers", result));
+    section("sensors", "Sensors", fields)
 }
 
 /// DRM's mode dump: name, rounded refresh, clock kHz, hdisplay/hsync/
@@ -871,14 +955,17 @@ fn runtime(sources: &impl Sources, snapshot: &Result<Value, Missing>) -> Value {
         field(
             "process_presence",
             "Service processes",
-            unit_population(sources).map(|v| {
+            match unit_population(sources) {
+                Err(Missing::Absent) => Ok("controller cgroup is absent; no running service confirmed".into()),
+                result => result.map(|v| {
                 if v {
                     "unit cgroup contains processes (kernel observation, not systemd ActiveState)"
                         .into()
                 } else {
                     "unit cgroup is empty; service is not running".into()
                 }
-            }),
+                }),
+            },
         ),
     ];
     match record_age(sources, snapshot) {
@@ -1393,6 +1480,7 @@ fn collect(sources: &impl Sources) -> Value {
 
 fn collect_mode(sources: &impl Sources, expanded: bool) -> Value {
     let snapshot = sources.runtime();
+    let os = os_release(sources);
     let mut display = display(sources);
     display["fields"]
         .as_array_mut()
@@ -1404,9 +1492,9 @@ fn collect_mode(sources: &impl Sources, expanded: bool) -> Value {
         fan(sources, &snapshot),
         power(sources, &snapshot),
         display,
-        graphics::collect(sources),
+        graphics::collect(sources, &os),
         integrations(sources, &snapshot),
-        system(sources),
+        system(sources, &os),
     ];
     if expanded {
         sections.extend([
@@ -1631,6 +1719,115 @@ mod tests {
         fn put(&mut self, path: &str, value: &str) {
             self.files.insert(path.into(), Ok(value.into()));
         }
+    }
+
+    fn report_row<'a>(report: &'a Value, section: &str, key: &str) -> &'a Value {
+        report["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["key"] == section)
+            .unwrap()["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["key"] == key)
+            .unwrap()
+    }
+
+    #[test]
+    fn shared_identity_and_tablet_discovery_are_sampled_once_per_report() {
+        let mut fixture = Fixture::default();
+        fixture.put("/etc/os-release", "ID=arch\nPRETTY_NAME=\"Test Linux\"\n");
+        fixture
+            .directories
+            .insert("/sys/class/input".into(), vec!["input0".into()]);
+        fixture.put("/sys/class/input/input0/name", crate::tablet::SWITCH_NAME);
+        fixture.put("/sys/class/input/input0/capabilities/sw", "2");
+        let report = collect_mode(&fixture, true);
+        assert_eq!(
+            report_row(&report, "system", "distribution")["value"],
+            "Test Linux"
+        );
+        assert_eq!(
+            report_row(&report, "tablet", "tablet_switch")["state"],
+            "ok"
+        );
+        let reads = fixture.reads.borrow();
+        for path in ["/etc/os-release", "/sys/class/input/input0/name"] {
+            assert_eq!(
+                reads.iter().filter(|read| read.as_str() == path).count(),
+                1,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_bios_is_reported_with_the_required_revision_without_relaxing_the_gate() {
+        let mut fixture = Fixture::default();
+        fixture.put("/sys/class/dmi/id/sys_vendor", "CHUWI");
+        fixture.put("/sys/class/dmi/id/product_name", "MiniBook X");
+        fixture.put("/proc/cpuinfo", "model name : Intel(R) Processor U300\n");
+        fixture.put("/sys/class/dmi/id/bios_version", "unknown");
+        let report = collect(&fixture);
+        let row = report_row(&report, "system", "hardware_profile");
+        assert_eq!(row["state"], "warning");
+        assert!(
+            row["message"]
+                .as_str()
+                .unwrap()
+                .contains(platform::KNOWN_BIOS)
+        );
+        fixture.put("/sys/class/dmi/id/bios_version", platform::KNOWN_BIOS);
+        assert_eq!(
+            report_row(&collect(&fixture), "system", "hardware_profile")["state"],
+            "ok"
+        );
+    }
+
+    #[test]
+    fn absent_cgroup_does_not_claim_the_platform_lacks_service_support() {
+        let fixture = Fixture::default();
+        let report = collect(&fixture);
+        let row = report_row(&report, "service", "process_presence");
+        assert_eq!(row["state"], "ok");
+        assert_eq!(
+            row["value"],
+            "controller cgroup is absent; no running service confirmed"
+        );
+    }
+
+    #[test]
+    fn debug_discovers_high_numbered_coretemp_inputs_without_guessing_other_files() {
+        let mut fixture = Fixture::default();
+        fixture
+            .directories
+            .insert("/sys/class/hwmon".into(), vec!["hwmon0".into()]);
+        fixture.directories.insert(
+            "/sys/class/hwmon/hwmon0".into(),
+            vec![
+                "temp1_input".into(),
+                "temp14_input".into(),
+                "tempjunk_input".into(),
+                "temp5000_input".into(),
+            ],
+        );
+        fixture.put("/sys/class/hwmon/hwmon0/name", "coretemp");
+        fixture.put("/sys/class/hwmon/hwmon0/temp1_input", "45000");
+        fixture.put("/sys/class/hwmon/hwmon0/temp14_input", "43000");
+        let report = collect_mode(&fixture, true);
+        assert_eq!(
+            report_row(&report, "sensors", "hwmon0.temp14")["value"],
+            "43.0 °C"
+        );
+        assert!(
+            !fixture
+                .reads
+                .borrow()
+                .iter()
+                .any(|path| path.contains("temp5000") || path.contains("tempjunk"))
+        );
     }
     fn policy_snapshot(stamp: u64) -> Value {
         json!({"policy": {

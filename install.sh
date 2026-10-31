@@ -16,7 +16,7 @@ usage() {
 Usage: sh install.sh [--release TAG | --binary PATH] [--no-enable] [--destdir PATH]
 
 Download the latest release, verify its SHA-256 checksum, and install/start it.
---release TAG   Select an immutable v<major>.<minor>.<patch> release.
+--release TAG   Select a published v<major>.<minor>.<patch> release.
 --binary PATH   Install a local executable instead of downloading a release.
 --no-enable     Preserve service state; restart it only if it was already running.
 --destdir PATH  Stage files without sudo, accounts, service changes or hardware I/O.

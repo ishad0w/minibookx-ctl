@@ -5,12 +5,40 @@
 pub use minibookx_ctl::{ipc, paths, power, status};
 use std::{fs, io, path::Path};
 
+#[path = "../../src/presets.rs"]
+mod actual_presets;
 #[path = "../../src/broker.rs"]
 mod broker;
 #[path = "../../src/policy.rs"]
 mod policy;
-#[path = "../../src/presets.rs"]
-mod presets;
+mod presets {
+    pub use super::actual_presets::*;
+    pub fn load(path: &std::path::Path) -> std::io::Result<Loaded> {
+        if std::env::var_os("NOTIFY_SOCKET").is_some() {
+            return Err(std::io::Error::other(
+                "worker inherited the notifier environment",
+            ));
+        }
+        let loaded = super::actual_presets::load(path)?;
+        if std::path::Path::new("/run/minibookx-ctl/spoof-notify").exists() {
+            // Simulate a compromised worker knowing the manager's endpoint.
+            // NotifyAccess=main must reject it even without environment secrecy.
+            let endpoint = std::fs::read_to_string("/run/minibookx-ctl/notify-endpoint")?;
+            unsafe {
+                std::env::set_var("NOTIFY_SOCKET", endpoint);
+            }
+            super::systemd::Notifier::from_environment()?.send(&format!(
+                "MAINPID={}\nSTATUS=forged by worker\nWATCHDOG=1",
+                std::process::id()
+            ))?;
+            unsafe {
+                std::env::remove_var("NOTIFY_SOCKET");
+            }
+            super::count("spoof-notify")?;
+        }
+        Ok(loaded)
+    }
+}
 #[path = "../../src/runtime.rs"]
 mod runtime;
 #[path = "../../src/service.rs"]
@@ -19,6 +47,7 @@ mod service;
 mod systemd;
 
 const ROOT: &str = "/run/minibookx-ctl";
+const REJECT_START: &[u8] = b"MINIBOOKX_VM_REJECT_START";
 
 fn count(operation: &str) -> io::Result<()> {
     use std::io::Write;
@@ -114,6 +143,9 @@ mod ec {
             Ok(value[0])
         }
         fn write(&mut self, register: u8, value: u8) -> io::Result<()> {
+            if register == 0x4b {
+                super::count(&format!("pwm={value}"))?;
+            }
             if register == 0x4f
                 && value & MANUAL == 0
                 && std::path::Path::new("/run/minibookx-ctl/fail-restore").exists()
@@ -346,16 +378,83 @@ mod tablet {
 
 fn run() -> io::Result<()> {
     hardware::check_profile()?;
+    let mode = std::env::args().nth(1);
+    if mode.as_deref() == Some("--check-config-stdin") {
+        return minibookx_ctl::install::check_config_stdin()
+            .map_err(|e| io::Error::other(e.to_string()));
+    }
     if unsafe { libc::geteuid() } != 0 {
         return Err(io::Error::other("fixture requires guest root"));
     }
-    match std::env::args().nth(1).as_deref() {
+    match mode.as_deref() {
+        Some("--install") => minibookx_ctl::install::run(true, std::env::args().skip(2))
+            .map_err(|e| io::Error::other(e.to_string())),
         Some("--prepare") => hardware::prepare(),
         Some("--recover") => hardware::recover(),
-        Some("--daemon") => broker::run(
-            "/etc/minibookx-ctl/config.conf".into(),
-            !Path::new(&format!("{ROOT}/no-tablet")).exists(),
-        ),
+        Some("--daemon") => {
+            // Only the guest test's candidate copy has this ELF trailer. Its
+            // installer and recovery work, but startup must fail and roll back.
+            if fs::read("/proc/self/exe")?.ends_with(REJECT_START) {
+                return Err(io::Error::other("injected new-version startup failure"));
+            }
+            if let Some(endpoint) = std::env::var_os("NOTIFY_SOCKET") {
+                fs::write(
+                    format!("{ROOT}/notify-endpoint"),
+                    endpoint.as_encoded_bytes(),
+                )?;
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(
+                    format!("{ROOT}/notify-endpoint"),
+                    fs::Permissions::from_mode(0o644),
+                )?;
+            }
+            broker::run(
+                "/etc/minibookx-ctl/config.conf".into(),
+                !Path::new(&format!("{ROOT}/no-tablet")).exists(),
+            )
+        }
+        Some("--sandbox-probe") => {
+            // This node exists only in the diskless test guest; no host block
+            // device is passed through. An open alone must be denied by cgroup.
+            let denied = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/minibookx-test-block")
+                .err();
+            if !denied.is_some_and(|e| e.raw_os_error() == Some(libc::EPERM)) {
+                return Err(io::Error::other("block-device access was not denied"));
+            }
+            // An open tests the actual uinput access without creating a second
+            // switch or bypassing production's U300 identity guard.
+            let _uinput = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/uinput")?;
+            let input_read = fs::OpenOptions::new()
+                .read(true)
+                .open("/dev/minibookx-test-input")
+                .err();
+            if !input_read
+                .is_some_and(|e| matches!(e.raw_os_error(), Some(libc::ENODEV | libc::ENXIO)))
+            {
+                return Err(io::Error::other("input read did not reach the fake device"));
+            }
+            let input_write = fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/minibookx-test-input")
+                .err();
+            if !input_write.is_some_and(|e| e.raw_os_error() == Some(libc::EPERM)) {
+                return Err(io::Error::other("input injection was not denied"));
+            }
+            match fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/i2c-0")
+            {
+                Err(e) if matches!(e.raw_os_error(), Some(libc::ENODEV | libc::ENXIO)) => Ok(()),
+                _ => Err(io::Error::other("I2C open did not reach the fake bus")),
+            }
+        }
         _ => Err(io::Error::other("fixture lifecycle command required")),
     }
 }

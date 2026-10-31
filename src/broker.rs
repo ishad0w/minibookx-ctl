@@ -47,6 +47,73 @@ const CPU_INTERVAL: Duration = Duration::from_secs(1);
 const CHILD_INTERVAL: Duration = Duration::from_secs(1);
 const DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Keep only the newest unsaved value. New observations must not reset a
+/// failed write's deadline or multiply attempts during frequent FD wakes.
+#[derive(Default)]
+struct PendingSnapshot {
+    text: Option<String>,
+    retry_at: Duration,
+}
+impl PendingSnapshot {
+    fn set(&mut self, text: String) {
+        self.text = Some(text);
+    }
+    fn deadline(&self) -> Option<Duration> {
+        self.text.as_ref().map(|_| self.retry_at)
+    }
+    fn flush(
+        &mut self,
+        now: Duration,
+        write: impl FnOnce(&str) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if now < self.retry_at {
+            return Ok(());
+        }
+        if let Some(text) = &self.text {
+            if let Err(error) = write(text) {
+                self.retry_at = now + DIAGNOSTIC_INTERVAL;
+                return Err(error);
+            }
+            self.text = None;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct Snapshots {
+    fan: PendingSnapshot,
+    tablet: PendingSnapshot,
+    power: PendingSnapshot,
+}
+impl Snapshots {
+    fn deadline(&self) -> Option<Duration> {
+        [&self.fan, &self.tablet, &self.power]
+            .into_iter()
+            .filter_map(PendingSnapshot::deadline)
+            .min()
+    }
+    fn flush(&mut self, now: Duration, mut write: impl FnMut(&str, &str) -> io::Result<()>) {
+        for (name, snapshot) in [
+            ("fan", &mut self.fan),
+            ("tablet", &mut self.tablet),
+            ("power", &mut self.power),
+        ] {
+            if let Err(error) = snapshot.flush(now, |text| write(name, text)) {
+                eprintln!("cannot publish broker {name} status: {error}");
+            }
+        }
+    }
+    fn flush_final(&mut self, now: Duration, write: impl FnMut(&str, &str) -> io::Result<()>) {
+        // One best-effort final attempt, after hardware release, without
+        // waiting for a retry timer or publishing an older queued state.
+        for snapshot in [&mut self.fan, &mut self.tablet, &mut self.power] {
+            snapshot.retry_at = Duration::ZERO;
+        }
+        self.flush(now, write);
+    }
+}
+
 /// Independent monotonic deadlines: an IPC or lid event cannot advance another
 /// source's cadence. Skip missed slots rather than replaying stale samples.
 struct Periodic {
@@ -249,19 +316,21 @@ extern "C" fn stop_signal(_: libc::c_int) {
 extern "C" fn reload_signal(_: libc::c_int) {
     RELOAD.store(true, Ordering::Relaxed)
 }
-fn install_signals() {
+fn install_signals() -> io::Result<()> {
     // SAFETY: these handlers only store to lock-free atomic booleans.
-    unsafe {
-        libc::signal(
-            libc::SIGTERM,
-            stop_signal as *const () as libc::sighandler_t,
-        );
-        libc::signal(libc::SIGINT, stop_signal as *const () as libc::sighandler_t);
-        libc::signal(
-            libc::SIGHUP,
-            reload_signal as *const () as libc::sighandler_t,
-        );
+    for (signal, handler) in [
+        (libc::SIGTERM, stop_signal as *const ()),
+        (libc::SIGINT, stop_signal as *const ()),
+        (libc::SIGHUP, reload_signal as *const ()),
+    ] {
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = handler as libc::sighandler_t;
+        // No SA_RESTART: TERM must interrupt the guardian's disarmed read.
+        if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
+    Ok(())
 }
 fn no_new_privileges() -> io::Result<()> {
     // SAFETY: PR_SET_NO_NEW_PRIVS has one integer argument and no pointers.
@@ -567,7 +636,7 @@ impl Drop for Guardian {
 }
 fn guardian_loop(mut socket: UnixStream) -> io::Result<()> {
     STOP.store(false, Ordering::Relaxed);
-    install_signals();
+    install_signals()?;
     // Remain OFF during setup. EOF still detects a dead broker; arm the
     // heartbeat timeout only after the first explicit 0/1 command.
     socket.set_read_timeout(None)?;
@@ -636,7 +705,7 @@ fn spawn_policy(
                 .map_err(|e| io::Error::other(format!("worker privilege boundary: {e}")))?;
             // SAFETY: this child remains single-threaded; no environment readers.
             unsafe {
-                std::env::remove_var("WATCHDOG_PID");
+                std::env::remove_var("NOTIFY_SOCKET");
             }
             service::install_transport(socket);
             let loaded = crate::presets::load(&path)
@@ -666,23 +735,35 @@ fn tablet_status_text(
         "{{\"tablet\":{tablet},\"angle_deg\":{angle},\"reliable\":{reliable},\"reason\":\"{reason}\"}}\n"
     )
 }
-fn tablet_status(
-    tablet: Option<bool>,
-    angle: Option<f64>,
-    reliable: bool,
-    reason: &str,
+/// Fail only this feature after a sensor/lid fault. OFF must be confirmed;
+/// otherwise common service cleanup must restore cooling and retain ownership.
+fn disable_tablet(
+    guardian: &mut Option<Guardian>,
+    sensors: &mut Option<Sensors>,
+    lid: &mut Option<Lid>,
+    snapshot: &mut PendingSnapshot,
+    error: io::Error,
 ) -> io::Result<()> {
-    write_snapshot(
-        "tablet",
-        &tablet_status_text(tablet, angle, reliable, reason),
-    )
+    eprintln!("tablet detection unavailable until service restart: {error}");
+    if let Some(g) = guardian {
+        g.off()?;
+        g.send(b'P')?;
+    }
+    if let Err(error) = restore_sensors(sensors) {
+        // Keep the object and lease for stop/ExecStopPost to retry. This cannot
+        // prevent fan/power protection from continuing in the meantime.
+        eprintln!("tablet sensor restoration pending: {error}");
+    }
+    *lid = None;
+    snapshot.set(tablet_status_text(Some(false), None, false, "Unavailable"));
+    Ok(())
 }
 
 fn write_snapshot(name: &str, text: &str) -> io::Result<()> {
     if text.len() > 4096 {
         return Err(io::Error::other("broker snapshot exceeds its size bound"));
     }
-    // Names are fixed at the three call sites, never accepted through IPC.
+    // Names are fixed in Snapshots, never accepted through IPC.
     let root = Path::new(service::RUN_DIR);
     let temp = root.join(format!("{name}.tmp"));
     use std::os::unix::fs::OpenOptionsExt;
@@ -697,27 +778,24 @@ fn write_snapshot(name: &str, text: &str) -> io::Result<()> {
     f.set_permissions(fs::Permissions::from_mode(0o644))?;
     fs::rename(temp, root.join(format!("{name}.json")))
 }
-fn fan_status(
+fn fan_status_text(
     fan: Option<&ec::Fan<ec::FileEc>>,
     emergency: bool,
     health: &FanHealth,
     now: Duration,
-) -> io::Result<()> {
-    write_snapshot(
-        "fan",
-        &serde_json::json!({
-            "enabled": fan.is_some(),
-            "manual": fan.is_some_and(|fan| fan.may_be_manual()),
-            "actual_raw": fan.and_then(|fan| fan.current_raw()),
-            "emergency_override": emergency,
-            "tach_guard_active": fan.is_some_and(|fan| fan.may_be_manual()),
-            "tach_state": health.state.as_str(),
-            "ec_c": health.temperature,
-            "fan_speed_ec": health.tach,
-            "feedback_age_ms": health.last_check.map(|last| now.saturating_sub(last).as_millis()),
-        })
-        .to_string(),
-    )
+) -> String {
+    serde_json::json!({
+        "enabled": fan.is_some(),
+        "manual": fan.is_some_and(|fan| fan.may_be_manual()),
+        "actual_raw": fan.and_then(|fan| fan.current_raw()),
+        "emergency_override": emergency,
+        "tach_guard_active": fan.is_some_and(|fan| fan.may_be_manual()),
+        "tach_state": health.state.as_str(),
+        "ec_c": health.temperature,
+        "fan_speed_ec": health.tach,
+        "feedback_age_ms": health.last_check.map(|last| now.saturating_sub(last).as_millis()),
+    })
+    .to_string()
 }
 fn startup_mode(request: Request) -> io::Result<bool> {
     match request {
@@ -757,12 +835,6 @@ fn await_startup(socket: &UnixDatagram, child: &mut Child) -> io::Result<(bool, 
         }
     }
 }
-fn power_status(power: &Manager) {
-    if let Err(error) = write_snapshot("power", &power.diagnostic_status().to_string()) {
-        // Diagnostic I/O cannot prevent independent fan/power restoration.
-        eprintln!("cannot publish broker power status: {error}");
-    }
-}
 pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
     hardware::check_profile()?;
     if unsafe { libc::geteuid() } != 0 {
@@ -779,19 +851,35 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
     let (parent, worker) = UnixDatagram::pair()?;
     parent.set_nonblocking(true)?;
     let mut child = spawn_policy(worker, path, uid, gid)?;
+    let notify = crate::systemd::Notifier::from_environment()?;
     STOP.store(false, Ordering::Relaxed);
     RELOAD.store(false, Ordering::Relaxed);
-    install_signals();
+    install_signals()?;
     let (fan_control, sequence) = await_startup(&parent, &mut child)?;
     // Fork both children before opening any hardware/ownership descriptor.
-    let mut lid = tablet_enabled.then(Lid::discover).transpose()?;
+    let mut lid = None;
+    let mut snapshots = Snapshots::default();
     // A shared guard serializes sensor wake and all later EC/RAPL operations.
     let control = hardware::Control::open()?;
-    let mut sensors = if tablet_enabled {
-        Some(Sensors::discover(&control)?)
-    } else {
-        None
-    };
+    let mut sensors = None;
+    let mut tablet_failed = false;
+    if tablet_enabled {
+        let setup = (|| {
+            lid = Some(Lid::discover()?);
+            sensors = Some(Sensors::discover(&control)?);
+            Ok::<_, io::Error>(())
+        })();
+        if let Err(error) = setup {
+            disable_tablet(
+                &mut guardian,
+                &mut sensors,
+                &mut lid,
+                &mut snapshots.tablet,
+                error,
+            )?;
+            tablet_failed = true;
+        }
+    }
     // Configuration has only been parsed in the fully unprivileged worker.
     // This single bounded choice is fixed for the lifetime of this broker.
     let mut session = hardware::Session::open_locked(fan_control, control.clone())?;
@@ -799,7 +887,7 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
         .then(|| CpuSensor::discover(Path::new("/sys/class/hwmon")))
         .transpose()?;
     let mut power = Manager::new();
-    power_status(&power);
+    snapshots.power.set(power.diagnostic_status().to_string());
     capabilities(true)?;
     parent.send(
         &Reply {
@@ -825,6 +913,7 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
     let mut rate_epoch = Instant::now();
     let mut requests = 0_u32;
     let mut fan_report = None;
+    let mut ready = false;
     let result = (|| {
         while !STOP.load(Ordering::Relaxed) {
             if RELOAD.swap(false, Ordering::Relaxed) {
@@ -849,10 +938,13 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                 return Err(io::Error::other("policy heartbeat expired"));
             }
             let mut deadline = schedule.deadline(
-                guardian.is_some() && !paused,
+                guardian.is_some() && !paused && !tablet_failed,
                 !paused && session.fan.as_ref().is_some_and(|fan| fan.may_be_manual()),
                 &health,
             );
+            if let Some(next) = snapshots.deadline() {
+                deadline = deadline.min(next);
+            }
             if !paused {
                 deadline =
                     deadline.min(last_request.duration_since(epoch) + Duration::from_secs(12));
@@ -900,9 +992,11 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                     return Err(io::Error::other("broker child connection lost"));
                 }
             }
-            if sources[1].revents != 0 {
-                lid.as_mut().unwrap().drain(sources[1].revents)?;
-            }
+            let lid_error = if sources[1].revents != 0 {
+                lid.as_mut().unwrap().drain(sources[1].revents).err()
+            } else {
+                None
+            };
             if sources[0].revents & libc::POLLIN != 0 {
                 let mut bytes = [0; REQUEST_BYTES + 1];
                 let n = parent.recv(&mut bytes)?;
@@ -922,24 +1016,52 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                     sequence,
                     ..Reply::default()
                 };
-                let operation: io::Result<()> = match request {
+                let operation: io::Result<()> = (|| match request {
                     Request::Initialize { .. } => Err(io::Error::other(
                         "startup mode is already fixed; restart required",
                     )),
-                    Request::Heartbeat => Ok(()),
+                    Request::Ready if !ready => {
+                        notify.send(if fan_control {
+                            "READY=1\nWATCHDOG=1\nSTATUS=Controller active; managed fan control"
+                        } else {
+                            "READY=1\nWATCHDOG=1\nSTATUS=Controller active; firmware fan control"
+                        })?;
+                        ready = true;
+                        Ok(())
+                    }
+                    Request::Ready => {
+                        Err(io::Error::other("policy readiness already acknowledged"))
+                    }
+                    Request::Heartbeat => {
+                        if ready {
+                            notify.send("WATCHDOG=1")?;
+                        }
+                        Ok(())
+                    }
                     Request::Activate => {
                         if paused {
                             estimator.reset();
-                            sensors = if tablet_enabled {
-                                Some(Sensors::discover(&control)?)
-                            } else {
-                                None
-                            };
-                            if let Some(lid) = &mut lid {
-                                lid.resync()?;
-                            }
-                            if let Some(g) = &mut guardian {
-                                g.off()?;
+                            if tablet_enabled && !tablet_failed {
+                                let setup = (|| {
+                                    sensors = Some(Sensors::discover(&control)?);
+                                    if let Some(lid) = &mut lid {
+                                        lid.resync()?;
+                                    }
+                                    if let Some(g) = &mut guardian {
+                                        g.off()?;
+                                    }
+                                    Ok::<_, io::Error>(())
+                                })();
+                                if let Err(error) = setup {
+                                    disable_tablet(
+                                        &mut guardian,
+                                        &mut sensors,
+                                        &mut lid,
+                                        &mut snapshots.tablet,
+                                        error,
+                                    )?;
+                                    tablet_failed = true;
+                                }
                             }
                             schedule.posture.next = epoch.elapsed();
                             schedule.heartbeat.restart(epoch.elapsed());
@@ -990,19 +1112,28 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                             Ok(())
                         };
                         restore_results([fan, rapl, sensor, off])?;
-                        tablet_status(Some(false), None, true, "Paused")?;
+                        snapshots.tablet.set(tablet_status_text(
+                            Some(false),
+                            None,
+                            !tablet_failed,
+                            if tablet_failed {
+                                "Unavailable"
+                            } else {
+                                "Paused"
+                            },
+                        ));
                         tablet_report = TabletReport::default();
                         Ok(())
                     }
                     Request::Power(config) => power.apply(&config),
-                };
+                })();
                 let fatal_power = power.uncertain();
                 if let Err(e) = &operation {
                     eprintln!("broker operation rejected: {e}");
                     reply.rejected = true;
                 }
                 if report_power {
-                    power_status(&power);
+                    snapshots.power.set(power.diagnostic_status().to_string());
                 }
                 reply.actual_raw = session.fan.as_ref().and_then(|fan| fan.current_raw());
                 reply.emergency = emergency.active;
@@ -1038,43 +1169,56 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
             {
                 health.refresh(fan, epoch.elapsed())?;
             }
-            if let Some(g) = &mut guardian {
-                if !paused && schedule.posture.take(epoch.elapsed()) {
-                    let sample = match sensors.as_ref().map(Sensors::sample).transpose() {
-                        Ok(sample) => sample,
-                        Err(error) => {
-                            // Common cleanup restores cooling before guardian
-                            // OFF, including when the sensor itself has failed.
-                            return Err(io::Error::other(format!("tablet sensor failed: {error}")));
-                        }
-                    };
-                    let estimate = estimator.update(
-                        sample,
-                        lid.as_ref().and_then(Lid::closed),
-                        epoch.elapsed(),
-                    );
-                    let (snapshot, log) =
-                        tablet_report.update(estimate, epoch.elapsed(), |tablet| {
-                            if tablet { g.send(b'1') } else { g.off() }
-                        })?;
-                    if log {
-                        eprintln!(
-                            "tablet={} angle={:?} reliable={} reason={:?}",
-                            estimate.tablet, estimate.angle_deg, estimate.reliable, estimate.reason
+            let tablet_result = (|| {
+                if let Some(error) = lid_error {
+                    return Err(error);
+                }
+                if let Some(g) = &mut guardian {
+                    if !paused && !tablet_failed && schedule.posture.take(epoch.elapsed()) {
+                        let sample = sensors.as_ref().map(Sensors::sample).transpose()?;
+                        let estimate = estimator.update(
+                            sample,
+                            lid.as_ref().and_then(Lid::closed),
+                            epoch.elapsed(),
                         );
+                        let (snapshot, log) =
+                            tablet_report.update(estimate, epoch.elapsed(), |tablet| {
+                                if tablet { g.send(b'1') } else { g.off() }
+                            })?;
+                        if log {
+                            eprintln!(
+                                "tablet={} angle={:?} reliable={} reason={:?}",
+                                estimate.tablet,
+                                estimate.angle_deg,
+                                estimate.reliable,
+                                estimate.reason
+                            );
+                        }
+                        if snapshot {
+                            snapshots.tablet.set(tablet_status_text(
+                                Some(estimate.tablet),
+                                estimate.angle_deg,
+                                estimate.reliable,
+                                &format!("{:?}", estimate.reason),
+                            ));
+                        }
                     }
-                    if snapshot {
-                        tablet_status(
-                            Some(estimate.tablet),
-                            estimate.angle_deg,
-                            estimate.reliable,
-                            &format!("{:?}", estimate.reason),
-                        )?;
+                    if !paused && !tablet_failed && schedule.heartbeat.take(epoch.elapsed()) {
+                        g.send(b'.')?;
                     }
                 }
-                if !paused && schedule.heartbeat.take(epoch.elapsed()) {
-                    g.send(b'.')?;
-                }
+                Ok::<_, io::Error>(())
+            })();
+            if let Err(error) = tablet_result {
+                disable_tablet(
+                    &mut guardian,
+                    &mut sensors,
+                    &mut lid,
+                    &mut snapshots.tablet,
+                    error,
+                )?;
+                tablet_failed = true;
+                estimator.reset();
             }
             let state = (
                 session.fan.as_ref().is_some_and(|fan| fan.may_be_manual()),
@@ -1084,22 +1228,31 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                 health.last_check,
             );
             if fan_report != Some(state) {
-                fan_status(
+                snapshots.fan.set(fan_status_text(
                     session.fan.as_ref(),
                     emergency.active,
                     &health,
                     epoch.elapsed(),
-                )?;
+                ));
                 fan_report = Some(state);
             }
+            snapshots.flush(epoch.elapsed(), write_snapshot);
         }
         Ok(())
     })();
     // Do not leave the fan in manual mode while waiting for guardian OFF/exit.
     let fan_result = session.restore();
-    let _ = fan_status(session.fan.as_ref(), false, &health, epoch.elapsed());
+    snapshots.fan.set(fan_status_text(
+        session.fan.as_ref(),
+        false,
+        &health,
+        epoch.elapsed(),
+    ));
     let power_result = power.restore();
-    power_status(&power);
+    snapshots.power.set(power.diagnostic_status().to_string());
+    if let Err(error) = notify.send("STOPPING=1") {
+        eprintln!("systemd stop notification failed: {error}");
+    }
     let tablet_shutdown = guardian.as_mut().map(Guardian::stop);
     let (tablet, reliable, reason) = match &tablet_shutdown {
         Some(GuardianShutdown {
@@ -1109,7 +1262,9 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
         Some(_) => (None, false, "StopUnconfirmed"),
         None => (Some(false), true, "Stopped"),
     };
-    let _ = tablet_status(tablet, None, reliable, reason);
+    snapshots
+        .tablet
+        .set(tablet_status_text(tablet, None, reliable, reason));
     let tablet_error = tablet_shutdown.and_then(|shutdown| shutdown.error);
     if let Some(error) = &tablet_error {
         eprintln!("{error}");
@@ -1126,6 +1281,7 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
     };
     drop(child);
     drop(guardian);
+    snapshots.flush_final(epoch.elapsed(), write_snapshot);
     restore_results([fan_result, power_result, sensor_result])?;
     if let Some(error) = tablet_error {
         return Err(error);
@@ -1167,6 +1323,119 @@ mod tests {
             reliable: reason == EstimateReason::Valid,
             angle_deg: None,
         }
+    }
+
+    #[test]
+    fn failed_snapshot_keeps_the_newest_value_without_early_retries() {
+        let mut snapshot = PendingSnapshot::default();
+        snapshot.set("Valid".into());
+        let mut writes = Vec::new();
+        assert!(
+            snapshot
+                .flush(Duration::ZERO, |text| {
+                    writes.push(text.to_owned());
+                    Err(io::Error::other("status storage unavailable"))
+                })
+                .is_err()
+        );
+        for ms in (0..5_000).step_by(10) {
+            snapshot.set("Unavailable".into());
+            snapshot
+                .flush(Duration::from_millis(ms), |text| {
+                    writes.push(text.to_owned());
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(snapshot.deadline(), Some(Duration::from_secs(5)));
+        }
+        assert_eq!(writes, ["Valid"]);
+        snapshot
+            .flush(Duration::from_secs(5), |text| {
+                writes.push(text.to_owned());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(writes, ["Valid", "Unavailable"]);
+        assert_eq!(snapshot.deadline(), None);
+        snapshot
+            .flush(Duration::from_secs(30), |_| panic!("clean record retried"))
+            .unwrap();
+    }
+
+    #[test]
+    fn snapshot_domains_progress_independently_and_successful_changes_are_immediate() {
+        let mut snapshots = Snapshots::default();
+        snapshots.fan.set("fan".into());
+        snapshots.tablet.set("tablet".into());
+        let mut writes = Vec::new();
+        snapshots.flush(Duration::ZERO, |name, _| {
+            writes.push(name.to_owned());
+            if name == "fan" {
+                Err(io::Error::other("fan snapshot blocked"))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(snapshots.deadline(), Some(Duration::from_secs(5)));
+        snapshots.tablet.set("changed".into());
+        snapshots.power.set("power".into());
+        snapshots.flush(Duration::from_secs(1), |name, _| {
+            writes.push(name.to_owned());
+            Ok(())
+        });
+        assert_eq!(writes, ["fan", "tablet", "tablet", "power"]);
+        assert_eq!(snapshots.deadline(), Some(Duration::from_secs(5)));
+        snapshots.flush(Duration::from_secs(5), |name, _| {
+            writes.push(name.to_owned());
+            Ok(())
+        });
+        assert_eq!(writes, ["fan", "tablet", "tablet", "power", "fan"]);
+        assert_eq!(snapshots.deadline(), None);
+    }
+
+    #[test]
+    fn delayed_snapshot_retry_skips_missed_slots_instead_of_spinning() {
+        let mut snapshot = PendingSnapshot::default();
+        snapshot.set("pending".into());
+        let mut attempts = 0;
+        for now in [0, 30, 30, 31, 34] {
+            let _ = snapshot.flush(Duration::from_secs(now), |_| {
+                attempts += 1;
+                Err(io::Error::other("still blocked"))
+            });
+        }
+        assert_eq!(attempts, 2);
+        assert_eq!(snapshot.deadline(), Some(Duration::from_secs(35)));
+    }
+
+    #[test]
+    fn final_snapshot_replaces_failed_live_state_without_waiting_or_skipping_domains() {
+        let mut snapshots = Snapshots::default();
+        snapshots.tablet.set("tablet ON".into());
+        snapshots.flush(Duration::ZERO, |_, _| Err(io::Error::other("blocked")));
+        snapshots.tablet.set("tablet OFF".into());
+        snapshots.fan.set("firmware".into());
+        snapshots.power.set("restored".into());
+        let mut writes = Vec::new();
+        snapshots.flush_final(Duration::from_secs(1), |name, text| {
+            writes.push((name.to_owned(), text.to_owned()));
+            if name == "fan" {
+                Err(io::Error::other("fan status still blocked"))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(
+            writes,
+            [
+                ("fan".into(), "firmware".into()),
+                ("tablet".into(), "tablet OFF".into()),
+                ("power".into(), "restored".into()),
+            ]
+        );
+        assert!(snapshots.tablet.deadline().is_none());
+        assert!(snapshots.power.deadline().is_none());
+        assert_eq!(snapshots.fan.deadline(), Some(Duration::from_secs(6)));
     }
 
     #[test]

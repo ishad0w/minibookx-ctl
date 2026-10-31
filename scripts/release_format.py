@@ -1,9 +1,9 @@
-#!/usr/bin/env python3
 """Pure validation of release metadata, checksums, archives and static ELF files.
 
 This module does not install files, execute release code, access hardware or
 invoke package/service managers. It is shared by local and CI release checks.
 """
+
 # SPDX-License-Identifier: Apache-2.0
 import argparse
 import gzip
@@ -11,11 +11,11 @@ import hashlib
 import io
 import json
 import os
-from pathlib import Path
 import re
 import stat
 import struct
 import tarfile
+from pathlib import Path
 
 NAME = "minibookx-ctl"
 TARGET = "x86_64-unknown-linux-musl"
@@ -52,7 +52,9 @@ def read_asset(path, maximum=MAX_ARCHIVE):
             data = stream.read(maximum + 1)
         after = os.fstat(fd)
         keys = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns", "st_mode")
-        if len(data) > maximum or any(getattr(before, k) != getattr(after, k) for k in keys):
+        if len(data) > maximum or any(
+            getattr(before, k) != getattr(after, k) for k in keys
+        ):
             fail("release asset changed while reading or exceeds its size limit")
         return data
     finally:
@@ -67,6 +69,7 @@ def parse_json(data, description):
                 fail(f"duplicate JSON key in {description}: {key}")
             result[key] = value
         return result
+
     try:
         return json.loads(data, object_pairs_hook=no_duplicates)
     except Refuse:
@@ -80,14 +83,21 @@ def verify_binary(data):
     if len(data) < 64 or data[:7] != b"\x7fELF\x02\x01\x01" or data[7] not in (0, 3):
         fail("binary must be an ELF64 little-endian executable")
     header = struct.unpack_from("<16sHHIQQQIHHHHHH", data)
-    if header[1] not in (2, 3) or header[2:4] != (62, 1) or header[8] != 64 or header[9] != 56:
+    if (
+        header[1] not in (2, 3)
+        or header[2:4] != (62, 1)
+        or header[8] != 64
+        or header[9] != 56
+    ):
         fail("binary must be an x86_64 Linux executable")
     offset, count = header[5], header[10]
     if not 1 <= count <= 128 or offset < 64 or offset + count * 56 > len(data):
         fail("invalid ELF program headers")
     load = stack = False
     for index in range(count):
-        kind, flags, file_offset, _, _, file_size, _, _ = struct.unpack_from("<IIQQQQQQ", data, offset + index * 56)
+        kind, flags, file_offset, _, _, file_size, _, _ = struct.unpack_from(
+            "<IIQQQQQQ", data, offset + index * 56
+        )
         if file_offset + file_size > len(data):
             fail("ELF segment exceeds the binary")
         if kind == 1:
@@ -124,16 +134,28 @@ def validate_metadata(data, tag):
         fail("release tag must be v<major>.<minor>.<patch>")
     version = ".".join(match.groups())
     prefix = NAME + "-" + version + "-" + build
-    expected = {"schema_version": 1, "version": version, "build": build, "tag": tag, "target": TARGET,
-                "binary_version": version + "+g" + build,
-                "binary_archive": prefix + "-" + TARGET + ".tar.gz",
-                "source_archive": prefix + "-sources.tar.gz"}
-    if (type(metadata.get("schema_version")) is not int or
-            any(metadata.get(key) != value for key, value in expected.items())):
+    expected = {
+        "schema_version": 1,
+        "version": version,
+        "build": build,
+        "tag": tag,
+        "target": TARGET,
+        "binary_version": version + "+g" + build,
+        "binary_archive": prefix + "-" + TARGET + ".tar.gz",
+        "source_archive": prefix + "-sources.tar.gz",
+    }
+    if type(metadata.get("schema_version")) is not int or any(
+        metadata.get(key) != value for key, value in expected.items()
+    ):
         fail("release metadata is inconsistent with its tag or target")
-    if not isinstance(metadata.get("binary_sha256"), str) or not HASH_RE.fullmatch(metadata["binary_sha256"]):
+    if not isinstance(metadata.get("binary_sha256"), str) or not HASH_RE.fullmatch(
+        metadata["binary_sha256"]
+    ):
         fail("release metadata has an invalid binary hash")
-    if not isinstance(metadata.get("rustc"), str) or not 1 <= len(metadata["rustc"]) <= 8192:
+    if (
+        not isinstance(metadata.get("rustc"), str)
+        or not 1 <= len(metadata["rustc"]) <= 8192
+    ):
         fail("release metadata lacks the Rust toolchain identity")
     return metadata
 
@@ -152,16 +174,34 @@ def unpack_archive(data, top):
             for number, member in enumerate(archive):
                 if number >= MAX_MEMBERS:
                     fail("too many release archive members")
-                name = member.name[:-1] if member.isdir() and member.name.endswith("/") else member.name
+                name = (
+                    member.name[:-1]
+                    if member.isdir() and member.name.endswith("/")
+                    else member.name
+                )
                 parts = name.split("/")
-                if (not name or "\\" in name or any(ord(character) < 32 or ord(character) == 127 for character in name) or
-                        any(part in ("", ".", "..") for part in parts) or parts[0] != top):
+                if (
+                    not name
+                    or "\\" in name
+                    or any(
+                        ord(character) < 32 or ord(character) == 127
+                        for character in name
+                    )
+                    or any(part in ("", ".", "..") for part in parts)
+                    or parts[0] != top
+                ):
                     fail("unsafe path in release archive")
                 if name in seen:
                     fail("duplicate path in release archive")
                 seen.add(name)
-                if member.mode & 0o7022 or member.sparse is not None or not (member.isdir() or member.isfile()):
-                    fail("release archive contains a link, special file, sparse file or unsafe permissions")
+                if (
+                    member.mode & 0o7022
+                    or member.sparse is not None
+                    or not (member.isdir() or member.isfile())
+                ):
+                    fail(
+                        "release archive contains a link, special file, sparse file or unsafe permissions"
+                    )
                 if len(parts) == 1:
                     if not member.isdir():
                         fail("archive root must be a directory")
@@ -179,7 +219,10 @@ def unpack_archive(data, top):
                     result[relative] = content
         for path in result:
             components = path.split("/")
-            if any("/".join(components[:index]) in result for index in range(1, len(components))):
+            if any(
+                "/".join(components[:index]) in result
+                for index in range(1, len(components))
+            ):
                 fail("release archive has a file/directory collision")
         if not result:
             fail("empty release archive")
@@ -210,15 +253,28 @@ def checked_assets(folder, expected_commit):
         fail("expected full commit is required")
     raw = read_asset(folder / "build-metadata.json", 65536)
     value = parse_json(raw, "build metadata")
-    metadata = validate_metadata(raw, value.get("tag", "") if isinstance(value, dict) else "")
+    metadata = validate_metadata(
+        raw, value.get("tag", "") if isinstance(value, dict) else ""
+    )
     if metadata["commit"] != expected_commit:
         fail("build metadata does not match the workflow commit")
-    names = {metadata["binary_archive"], metadata["source_archive"], "build-metadata.json", FLAT_BINARY}
+    names = {
+        metadata["binary_archive"],
+        metadata["source_archive"],
+        "build-metadata.json",
+        FLAT_BINARY,
+    }
     sums = checksum_entries(read_asset(folder / "SHA256SUMS", 65536))
-    if set(sums) != names or {p.name for p in folder.iterdir()} != names | {"SHA256SUMS"}:
+    if set(sums) != names or {p.name for p in folder.iterdir()} != names | {
+        "SHA256SUMS"
+    }:
         fail("unexpected/missing release file or checksum")
-    assets = {name: read_asset(folder / name, MAX_FILE if name == FLAT_BINARY else MAX_ARCHIVE)
-              for name in names}
+    assets = {
+        name: read_asset(
+            folder / name, MAX_FILE if name == FLAT_BINARY else MAX_ARCHIVE
+        )
+        for name in names
+    }
     for name, content in assets.items():
         if digest(content) != sums[name]:
             fail("release checksum mismatch: " + name)
@@ -230,9 +286,16 @@ def checked_assets(folder, expected_commit):
     files = unpack_archive(assets[metadata["binary_archive"]], top)
     if files.get(NAME) != binary or files.get("build-metadata.json") != raw:
         fail("archive binary or embedded metadata differs from the flat release assets")
-    required = {"config/presets.conf", "LICENSE", "NOTICE", "THIRD_PARTY.md",
-                "packaging/minibookx-ctl.service"}
-    if not required.issubset(files) or not any(p.startswith("packaging/licenses/") for p in files):
+    required = {
+        "config/presets.conf",
+        "LICENSE",
+        "NOTICE",
+        "THIRD_PARTY.md",
+        "packaging/minibookx-ctl.service",
+    }
+    if not required.issubset(files) or not any(
+        p.startswith("packaging/licenses/") for p in files
+    ):
         fail("runtime archive lacks configuration, service or license files")
     if "packaging/minibookx-ctl-recover.service" in files:
         fail("runtime archive contains a removed auxiliary service")
@@ -242,18 +305,26 @@ def checked_assets(folder, expected_commit):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    elf = commands.add_parser("elf", help="check one static x86_64 ELF without executing it")
+    elf = commands.add_parser(
+        "elf", help="check one static x86_64 ELF without executing it"
+    )
     elf.add_argument("binary", type=Path)
-    check = commands.add_parser("check", help="check a complete release against its source commit")
+    check = commands.add_parser(
+        "check", help="check a complete release against its source commit"
+    )
     check.add_argument("directory", type=Path)
     check.add_argument("--commit", required=True)
     args = parser.parse_args()
     if args.command == "elf":
         verify_binary(read_asset(args.binary, MAX_FILE))
-        print("Static ELF check passed: x86_64, no INTERP/DT_NEEDED, non-executable stack.")
+        print(
+            "Static ELF check passed: x86_64, no INTERP/DT_NEEDED, non-executable stack."
+        )
     else:
         metadata, names = checked_assets(args.directory.resolve(), args.commit)
-        print(f"Verified {metadata['tag']}: {len(names)} assets; static ELF and archive policy passed.")
+        print(
+            f"Verified {metadata['tag']}: {len(names)} assets; static ELF and archive policy passed."
+        )
 
 
 if __name__ == "__main__":

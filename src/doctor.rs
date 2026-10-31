@@ -384,10 +384,7 @@ fn fan(sources: &impl Sources, snapshot: &Result<Value, Missing>) -> Value {
     ));
     let lockdown = lockdown_mode(sources);
     fields.push(field("lockdown", "Kernel lockdown", lockdown.clone()));
-    if enabled == Ok(true)
-        && live_policy(sources, snapshot)
-        && lockdown.as_deref().is_ok_and(|mode| mode != "none")
-    {
+    if enabled != Ok(false) && lockdown.as_deref().is_ok_and(|mode| mode != "none") {
         fields.push(warning(
             "ec_access",
             "Fan access",
@@ -397,7 +394,7 @@ fn fan(sources: &impl Sources, snapshot: &Result<Value, Missing>) -> Value {
     fields.push(note(
         "scope",
         "EC access check",
-        "No raw EC file was opened or write attempted. An absent interface may be unloaded or unavailable; check the exact running kernel. fan_control=false does not require ec_sys. See docs/distributions.md",
+        "No raw EC file was opened or write attempted. An absent interface may be unloaded or unavailable; check the exact running kernel. fan_control=false does not require ec_sys. See https://github.com/ishad0w/minibookx-ctl/blob/main/docs/reference/kernel-support.md",
     ));
     section("fan", "Fan control", fields)
 }
@@ -1512,12 +1509,12 @@ fn concise(section: &mut Value) {
         "service" => Some((
             "service_action",
             "Service help",
-            "if startup failed, run systemctl status minibookx-ctl and journalctl -u minibookx-ctl; see packaging/README.md",
+            "if startup failed, run systemctl status minibookx-ctl and journalctl -u minibookx-ctl; see https://github.com/ishad0w/minibookx-ctl/blob/main/docs/guide/troubleshooting.md",
         )),
         "graphics" => Some((
             "graphics_action",
             "Graphics help",
-            "graphics/media packages are optional to the controller. See docs/distributions.md for manual setup; debug includes installed versions and codec advice",
+            "graphics/media packages are optional to the controller. See https://github.com/ishad0w/minibookx-ctl/blob/main/docs/guide/graphics.md for manual setup; debug includes installed versions and codec advice",
         )),
         _ => None,
     };
@@ -1683,7 +1680,7 @@ mod tests {
     }
 
     #[test]
-    fn lockdown_advice_depends_on_known_fan_policy_and_preserves_unknown_older_records() {
+    fn lockdown_advice_does_not_require_a_running_or_successfully_started_service() {
         let mut fixture = Fixture {
             clock_ms: Some(12_000),
             ..Fixture::default()
@@ -1697,6 +1694,13 @@ mod tests {
         let mut snapshot = policy_snapshot(10_000);
         let old = fan(&fixture, &Ok(snapshot.clone()));
         assert_eq!(old["fields"][0]["state"], "unavailable");
+        assert!(
+            old["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["key"] == "ec_access")
+        );
         snapshot["policy"]["accepted_config"]["fan_control"] = json!(true);
         let report = fan(&fixture, &Ok(snapshot.clone()));
         assert!(report.to_string().contains("built-in or loaded"));
@@ -1706,6 +1710,22 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|v| v["key"] == "ec_access" && v["state"] == "warning")
+        );
+        fixture.put(&format!("{UNIT_CGROUP}/cgroup.events"), "populated 0\n");
+        assert!(
+            fan(&fixture, &Ok(snapshot.clone()))["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["key"] == "ec_access")
+        );
+        snapshot["policy"]["accepted_config"]["fan_control"] = json!(false);
+        assert!(
+            !fan(&fixture, &Ok(snapshot.clone()))["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["key"] == "ec_access")
         );
         snapshot["policy"]["accepted_config"]["fan_control"] = json!("false");
         assert_eq!(

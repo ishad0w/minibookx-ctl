@@ -56,14 +56,15 @@ For immutable Fedora variants, use their own package-layering procedure.
 Leave the laptop in its ordinary working position. Run as your ordinary user:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ishad0w/minibookx-ctl/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ishad0w/minibookx-ctl/2ba14f40b8d353527adca3e94e8e226b5d79b16e/install.sh | sh
 ```
 
-The script downloads the latest release and checks its checksum, then asks for
+The bootstrap URL pins a reviewed source commit. It downloads the latest
+release and checks its checksum, then asks for
 sudo to install and start it. If you prefer to read the script first:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ishad0w/minibookx-ctl/main/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/ishad0w/minibookx-ctl/2ba14f40b8d353527adca3e94e8e226b5d79b16e/install.sh -o install.sh
 less install.sh
 sh install.sh
 ```
@@ -80,8 +81,7 @@ systemctl status minibookx-ctl.service --no-pager
 ```
 
 If startup fails, read [troubleshooting](troubleshooting.md) before retrying.
-The service initializes the supported base sensor automatically; there is no
-manual register setup step.
+The service initializes the supported base sensor automatically.
 
 ### Without fan control
 
@@ -103,8 +103,9 @@ sudo systemctl enable --now minibookx-ctl.service
 minibookx-ctl --doctor
 ```
 
-Tablet detection remains enabled. On updates, `--no-enable` preserves the
-previous service state; it does not stop an already running service.
+Tablet detection remains enabled. On updates, `--no-enable` preserves whether
+the service was enabled and running. Updating stops it for recovery and restarts
+it if it was running; this option is not a way to keep an active service stopped.
 
 ## Check the result
 
@@ -125,7 +126,7 @@ the latest example is saved at `/usr/local/share/doc/minibookx-ctl/presets.conf`
 To select a published version with the downloaded script:
 
 ```sh
-sh install.sh --release v0.1.1
+sh install.sh --release v0.1.4
 ```
 
 To remove the binary and service:

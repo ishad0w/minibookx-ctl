@@ -9,7 +9,11 @@ RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
     && kernel_package=$(apt-cache depends linux-image-amd64 | awk '/Depends: linux-image-[0-9]/ {print $2; exit}') \
     && test -n "$kernel_package" \
     && apt-get download "$kernel_package" \
-    && dpkg-deb --fsys-tarfile ./*.deb | tar -xOf - --wildcards './boot/vmlinuz-*' > /boot/vmlinuz \
+    && dpkg-deb --extract ./*.deb extracted \
+    && cp extracted/boot/vmlinuz-* /boot/vmlinuz \
+    && find extracted/usr/lib/modules -type f \( -name 'uinput.ko*' -o -name 'i2c-dev.ko*' \) \
+       -exec sh -c 'for file; do target="/${file#extracted/}"; mkdir -p "$(dirname "$target")"; cp "$file" "$target"; done' sh {} + \
+    && depmod -a "$(basename extracted/usr/lib/modules/*)" \
     && rm -rf /tmp/guest-kernel \
     && rm -rf /var/lib/apt/lists/*
-RUN useradd --system --no-create-home --shell /usr/sbin/nologin minibookx-ctl
+RUN useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin minibookx-ctl

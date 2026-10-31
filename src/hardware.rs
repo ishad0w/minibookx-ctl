@@ -93,7 +93,7 @@ pub fn check_profile() -> io::Result<()> {
 }
 fn invocation() -> io::Result<String> {
     let id = env::var("INVOCATION_ID")
-        .map_err(|_| error("run prepare/run/cleanup through the systemd unit"))?;
+        .map_err(|_| error("run --prepare and --daemon through the systemd unit"))?;
     if !valid_invocation(&id) {
         return Err(error("invalid systemd invocation ID"));
     }
@@ -384,9 +384,6 @@ impl<T: EcIo> Drop for Session<T> {
             eprintln!("fan ownership release failed in Drop: {e}");
         }
     }
-}
-pub fn cleanup() -> io::Result<()> {
-    cleanup_owned(Some(invocation()?))
 }
 /// Root-only orphan recovery. The exclusive lock proves no cooperating runtime
 /// is alive; persistent root-owned lease/marker identify this controller's state.

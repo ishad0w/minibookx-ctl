@@ -87,6 +87,7 @@ struct FakeHost {
     recoveries: usize,
     leave_lease: Option<PathBuf>,
     edit_config_after_validation: Option<PathBuf>,
+    interrupt_on_start: bool,
 }
 impl FakeHost {
     fn running() -> Self {
@@ -94,6 +95,7 @@ impl FakeHost {
             state: State {
                 loaded: true,
                 active: true,
+                transitioning: false,
                 enabled: Enabled::Permanent,
             },
             recovery: State::default(),
@@ -104,6 +106,7 @@ impl FakeHost {
             recoveries: 0,
             leave_lease: None,
             edit_config_after_validation: None,
+            interrupt_on_start: false,
         }
     }
 }
@@ -134,15 +137,33 @@ impl Host for FakeHost {
         self.events.push(event.clone());
         if self.fail == Some(event.as_str()) {
             self.fail = None;
+            if args[0] == "start" {
+                // A failed Restart=on-failure start normally leaves systemd
+                // activating/auto-restart, rather than stably inactive.
+                self.state = parse_state(
+                    "LoadState=loaded\nActiveState=activating\nUnitFileState=enabled\n",
+                )?;
+            }
             return Err(refuse("injected command failure"));
         }
         match args[0] {
             "stop" if args[1] == RECOVERY_UNIT => self.recovery.active = false,
-            "stop" => self.state.active = false,
+            "stop" => {
+                self.state.active = false;
+                self.state.transitioning = false;
+            }
             "start" => self.state.active = true,
             "enable" => self.state.enabled = Enabled::Permanent,
             "disable" => self.state.enabled = Enabled::No,
             _ => (),
+        }
+        if args[0] == "start" && self.interrupt_on_start {
+            self.interrupt_on_start = false;
+            // The isolated helper below targets only its own blocked thread.
+            assert_eq!(
+                unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGINT) },
+                0
+            );
         }
         Ok(())
     }
@@ -310,7 +331,6 @@ fn malformed_and_ambiguous_systemd_state_is_not_treated_as_stopped() {
     for value in [
         "LoadState=loaded\nActiveState=inactive\n",
         "LoadState=loaded\nActiveState=inactive\nUnitFileState=disabled\nUnitFileState=enabled\n",
-        "LoadState=loaded\nActiveState=activating\nUnitFileState=enabled\n",
         "LoadState=error\nActiveState=inactive\nUnitFileState=disabled\n",
         "LoadState=not-found\nActiveState=active\nUnitFileState=\n",
         "LoadState=loaded\nActiveState=inactive\nUnitFileState=unknown\n",
@@ -489,6 +509,122 @@ fn failed_new_start_recovers_then_restores_old_binary_and_running_state() {
 }
 
 #[test]
+fn a_collected_inactive_unit_does_not_block_start_or_update() {
+    let mut fixture = Fixture::new();
+    fixture.install();
+    fixture.target.live = true;
+    let mut host = FakeHost::running();
+    host.fail = Some("reset-failed minibookx-ctl.service");
+    apply(
+        true,
+        &Options::default(),
+        &fixture.target,
+        &fixture.source,
+        &mut host,
+    )
+    .unwrap();
+    assert!(host.state.active);
+    assert_eq!(fixture.bytes(BINARY).unwrap(), b"\x7fELFnew-image");
+}
+
+#[test]
+fn a_new_failed_install_stops_auto_restart_and_removes_enabled_unit() {
+    let mut fixture = Fixture::new();
+    fixture.target.live = true;
+    let mut host = FakeHost::running();
+    host.state = State::default();
+    host.fail = Some("start minibookx-ctl.service");
+    let error = apply(
+        true,
+        &Options {
+            enable: true,
+            ..Options::default()
+        },
+        &fixture.target,
+        &fixture.source,
+        &mut host,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("previous files restored"),
+        "{error}"
+    );
+    assert!(!host.state.active && !host.state.transitioning);
+    assert_eq!(host.state.enabled, Enabled::No);
+    assert!(fixture.bytes(BINARY).is_none());
+    assert!(fixture.bytes(UNIT_FILE).is_none());
+    assert_eq!(host.recoveries, 1);
+}
+
+#[test]
+fn an_initially_transitioning_service_is_left_untouched() {
+    let mut fixture = Fixture::new();
+    fixture.install();
+    fixture.target.live = true;
+    let mut host = FakeHost::running();
+    host.state =
+        parse_state("LoadState=loaded\nActiveState=activating\nUnitFileState=enabled\n").unwrap();
+    let error = apply(
+        true,
+        &Options::default(),
+        &fixture.target,
+        &fixture.source,
+        &mut host,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("transitioning"));
+    assert!(host.events.is_empty());
+    assert_eq!(host.recoveries, 0);
+}
+
+#[test]
+fn interrupted_install_restores_previous_files_and_service() {
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "install::tests::interrupted_install_helper",
+            "--ignored",
+        ])
+        .env("MINIBOOKX_TEST_INSTALL_INTERRUPT", "1")
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "isolated interrupt/rollback test failed: {status}"
+    );
+}
+
+#[test]
+#[ignore = "subprocess helper for signal isolation"]
+fn interrupted_install_helper() {
+    if std::env::var_os("MINIBOOKX_TEST_INSTALL_INTERRUPT").is_none() {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    fixture.install();
+    fixture.write(BINARY, b"\x7fELFold-image", 0o755);
+    fixture.target.live = true;
+    let mut host = FakeHost::running();
+    host.interrupt_on_start = true;
+    let error = apply(
+        true,
+        &Options::default(),
+        &fixture.target,
+        &fixture.source,
+        &mut host,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("interrupted"), "{error}");
+    assert!(
+        error.to_string().contains("previous files restored"),
+        "{error}"
+    );
+    assert_eq!(fixture.bytes(BINARY).unwrap(), b"\x7fELFold-image");
+    assert!(host.state.active);
+    assert_eq!(host.recoveries, 2);
+}
+
+#[test]
 fn failed_new_recovery_keeps_new_binary_available_and_never_restarts_old_runtime() {
     let mut fixture = Fixture::new();
     fixture.install();
@@ -559,6 +695,7 @@ fn legacy_recovery_unit_is_stopped_before_direct_recovery_and_removed_only_after
         host.recovery = State {
             loaded: true,
             active: true,
+            transitioning: false,
             enabled: Enabled::No,
         };
         if fail_stop {
@@ -721,4 +858,24 @@ fn command_deadline_covers_waiting_children_and_inherited_output_pipes() {
         assert!(error.to_string().contains("timed out"), "{error}");
         assert!(start.elapsed() < Duration::from_secs(2));
     }
+}
+
+#[test]
+fn failed_commands_include_bounded_stderr_without_terminal_controls() {
+    let error = execute(
+        subprocess(
+            Path::new("/bin/sh"),
+            &[
+                "-c",
+                "printf '\\033[31mconfig rejected\\n' >&2; head -c 16384 /dev/zero >&2; exit 1",
+            ],
+        ),
+        false,
+        Duration::from_secs(2),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("config rejected"), "{error}");
+    assert!(!error.contains('\u{1b}') && !error.contains('\0'));
+    assert!(error.len() < MAX_COMMAND_OUTPUT * 5);
 }

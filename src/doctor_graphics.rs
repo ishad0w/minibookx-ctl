@@ -320,7 +320,7 @@ fn package_row(key: &str, label: &str, names: &[&str], inventory: &Inventory) ->
             key,
             label,
             &format!(
-                "optional package not installed: {}; see docs/distributions.md",
+                "optional package not installed: {}; see https://github.com/ishad0w/minibookx-ctl/blob/main/docs/guide/graphics.md",
                 names.join(" or ")
             ),
         )

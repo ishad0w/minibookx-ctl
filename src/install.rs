@@ -424,6 +424,7 @@ enum Enabled {
 struct State {
     loaded: bool,
     active: bool,
+    transitioning: bool,
     enabled: Enabled,
 }
 
@@ -457,7 +458,7 @@ fn parse_state(text: &str) -> io::Result<State> {
         }
     };
     let active = match properties["ActiveState"] {
-        "active" | "reloading" | "refreshing" => true,
+        "active" | "reloading" | "refreshing" | "activating" | "deactivating" => true,
         "inactive" | "failed" => false,
         _ => return Err(refuse("service is transitioning; wait and retry")),
     };
@@ -471,6 +472,7 @@ fn parse_state(text: &str) -> io::Result<State> {
     Ok(State {
         loaded,
         active,
+        transitioning: matches!(properties["ActiveState"], "activating" | "deactivating"),
         enabled,
     })
 }
@@ -500,8 +502,9 @@ fn subprocess(program: &Path, args: &[&str]) -> Command {
         .env("LANG", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        // Never forward arbitrary subprocess output to a privileged terminal.
-        .stderr(Stdio::null())
+        // Capture a bounded, escaped diagnostic on failure, never a raw stream
+        // from the dropped config parser into a privileged terminal.
+        .stderr(Stdio::piped())
         .process_group(0);
     command
 }
@@ -513,21 +516,25 @@ fn execute(mut command: Command, capture: bool, timeout: Duration) -> io::Result
     }
     let mut child = command.spawn()?;
     let result = (|| {
-        if let Some(stdout) = &child.stdout {
-            // SAFETY: stdout owns this pipe descriptor. Nonblocking reads keep
+        for fd in [
+            child.stdout.as_ref().map(AsRawFd::as_raw_fd),
+            child.stderr.as_ref().map(AsRawFd::as_raw_fd),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            // SAFETY: the child owns this pipe descriptor. Nonblocking reads keep
             // both output and inherited-pipe descendants inside the deadline.
-            let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
-            if flags < 0
-                || unsafe {
-                    libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
-                } < 0
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
             {
                 return Err(io::Error::last_os_error());
             }
         }
         let deadline = Instant::now() + timeout;
         let mut output = Vec::new();
-        let mut eof = !capture;
+        let mut stderr = Vec::new();
+        let mut eof = [!capture, false];
         let mut status = None;
         loop {
             if Instant::now() >= deadline {
@@ -535,34 +542,54 @@ fn execute(mut command: Command, capture: bool, timeout: Duration) -> io::Result
                     "{program} timed out; installed files retained for recovery"
                 )));
             }
-            if !eof {
-                let mut buffer = [0; MAX_COMMAND_OUTPUT + 1];
-                match child
-                    .stdout
-                    .as_mut()
-                    .expect("captured pipe")
-                    .read(&mut buffer)
-                {
-                    Ok(0) => eof = true,
-                    Ok(count) if count > MAX_COMMAND_OUTPUT - output.len() => {
-                        return Err(refuse(format!("{program} output exceeded its size limit")));
+            let streams: [Option<&mut dyn Read>; 2] = [
+                child.stdout.as_mut().map(|v| v as &mut dyn Read),
+                child.stderr.as_mut().map(|v| v as &mut dyn Read),
+            ];
+            for (index, stream) in streams.into_iter().enumerate() {
+                let Some(stream) = stream else { continue };
+                if eof[index] {
+                    continue;
+                }
+                // Bound work even if a child continuously floods its pipes.
+                for _ in 0..16 {
+                    let mut buffer = [0; MAX_COMMAND_OUTPUT + 1];
+                    match stream.read(&mut buffer) {
+                        Ok(0) => {
+                            eof[index] = true;
+                            break;
+                        }
+                        Ok(count) => {
+                            let bytes = if index == 0 { &mut output } else { &mut stderr };
+                            let remaining = MAX_COMMAND_OUTPUT - bytes.len();
+                            if index == 0 && count > remaining {
+                                return Err(refuse(format!(
+                                    "{program} output exceeded its size limit"
+                                )));
+                            }
+                            bytes.extend_from_slice(&buffer[..count.min(remaining)]);
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error) => return Err(error),
                     }
-                    Ok(count) => output.extend_from_slice(&buffer[..count]),
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(error) => return Err(error),
                 }
             }
             if status.is_none() {
                 status = child.try_wait()?;
             }
-            if let Some(status) = status {
+            if let Some(status) = status
+                && eof.into_iter().all(|v| v)
+            {
                 if !status.success() {
-                    return Err(refuse(format!("{program} failed ({status})")));
+                    let diagnostic = String::from_utf8_lossy(&stderr)
+                        .escape_default()
+                        .to_string();
+                    return Err(refuse(format!(
+                        "{program} failed ({status}); stderr: {diagnostic}"
+                    )));
                 }
-                if eof {
-                    return Ok(output);
-                }
+                return Ok(output);
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -910,8 +937,22 @@ fn restore_state(host: &mut impl Host, state: State) -> io::Result<()> {
         Enabled::No => host.control(&["disable", UNIT])?,
     }
     if state.active {
-        host.control(&["reset-failed", UNIT])?;
-        host.control(&["start", UNIT])?;
+        start_service(host)?;
+    }
+    Ok(())
+}
+
+fn start_service(host: &mut impl Host) -> io::Result<()> {
+    // The manager may have collected an inactive unit after stop/reload.
+    // Resetting a rate limit is useful, but only a successful start and active
+    // state are required. A missing reset target must not prevent rollback.
+    if let Err(error) = host.control(&["reset-failed", UNIT]) {
+        eprintln!("could not reset failed state; attempting service start: {error}");
+    }
+    host.control(&["start", UNIT])?;
+    let current = host.state(UNIT)?;
+    if !current.active || current.transitioning {
+        return Err(refuse("service did not remain active"));
     }
     Ok(())
 }
@@ -923,6 +964,18 @@ fn apply(
     executable: &Path,
     host: &mut impl Host,
 ) -> io::Result<()> {
+    // Defer termination during the transaction. Check pending signals between
+    // steps; rollback stays protected until files and service state are settled.
+    // Staging has no live service or hardware to protect.
+    let signals = target.live.then(crate::systemd::Signals::new).transpose()?;
+    let interrupted = || {
+        if let Some(signals) = &signals
+            && !signals.drain()?.is_empty()
+        {
+            return Err(refuse("installation interrupted"));
+        }
+        Ok(())
+    };
     let _lock = target.lock()?;
     if target.capture(PENDING)?.is_some() {
         return Err(refuse(
@@ -967,6 +1020,9 @@ fn apply(
     } else {
         State::default()
     };
+    if state.transitioning {
+        return Err(refuse("service is transitioning; wait and retry"));
+    }
     if target.live {
         let legacy = host.state("minibook-fand.service")?;
         if legacy.active || legacy.enabled != Enabled::No {
@@ -986,6 +1042,7 @@ fn apply(
                 .1
                 .gid = account.gid;
         }
+        interrupted()?;
         stopped(target, host)?;
     }
     if let Some(config) = config {
@@ -995,7 +1052,8 @@ fn apply(
             .expect("bundled config");
         entry.1.data.clone_from(&config.data);
     }
-    let result = (|| {
+    let result: io::Result<()> = (|| {
+        interrupted()?;
         if install {
             let gid = files
                 .iter()
@@ -1007,6 +1065,7 @@ fn apply(
             // rollback may retain these safe directory permissions.
             target.config_directory(gid)?;
             for (path, snapshot) in &files {
+                interrupted()?;
                 target.write(path, snapshot)?;
             }
         } else {
@@ -1014,6 +1073,7 @@ fn apply(
                 host.control(&["disable", UNIT])?;
             }
             for (path, _) in &files {
+                interrupted()?;
                 if path != CONFIG {
                     target.remove(path)?;
                 }
@@ -1029,14 +1089,11 @@ fn apply(
                     host.control(&["enable", UNIT])?;
                 }
                 if options.enable || state.active {
-                    host.control(&["reset-failed", UNIT])?;
-                    host.control(&["start", UNIT])?;
-                    if !host.state(UNIT)?.active {
-                        return Err(refuse("new service did not remain active"));
-                    }
+                    start_service(host)?;
                 }
             }
         }
+        interrupted()?;
         Ok(())
     })();
     if let Err(original) = result {
@@ -1051,22 +1108,36 @@ fn apply(
             )));
         }
         let rollback = (|| {
-            if target.live && !state.loaded && options.enable {
-                host.control(&["disable", UNIT])?;
+            let mut errors = Vec::new();
+            if target.live
+                && !state.loaded
+                && options.enable
+                && let Err(error) = host.control(&["disable", UNIT])
+            {
+                errors.push(error.to_string());
             }
             for (path, snapshot) in &previous {
-                match snapshot {
-                    Some(value) => target.write(path, value)?,
-                    None => target.remove(path)?,
+                let result = match snapshot {
+                    Some(value) => target.write(path, value),
+                    None => target.remove(path),
+                };
+                if let Err(error) = result {
+                    errors.push(format!("{path}: {error}"));
                 }
             }
             if target.live {
-                host.control(&["daemon-reload"])?;
-                if state.loaded {
+                if let Err(error) = host.control(&["daemon-reload"]) {
+                    errors.push(error.to_string());
+                }
+                if state.loaded && errors.is_empty() {
                     restore_state(host, state)?;
                 }
             }
-            Ok::<_, io::Error>(())
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(refuse(errors.join("; ")))
+            }
         })();
         return match rollback {
             Ok(()) => Err(refuse(format!(

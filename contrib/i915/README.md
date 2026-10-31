@@ -49,6 +49,9 @@ timing method and unresolved design questions.
 The sequence below is a development checklist. It becomes a usable installation
 recipe only after someone builds and tests the exact candidate against a named
 target. Keep a working kernel, initramfs and boot entry on independent files.
+Use a different kernel version for recovery, with its own module directory, or
+have bootable rescue media and a recovery procedure. A second entry for the same
+kernel can select the same replacement module and is not an independent fallback.
 
 ### 1. Match the distribution kernel
 
@@ -114,11 +117,10 @@ to a module that implements it:
 options i915 dsi_link_ready_timeout_us=10000
 ```
 
-Regenerate the target's initramfs through its existing integration. Examples are
-`mkinitcpio -P`, CachyOS's `limine-mkinitcpio`, Fedora's
-`dracut --force --kver "$kver"`, or Debian/Ubuntu's
-`update-initramfs -u -k "$kver"`, run with sudo. Choose the applicable command;
-do not run every generator. Ensure the selected boot image contains the new
+Regenerate only the test kernel's initramfs through its existing integration.
+Use the [distribution-specific generator](../../docs/guide/display.md#3-select-60-hz-and-regenerate)
+with that kernel's package name/version; do not regenerate every installed
+kernel or overwrite the recovery image. Ensure the selected boot image contains the new
 module and modprobe configuration, and that ESP copies, hashes and signatures
 are updated by the native integration.
 
@@ -141,15 +143,14 @@ rebuild hook, interceptor or automatic installer.
 
 ## Rollback
 
-Boot the preserved working entry. Remove only your separate override and its
+Boot the independent working kernel or rescue media. Remove only your separate override and its
 parameter configuration, run `depmod` for the target, then regenerate that
 target's boot image using the same integration. Verify selection before reboot.
 Stock i915 restores the stock timeout; the original startup corruption may
 return. A 50 Hz entry restores timings, not necessarily clean output.
 
-Do not leave another module maintainer or local rebuild hook active for the same
-override. Inspect existing local hooks before migrating. Preserve pending recovery
-records and complete recovery with their owning tool rather than deleting them.
+Run only one maintainer of this module override; competing rebuild hooks can
+replace the selected file unexpectedly.
 
 ## Before upstream submission
 

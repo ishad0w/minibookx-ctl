@@ -8,6 +8,7 @@ pub const REPLY_BYTES: usize = 16;
 pub enum Request {
     Initialize { fan_control: bool },
     Heartbeat,
+    Ready,
     Activate,
     Duty(u8),
     Restore,
@@ -24,6 +25,7 @@ impl Request {
                 b[3] = u8::from(*fan_control);
             }
             Self::Heartbeat => b[2] = 8,
+            Self::Ready => b[2] = 9,
             Self::Activate => b[2] = 1,
             Self::Duty(raw) => {
                 b[2] = 2;
@@ -55,6 +57,7 @@ impl Request {
                 fan_control: b[3] == 1,
             },
             8 if b[3..6] == [0; 3] => Self::Heartbeat,
+            9 if b[3..6] == [0; 3] => Self::Ready,
             1 if b[3..6] == [0; 3] => Self::Activate,
             2 if b[4..6] == [0; 2]
                 && (b[3] == 0 || (crate::ec::MIN_RAW..=crate::ec::MAX_RAW).contains(&b[3])) =>
@@ -184,6 +187,7 @@ mod tests {
             Request::Initialize { fan_control: false },
             Request::Initialize { fan_control: true },
             Request::Heartbeat,
+            Request::Ready,
             Request::Activate,
             Request::Duty(0),
             Request::Duty(32),
@@ -196,7 +200,7 @@ mod tests {
         ] {
             assert_eq!(Request::decode(&r.encode(42)).unwrap(), (r, 42));
         }
-        for op in [3, 4].into_iter().chain(9..=255) {
+        for op in [3, 4].into_iter().chain(10..=255) {
             let mut b = Request::Activate.encode(0);
             b[2] = op;
             assert!(Request::decode(&b).is_err());
@@ -208,10 +212,12 @@ mod tests {
         let mut request = Request::Initialize { fan_control: false }.encode(1);
         request[3] = 2;
         assert!(Request::decode(&request).is_err());
-        for index in 3..6 {
-            let mut request = Request::Heartbeat.encode(2);
-            request[index] = 1;
-            assert!(Request::decode(&request).is_err());
+        for request in [Request::Heartbeat, Request::Ready] {
+            for index in 3..6 {
+                let mut bytes = request.encode(2);
+                bytes[index] = 1;
+                assert!(Request::decode(&bytes).is_err());
+            }
         }
     }
     #[test]

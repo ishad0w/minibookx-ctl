@@ -108,13 +108,6 @@ pub struct Sample {
     pub secondary: [f64; 3],
 }
 
-#[derive(Debug)]
-pub struct SensorPaths {
-    pub primary_iio: PathBuf,
-    pub secondary_adapter: PathBuf,
-    pub secondary_device: PathBuf,
-}
-
 #[repr(C)]
 struct I2cMessage {
     address: u16,
@@ -130,7 +123,6 @@ struct I2cTransfer {
 }
 
 pub struct Sensors {
-    paths: SensorPaths,
     primary: [File; 3],
     secondary: Secondary,
     power: Option<power::Lease>,
@@ -192,11 +184,6 @@ impl Sensors {
             open_read_attribute(&primary_iio.join("in_accel_z_raw"))?,
         ];
         let mut sensor = Self {
-            paths: SensorPaths {
-                primary_iio,
-                secondary_adapter: secondary.adapter.clone(),
-                secondary_device: PathBuf::from(format!("/dev/i2c-{}", secondary.adapter_number)),
-            },
             primary,
             secondary,
             power: None,
@@ -213,10 +200,6 @@ impl Sensors {
         // with a fresh estimator, so warm-up cannot establish a posture.
         sensor.sample()?;
         Ok(sensor)
-    }
-
-    pub fn paths(&self) -> &SensorPaths {
-        &self.paths
     }
 
     pub fn restore(&mut self) -> io::Result<()> {
@@ -865,10 +848,6 @@ impl VirtualSwitch {
         self.tablet = tablet;
         self.known = true;
         Ok(())
-    }
-
-    pub fn is_tablet(&self) -> bool {
-        self.tablet
     }
 }
 

@@ -32,6 +32,16 @@ can choose bounded settings, but cannot name commands, registers, device paths
 or privileged hooks. systemd further restricts capabilities and writable paths.
 See the [security model](../../SECURITY.md) for the trust boundary.
 
+`AmbientCapabilities=CAP_SETUID` retains the startup capability needed for that
+one-way drop. systemd's sandbox setup can otherwise remove it even for UID 0;
+see [exec-invoke](https://github.com/systemd/systemd/blob/v257/src/core/exec-invoke.c#L4860-L4865).
+The worker clears its capability sets afterwards; the VM checks this boundary.
+
+The broker sends systemd READY only after the worker completes startup. A fixed
+worker heartbeat request, sent while awake and paused, permits the broker to
+ping the watchdog. The unit accepts notifications only from the main broker;
+the worker cannot replace MainPID or directly keep the manager's watchdog alive.
+
 After parsing configuration, the worker sends one fixed startup choice to the
 broker. With `fan_control = false`, the broker does not prepare, open or access
 the EC, and the worker does not require a CPU temperature sensor. Tablet and
@@ -72,6 +82,12 @@ its active interval while heating, holding or running the fan. Defaults live in
 [the preset template](../../config/presets.conf). Identical config reloads
 preserve pending timers; profile changes preserve the emergency latch and the
 actual fan run time.
+
+At startup and resume, the broker reports the firmware's existing duty without
+writing OFF. The worker seeds policy from that duty and a fresh temperature.
+Hot takeover bypasses the ordinary start/up holds; reducing inherited cooling
+still requires the cooling hold. Later speed increases use hysteresis so one
+sample just below a threshold cannot repeatedly cancel their timers.
 
 The broker waits for IPC, lid notifications or the nearest active monotonic
 deadline. Posture samples and guardian heartbeats have separate deadlines;
@@ -180,8 +196,12 @@ or power restoration.
 Before sleep or normal shutdown, the live guardian must confirm tablet OFF
 before the broker powers down a sensor it woke. Resume reacquires the sensor
 and starts a new posture estimate. An I/O or identity failure clears tablet mode
-and faults the service; invalid gravity samples use the estimator's stale-data
-timeout. The unprivileged worker and guardian never inherit the I2C descriptor
+and disables detection until service restart, while fan/power supervision
+continues. It disarms the guardian heartbeat after OFF acknowledgement and
+closes the failed lid descriptor. A pending sensor-restore failure keeps its
+object and ownership record for final cleanup. Unconfirmed OFF still faults the
+whole service. Invalid gravity samples use the estimator's stale-data timeout.
+The unprivileged worker and guardian never inherit the I2C descriptor
 or the hardware lock.
 
 ### Power-limit recovery
@@ -212,6 +232,16 @@ edits and atomic replacement. Invalid updates keep the last accepted policy.
 checks
 ownership, file type, links and size, then parses and reserializes JSON. This
 keeps worker-controlled output from becoming a privileged file read or terminal
-control sequence. The records update separately; their
+control sequence.
+
+The broker retains only the newest pending fan, power and tablet snapshot.
+Failed writes are retried at most once every five seconds per record, including
+in firmware fan mode, after tablet detection fails and while paused. Pending
+deadlines join the existing poll; a clean record adds no timer or write. A
+newer observation replaces the queued value without resetting its retry delay.
+Diagnostic failures never prevent hardware recovery. Shutdown makes one final
+best-effort publication after hardware release, without waiting for a retry.
+
+The records update separately; their
 [field meanings](../reference/diagnostics.md#service-status) distinguish policy requests,
 broker-applied duty, captured power baseline and current RAPL observations.

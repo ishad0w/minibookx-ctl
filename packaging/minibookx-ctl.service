@@ -1,13 +1,15 @@
 [Unit]
 Description=Bounded hardware control for the tested MiniBook X U300
-After=systemd-logind.service sys-kernel-debug.mount
+After=systemd-logind.service sys-kernel-debug.mount modprobe@uinput.service modprobe@i2c_dev.service
 Requires=systemd-logind.service
+# DeviceAllow resolves kernel device groups when the cgroup is created.
+Wants=modprobe@uinput.service modprobe@i2c_dev.service
 StartLimitIntervalSec=120
 StartLimitBurst=3
 
 [Service]
 Type=notify
-NotifyAccess=all
+NotifyAccess=main
 User=root
 Group=root
 ExecStartPre=/usr/local/bin/minibookx-ctl --prepare
@@ -28,11 +30,17 @@ RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes
 UMask=0077
 LimitCORE=0
+OOMScoreAdjust=-250
 NoNewPrivileges=yes
 CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_MODULE
-# Preserve the intentional setuid capability through systemd seccomp setup.
+# systemd's sandbox setup can drop SETUID unless requested as ambient. Keep it
+# for the worker's UID drop; the VM checks all worker capability sets are empty.
 AmbientCapabilities=CAP_SETUID
 PrivateDevices=no
+DevicePolicy=closed
+DeviceAllow=char-input r
+DeviceAllow=char-i2c rw
+DeviceAllow=/dev/uinput rw
 InaccessiblePaths=/tmp /var/tmp
 ProtectHome=yes
 ProtectSystem=strict
@@ -49,6 +57,7 @@ ReadWritePaths=-/sys/module/ec_sys/parameters/write_support
 # control disabled by default; enabling it requires no additional unit files.
 ReadWritePaths=-/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw
 ReadWritePaths=-/sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw
+# RAPL indices are discovered by long_term/short_term names, not their numbers.
 ReadWritePaths=-/sys/class/powercap/intel-rapl:0/constraint_2_power_limit_uw
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
 RestrictNamespaces=yes

@@ -255,6 +255,23 @@ mod tests {
     }
 
     #[test]
+    fn opting_in_without_explicit_limits_preserves_firmware_in_every_profile() {
+        let document =
+            Document::parse(&SAMPLE.replace("power_control = false", "power_control = true"))
+                .unwrap();
+        for preset in Preset::ALL {
+            assert_eq!(
+                document.power(preset),
+                &PowerConfig {
+                    enabled: true,
+                    pl1_w: None,
+                    pl2_w: None
+                }
+            );
+        }
+    }
+
+    #[test]
     fn damaged_or_unsafe_inactive_presets_reject_the_whole_document() {
         for bad in [
             SAMPLE.replace("[quiet]", "[balance]"),

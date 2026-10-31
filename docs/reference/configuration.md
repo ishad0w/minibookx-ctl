@@ -29,7 +29,7 @@ Each named profile has these keys:
 | Key | Meaning | Accepted range |
 |---|---|---|
 | `curve` | `temperature_c:pwm_percent` pairs | 1–16 steps; ascending 20–100°C thresholds below `emergency_c`; nondecreasing 35–80% duty |
-| `hysteresis_c` | Cooling margin below a threshold | 1–15°C |
+| `hysteresis_c` | Cooling margin and margin before resetting a pending speed increase | 1–15°C |
 | `start_hold_s` | Sustained heat before starting | 0–120 s |
 | `up_hold_s` | Sustained heat before increasing speed | 0–120 s |
 | `down_hold_s` | Sustained cooling before reducing speed | 0–120 s |
@@ -38,10 +38,16 @@ Each named profile has these keys:
 | `idle_interval_ms` | Sampling at stable cold idle | Between `active_interval_ms` and 10000 ms |
 | `active_interval_ms` | Sampling while heating or running | At least 1000 ms, no greater than `idle_interval_ms` |
 
-Each higher curve threshold has its own heat timer. Cooling requires both the
-hysteresis margin and cooling delay; stopping also respects minimum run time.
+Each higher curve threshold has its own heat timer. Once started, it resets
+only below the threshold minus hysteresis. Cooling requires both the hysteresis
+margin and cooling delay; stopping also respects minimum run time.
 The actual thresholds and delays come from the selected profile, so a short
 spike need not start a stopped fan.
+
+Startup and resume use a fresh temperature and the EC's existing duty. They
+bypass start/up holds when taking over an already hot CPU and preserve a
+running firmware duty until a cooling hold permits a lower stage. These holds
+apply to later temperature changes, not to withholding cooling at takeover.
 
 At `emergency_c`, policy requests approximately 80% duty. Release requires
 30 continuous seconds at least 5°C below that threshold. The broker has an

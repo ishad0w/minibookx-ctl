@@ -170,22 +170,13 @@ fn classify_sleep_signal(message: &Message, owner: &str) -> io::Result<Option<bo
 /// Persistent AF_UNIX datagram socket, including systemd's @abstract names.
 pub struct Notifier {
     socket: Option<UnixDatagram>,
-    watchdog: Option<Duration>,
 }
 impl Notifier {
     pub fn from_environment() -> io::Result<Self> {
         let socket = env::var_os("NOTIFY_SOCKET")
             .map(|name| notify_socket(&name))
             .transpose()?;
-        let watchdog = watchdog_interval(
-            env::var("WATCHDOG_USEC").ok().as_deref(),
-            env::var("WATCHDOG_PID").ok().as_deref(),
-            std::process::id(),
-        );
-        Ok(Self { socket, watchdog })
-    }
-    pub fn watchdog_interval(&self) -> Option<Duration> {
-        self.watchdog
+        Ok(Self { socket })
     }
     pub fn send(&self, state: &str) -> io::Result<()> {
         if let Some(socket) = &self.socket
@@ -220,10 +211,17 @@ fn notify_socket(name: &OsStr) -> io::Result<UnixDatagram> {
         .map_err(|e| context("connect systemd NOTIFY_SOCKET", e))?;
     Ok(socket)
 }
-fn watchdog_interval(usec: Option<&str>, pid: Option<&str>, ours: u32) -> Option<Duration> {
-    if pid.is_some_and(|p| p.parse::<u32>().ok() != Some(ours)) {
-        return None;
-    }
+pub fn policy_heartbeat_interval() -> Duration {
+    // The worker reports liveness over bounded IPC; only the broker notifies
+    // systemd. WATCHDOG_PID therefore remains the broker's PID throughout.
+    heartbeat_interval(env::var("WATCHDOG_USEC").ok().as_deref())
+}
+fn heartbeat_interval(usec: Option<&str>) -> Duration {
+    watchdog_interval(usec)
+        .unwrap_or(Duration::from_secs(5))
+        .min(Duration::from_secs(5))
+}
+fn watchdog_interval(usec: Option<&str>) -> Option<Duration> {
     let usec = usec?.parse::<u64>().ok()?;
     (usec > 0).then(|| Duration::from_micros((usec / 2).max(1)))
 }
@@ -430,18 +428,18 @@ mod tests {
         assert!(notify_socket(OsStr::new("relative.sock")).is_err());
     }
     #[test]
-    fn watchdog_is_enabled_only_for_our_pid() {
+    fn policy_heartbeat_tracks_watchdog_without_exceeding_the_broker_timeout() {
         assert_eq!(
-            watchdog_interval(Some("10000000"), Some("12"), 12),
+            watchdog_interval(Some("10000000")),
             Some(Duration::from_secs(5))
         );
         assert_eq!(
-            watchdog_interval(Some("10000000"), None, 12),
-            Some(Duration::from_secs(5))
+            heartbeat_interval(Some("3000000")),
+            Duration::from_millis(1500)
         );
-        assert_eq!(watchdog_interval(Some("10000000"), Some("99"), 12), None);
-        assert_eq!(watchdog_interval(Some("0"), None, 12), None);
-        assert_eq!(watchdog_interval(Some("garbage"), None, 12), None);
+        for usec in [None, Some("0"), Some("garbage"), Some("60000000")] {
+            assert_eq!(heartbeat_interval(usec), Duration::from_secs(5));
+        }
     }
     #[test]
     fn pathname_notify_socket_sends_exact_payload() {

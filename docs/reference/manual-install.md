@@ -77,7 +77,7 @@ sudo install -d -o root -g root -m0755 \
 sudo install -o root -g root -m0755 minibookx-ctl /usr/local/bin/minibookx-ctl
 sudo install -o root -g root -m0644 packaging/minibookx-ctl.service \
   /etc/systemd/system/minibookx-ctl.service
-sudo install -o root -g root -m0644 LICENSE NOTICE THIRD_PARTY.md build-metadata.json \
+sudo install -o root -g root -m0644 LICENSE NOTICE THIRD_PARTY.md \
   /usr/local/share/doc/minibookx-ctl/
 sudo install -o root -g root -m0644 config/presets.conf \
   /usr/local/share/doc/minibookx-ctl/presets.conf

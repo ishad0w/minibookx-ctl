@@ -82,8 +82,9 @@ belong in `docs/hardware/`; source and release instructions belong in
 Keep mutable facts in one place: shipped defaults in `config/presets.conf`,
 accepted ranges in the configuration reference, sensor timings in the sensor
 reference, and supported hardware/limits in the hardware overview. Other
-pages should summarize and link. An explicitly illustrative config example or
-a dated test observation is not a second specification of current defaults.
+pages should summarize and link. Illustrative examples must be labelled and
+must not repeat shipped defaults. Keep test chronology and personal logs out
+of maintained documentation.
 
 | Path | Contents |
 |---|---|
@@ -97,6 +98,5 @@ a dated test observation is not a second specification of current defaults.
 | [docs/reference/](docs/reference/) | Manual file installation, config/status semantics and kernel support |
 | [docs/hardware/](docs/hardware/) | Tested revision, EC, BIOS catalogue, charging and hardware evidence |
 | [docs/development/](docs/development/) | Architecture, builds, tests and releases |
-| [packaging/README.md](packaging/README.md), [docs/distributions.md](docs/distributions.md) | Short navigation pages retained for paths printed by existing binaries; no duplicate instructions |
 | [contrib/vbt/build_vbt.py](contrib/vbt/build_vbt.py) | Offline, identity-checked timing builder; does not install firmware |
 | [contrib/i915/](contrib/i915/) | Unbuilt developer RFC and its validation requirements; separate from the controller |

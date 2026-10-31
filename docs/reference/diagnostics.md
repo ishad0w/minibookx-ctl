@@ -16,7 +16,7 @@ battery readings, power metadata and hardware references. Both are read-only.
 | Populated cgroup and recent policy record | Processes and recent status exist; physical behavior still needs checking |
 | Accepted config | Last validated worker settings, not necessarily the current file on disk |
 | Fan control disabled | Firmware controls the fan; missing EC readings are intentional |
-| Active display mode | Timing from a recognized active CRTC, not merely advertised connector modes |
+| Active display mode | Needs permission to read GPU debugfs; reports timing from a recognized active CRTC, not advertised modes |
 | Intel driver binding | Sysfs associates the GPU with a driver; an application can still use software rendering |
 | Package advice | Candidates for a recognized OS/version; not proof of acceleration |
 
@@ -106,10 +106,17 @@ error still fails shutdown. Final records may remain, but ordinary status
 reports the stopped state rather than presenting them as live. See
 [tablet recovery](../development/design.md#tablet-switch-recovery).
 
-While running, actual tablet-mode transitions update the tablet record
+During normal operation, tablet-mode transitions update the tablet record
 immediately. Angle, reliability and reason changes are coalesced into snapshots
 at most five seconds apart; diagnostic churn does not send another switch
-command. Errors still trigger immediate OFF and recovery.
+command. Sensor/lid errors send OFF and report `Unavailable`; detection remains
+disabled until restart while cooling continues. Unconfirmed OFF still triggers
+service-wide recovery.
+
+A temporary write failure can leave an older record visible. The broker keeps
+the newest state and [retries publication](../development/design.md#config-and-status-files)
+even with fan control or tablet detection disabled. Successful publication is
+not required for recovery.
 
 ## Suspend mode
 

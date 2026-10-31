@@ -6,7 +6,8 @@ This setup uses the distribution's existing i915 driver; no module build is need
 
 > [!WARNING]
 > The panel's rated maximum refresh is unknown. This is an experiment tested on
-> one panel. The builder checks your local panel table and refuses unknown ones.
+> one panel. Pixel clock increases by about 20% over the firmware's 50 Hz mode.
+> The builder checks your local panel table and refuses unknown ones.
 > Keep a working recovery boot; do not bypass that check or change the BIOS panel type.
 
 This is independent of the controller service. You will prepare a panel-timing
@@ -182,7 +183,9 @@ kernel's images during the first trial.
 ## 4. Test and keep a way back
 
 Reboot into the test entry. Check the physical screen and use
-`minibookx-ctl --doctor` to inspect the active refresh rate. Play a 60 fps video,
+`sudo minibookx-ctl --doctor` to inspect the active refresh rate through GPU
+debugfs. Without that permission, check the mode in desktop display settings.
+Play a 60 fps video,
 then try sleep and wake. Finish with a full shutdown, a 10–15 second pause and
 a button start; inspect the login screen before putting it to sleep again.
 

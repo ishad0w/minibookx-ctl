@@ -94,6 +94,10 @@ before its final commit. Follow the canonical
 for commit/tag naming, build identity and publication checks. Never relabel an
 old binary or reuse a published version for different source.
 
+Keep Balance as the default. Before releasing fan-policy or takeover changes,
+run supervised sustained-load and hot-start/resume checks on authorized hardware;
+unit/VM tests do not qualify physical cooling or case temperatures.
+
 Normal pushes and PRs run CI without publishing; do not use CI-skip commit
 markers. Publishing requires an explicit manual run on main with `publish=true`
 after the version bump. Native/musl fixture checks, the systemd VM and all

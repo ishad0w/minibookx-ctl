@@ -27,6 +27,8 @@ case "$1" in
         ;;
     *) exit 2 ;;
 esac
+# The production device filter requires these stock module-load dependencies.
+test -f /usr/lib/systemd/system/modprobe@.service || test -f /lib/systemd/system/modprobe@.service
 mkdir /stage
 cp /test-binary /tmp/minibookx-ctl
 chmod 755 /tmp/minibookx-ctl

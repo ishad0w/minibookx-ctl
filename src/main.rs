@@ -32,7 +32,7 @@ Usage:
 
 Use the installed systemd unit for --daemon. Profiles are selected in the config.
 Power limits are enabled only by power_control=true in the configuration.
-Systemd lifecycle only: --prepare, --cleanup, --recover.
+Systemd lifecycle: --prepare, --recover. Recovery may be retried with the service stopped.
 Diagnostic and simulation commands perform no hardware writes.";
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -49,7 +49,6 @@ fn reject_extra_operands(
         "--version",
         "--build-info",
         "--prepare",
-        "--cleanup",
         "--recover",
         "--status",
         "--capabilities",
@@ -102,7 +101,6 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::e
             return doctor::print(json_output).map_err(Into::into);
         }
         "--prepare" => return hardware::prepare().map_err(Into::into),
-        "--cleanup" => return hardware::cleanup().map_err(Into::into),
         "--recover" => return hardware::recover().map_err(Into::into),
         "--status" => return service::print_status().map_err(Into::into),
         "--check-config" => {
@@ -140,11 +138,6 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::e
         match flag.as_str() {
             "--config" if path.is_none() => {
                 path = Some(PathBuf::from(args.next().ok_or("--config needs a path")?))
-            }
-            // Accept old root-owned unit drop-ins during an upgrade. New units
-            // use config-only opt-in and never need this compatibility flag.
-            "--allow-power-limits" if command == "--daemon" => {
-                eprintln!("--allow-power-limits is obsolete; use power_control in the config")
             }
             "--no-tablet" if command == "--daemon" => tablet = false,
             "--samples" if command == "--monitor" && samples.is_none() => {
@@ -264,7 +257,6 @@ mod tests {
     fn no_operand_commands_reject_arguments_before_any_lifecycle_or_diagnostic_action() {
         for command in [
             "--prepare",
-            "--cleanup",
             "--recover",
             "--status",
             "--capabilities",

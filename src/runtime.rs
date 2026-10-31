@@ -1,4 +1,4 @@
-//! One-thread, event-driven controller. CPU sampling uses a 1..5 s monotonic timer;
+//! One-thread, event-driven controller. CPU sampling uses a 1..10 s monotonic timer;
 //! configuration changes and sleep notifications use file descriptors.
 use crate::{
     ec,
@@ -65,6 +65,7 @@ struct State {
     last_ec_temp: Option<u8>,
     tach_state: crate::ipc::TachState,
     applied: u8,
+    initial_sample: bool,
     broker_emergency: bool,
     paused: bool,
     started: bool,
@@ -104,7 +105,9 @@ impl State {
             "snapshot_boottime_ms": crate::status::boottime_ms()?,
             "accepted_config": accepted_config_summary(&self.config, &self.power, self.preset, self.fan_control),
         }).to_string();
-        service::write_status(&text).map_err(|e| sd::context("write policy status", e))?;
+        if let Err(error) = service::write_status(&text) {
+            eprintln!("cannot publish policy status: {error}");
+        }
         self.last_status = Some(Instant::now());
         Ok(())
     }
@@ -167,7 +170,6 @@ impl State {
             // CLOCK_MONOTONIC does not advance through S3; no wake alarm is used.
             self.schedule(Duration::from_secs(5))?;
         } else if !self.fan_control {
-            self.session.heartbeat()?;
             if self
                 .last_status
                 .is_none_or(|t| t.elapsed() >= Duration::from_secs(30))
@@ -183,15 +185,22 @@ impl State {
                 .read_mc()
                 .map_err(|e| sd::context("read coretemp sample", e))?;
             self.reads += 1;
-            let decision = self
-                .controller
-                .sample(self.epoch.elapsed(), cpu)
-                .map_err(io::Error::other)?;
+            let decision = if self.initial_sample {
+                self.controller
+                    .takeover(self.epoch.elapsed(), cpu, self.applied)
+            } else {
+                self.controller.sample(self.epoch.elapsed(), cpu)
+            }
+            .map_err(io::Error::other)?;
+            // A higher initial target is immediate. Downward changes retain
+            // the ordinary ramp and the controller's cooling hold.
             let requested = ec::ramp(
                 self.applied,
                 decision.raw_duty,
-                cpu >= self.config.emergency_mc,
+                cpu >= self.config.emergency_mc
+                    || (self.initial_sample && decision.raw_duty > self.applied),
             );
+            self.initial_sample = false;
             let now = Instant::now();
             let applied = self
                 .session
@@ -251,10 +260,6 @@ impl State {
         Ok(())
     }
     fn sleep(&mut self, preparing: bool) -> io::Result<()> {
-        if !self.started {
-            self.paused = preparing;
-            return Ok(());
-        }
         if preparing == self.paused {
             return Ok(());
         }
@@ -277,9 +282,9 @@ impl State {
                 .then(|| CpuSensor::discover(Path::new("/sys/class/hwmon")))
                 .transpose()?;
             self.session.apply_power(&self.power)?;
-            self.session.activate()?;
+            self.applied = self.session.activate()?.unwrap_or(0);
             self.epoch = Instant::now();
-            self.applied = 0;
+            self.initial_sample = true;
             self.broker_emergency = false;
             self.last_feedback_status = None;
             self.last_ec_temp = None;
@@ -327,10 +332,9 @@ fn event_loop(
     state: &mut State,
     signals: &sd::Signals,
     watch: Option<&sd::ConfigWatch>,
-    notify: &sd::Notifier,
 ) -> io::Result<()> {
-    let interval = notify.watchdog_interval();
-    let mut watchdog = interval.and_then(|delay| Instant::now().checked_add(delay));
+    let interval = sd::policy_heartbeat_interval();
+    let mut heartbeat = Instant::now() + interval;
     loop {
         // Drain on every iteration, including queued messages received during
         // setup calls. No callback can reenter State while it is being changed.
@@ -341,11 +345,11 @@ fn event_loop(
             state.tick()?;
         }
         let now = Instant::now();
-        if watchdog.is_some_and(|deadline| now >= deadline) {
-            notify.send("WATCHDOG=1")?;
-            watchdog = interval.and_then(|delay| now.checked_add(delay));
+        if now >= heartbeat {
+            state.session.heartbeat()?;
+            heartbeat = Instant::now() + interval;
         }
-        let deadline = watchdog.map_or(state.next_tick, |d| d.min(state.next_tick));
+        let deadline = heartbeat.min(state.next_tick);
         let bus = state.logind.watch();
         let bus_events =
             (if bus.read { libc::POLLIN } else { 0 }) | (if bus.write { libc::POLLOUT } else { 0 });
@@ -416,8 +420,6 @@ pub fn run(loaded: Loaded, config_path: Option<PathBuf>) -> io::Result<()> {
     // before the original signal mask is restored at function exit.
     let signals =
         sd::Signals::new().map_err(|e| sd::context("initialize policy signal source", e))?;
-    let notify = sd::Notifier::from_environment()
-        .map_err(|e| sd::context("initialize systemd notifier", e))?;
     let watch = config_path
         .as_deref()
         .map(sd::ConfigWatch::new)
@@ -452,6 +454,7 @@ pub fn run(loaded: Loaded, config_path: Option<PathBuf>) -> io::Result<()> {
         last_ec_temp: None,
         tach_state: crate::ipc::TachState::Unknown,
         applied: 0,
+        initial_sample: true,
         broker_emergency: false,
         paused: false,
         started: false,
@@ -483,10 +486,11 @@ pub fn run(loaded: Loaded, config_path: Option<PathBuf>) -> io::Result<()> {
             .session
             .apply_power(&state.power)
             .map_err(|e| sd::context("apply startup power policy", e))?;
-        state
+        state.applied = state
             .session
             .activate()
-            .map_err(|e| sd::context("activate startup fan session", e))?;
+            .map_err(|e| sd::context("activate startup fan session", e))?
+            .unwrap_or(0);
     }
     state
         .tick()
@@ -494,19 +498,13 @@ pub fn run(loaded: Loaded, config_path: Option<PathBuf>) -> io::Result<()> {
     eprintln!(
         "ready: U300 policy with live presets; 1 thread; fan_control={fan_control}; bounded broker access"
     );
-    notify
-        .send(if fan_control {
-            "READY=1\nWATCHDOG=1\nSTATUS=Fan policy active; configuration watch enabled"
-        } else {
-            "READY=1\nWATCHDOG=1\nSTATUS=Fan control disabled; configuration watch enabled"
-        })
-        .map_err(|e| sd::context("announce policy READY", e))?;
-    let result = event_loop(&mut state, &signals, watch.as_ref(), &notify);
+    state
+        .session
+        .ready()
+        .map_err(|e| sd::context("acknowledge policy readiness", e))?;
+    let result = event_loop(&mut state, &signals, watch.as_ref());
     if let Err(e) = &result {
         eprintln!("controller failure: {e}");
-    }
-    if let Err(e) = notify.send("STOPPING=1") {
-        eprintln!("systemd stop notification failed: {e}");
     }
     // State's Drop returns to firmware on all errors and ordinary shutdown.
     result

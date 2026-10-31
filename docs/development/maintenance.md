@@ -99,9 +99,14 @@ created. Review `results/result.json` and `results/serial.log` inside
 The suite checks start/stop/restart, the sandbox and privilege drop, real logind
 authorization, worker/broker loss, systemd watchdog handling, `ExecStopPost`,
 tablet OFF and recovery-record retention after an injected restoration fault.
-Stalled-guardian scenarios cover final cleanup, the pre-sleep Restore request
-and sensor failure: cooling returns to firmware before waiting for OFF, while
-sensor restoration waits for confirmation.
+It also checks hot takeover, tablet-domain failures, worker notification
+spoofing, real device-filter enforcement and a failed update rolled back by the
+production installer against real systemd. Status tests cover I/O errors and
+recovery of the latest fan/power/disabled-tablet snapshots without EC access.
+Stalled-guardian checks cover final cleanup, the pre-sleep Restore request and
+sensor failure. Stop and sleep release cooling before waiting for OFF. A sensor
+fault first attempts a bounded OFF to disable only tablet detection; failed OFF
+enters service cleanup. Sensor restoration always waits for confirmation.
 Fan-disabled cases start without debugfs, EC or CPU-temperature files, exercise
 profile reload and reject a changed startup flag. A guest-only fake debugfs
 source checks late EC-file creation through the unit's real private bind.
@@ -168,11 +173,11 @@ minibookx-ctl --build-info
 ```
 
 The release version comes from `Cargo.toml`. Each published release increments
-its patch version, with the matching change in `Cargo.lock`. For example,
-`0.1.2` uses commit title **`Release (v0.1.2)`**, tag **`v0.1.2`** and GitHub
-release title **`Release (v0.1.2)`**. Tags use a `v` prefix and no hash suffix.
+its patch version, with the matching change in `Cargo.lock`. Version `X.Y.Z`
+uses commit title **`Release (vX.Y.Z)`**, tag **`vX.Y.Z`** and GitHub release title
+**`Release (vX.Y.Z)`**. Tags use a `v` prefix and no hash suffix.
 
-The executable still reports `0.1.2+g<commit>`, using the source commit's first
+The executable reports `X.Y.Z+g<commit>`, using the source commit's first
 12 characters. Asset filenames keep the same build identity; metadata records
 the full commit, compiler and static libdbus identity. Make the final commit
 before building: changing even its message changes the hash and requires a new
@@ -183,8 +188,8 @@ Each release contains five assets:
 | Asset | Contents |
 |---|---|
 | `minibookx-ctl-x86_64-linux` | Static executable used by the bootstrap |
-| `minibookx-ctl-0.1.2-<commit>-x86_64-unknown-linux-musl.tar.gz` | Executable, configuration template, service, documentation and notices |
-| `minibookx-ctl-0.1.2-<commit>-sources.tar.gz` | Corresponding source, locked Cargo dependencies and pinned libdbus source |
+| `minibookx-ctl-X.Y.Z-<commit>-x86_64-unknown-linux-musl.tar.gz` | Executable, configuration template, service, documentation and notices |
+| `minibookx-ctl-X.Y.Z-<commit>-sources.tar.gz` | Corresponding source, locked Cargo dependencies and pinned libdbus source |
 | `build-metadata.json` | Build and source identity |
 | `SHA256SUMS` | Checksums of the other four assets |
 
@@ -222,9 +227,15 @@ artifact validation, the VM and all container suites pass. Ordinary commits do
 not require a version bump; `main` may contain unreleased changes. The public
 installer downloads the latest published release and preserves existing config.
 
-Published versions are immutable:
+Published versions are append-only by project policy:
 retrying the exact same build can verify and resume it, but a different commit
 cannot reuse its tag or replace its assets. A new release must use a new version.
+The bootstrap URL pins a reviewed commit; update it only after reviewing a
+changed bootstrap. This is separate from selecting the latest released binary.
+GitHub's platform-enforced release immutability requires repository settings;
+it is not enabled by a workflow file. CI-skip markers can prevent GitHub from
+starting a workflow at all, so a check inside that workflow cannot prohibit them.
+Required branch checks/rules must enforce that policy on GitHub.
 
 ```mermaid
 flowchart LR

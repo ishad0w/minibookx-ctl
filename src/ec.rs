@@ -93,7 +93,15 @@ impl<T: EcIo> Fan<T> {
         if self.io.read(0x4f)? & MANUAL == 0 {
             return Err(io::Error::other("manual flag did not latch"));
         }
-        self.current = None;
+        // Read again after latching manual mode: firmware may have raised its
+        // duty between baseline and takeover. Never acknowledge an assumed 0.
+        let current = self.io.read(0x4b)?;
+        if current != 0 && !(MIN_RAW..=MAX_RAW).contains(&current) {
+            return Err(io::Error::other(
+                "unsupported takeover duty; recovery required",
+            ));
+        }
+        self.current = Some(current);
         Ok(())
     }
     pub fn apply(&mut self, raw: u8) -> io::Result<bool> {
@@ -195,6 +203,7 @@ mod tests {
         values: [u8; 256],
         writes: Vec<(u8, u8)>,
         fail_after_manual_write: bool,
+        duty_at_takeover: Option<u8>,
     }
     impl Fake {
         fn new() -> Self {
@@ -205,6 +214,7 @@ mod tests {
                 values,
                 writes: vec![],
                 fail_after_manual_write: false,
+                duty_at_takeover: None,
             })))
         }
     }
@@ -216,6 +226,12 @@ mod tests {
             let mut s = self.0.borrow_mut();
             s.values[r as usize] = v;
             s.writes.push((r, v));
+            if r == 0x4f
+                && v & MANUAL != 0
+                && let Some(duty) = s.duty_at_takeover
+            {
+                s.values[0x4b] = duty;
+            }
             if r == 0x4f && v & MANUAL != 0 && s.fail_after_manual_write {
                 s.fail_after_manual_write = false;
                 return Err(io::Error::other("write accepted but reported error"));
@@ -245,6 +261,35 @@ mod tests {
             assert!(f.activate().is_err());
         }
         assert_eq!(io.0.borrow().values[0x4f], 0x05);
+    }
+    #[test]
+    fn takeover_preserves_running_firmware_duty_without_a_pwm_write() {
+        let io = Fake::new();
+        io.0.borrow_mut().values[0x4b] = MAX_RAW;
+        let mut fan = Fan::new(io.clone());
+        fan.activate().unwrap();
+        assert_eq!(fan.current_raw(), Some(MAX_RAW));
+        assert!(!fan.apply(MAX_RAW).unwrap());
+        assert_eq!(io.0.borrow().values[0x4b], MAX_RAW);
+        assert_eq!(io.0.borrow().writes, [(0x4f, 0x45)]);
+    }
+    #[test]
+    fn takeover_acknowledges_the_last_firmware_update_and_rejects_unknown_duty() {
+        for duty in [MAX_RAW, 1] {
+            let io = Fake::new();
+            io.0.borrow_mut().duty_at_takeover = Some(duty);
+            let mut fan = Fan::new(io.clone());
+            if duty == MAX_RAW {
+                fan.activate().unwrap();
+                assert_eq!(fan.current_raw(), Some(MAX_RAW));
+                assert!(!fan.apply(MAX_RAW).unwrap());
+            } else {
+                assert!(fan.activate().is_err());
+                assert!(fan.may_be_manual());
+            }
+            fan.restore().unwrap();
+            assert_eq!(io.0.borrow().writes, [(0x4f, 0x45), (0x4f, 0x05)]);
+        }
     }
     #[test]
     fn foreign_manual_is_never_cleared_by_drop() {

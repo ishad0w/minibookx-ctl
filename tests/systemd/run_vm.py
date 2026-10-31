@@ -1,18 +1,18 @@
-#!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """Run a file-backed lifecycle fixture in a diskless, networkless QEMU guest."""
+
 import argparse
 import gzip
 import hashlib
 import json
 import os
-from pathlib import Path
-import resource
 import signal
 import stat
 import subprocess
+import sys
 import tarfile
 import time
+from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -118,7 +118,7 @@ Type=oneshot
 ExecStart=/usr/bin/python3 /usr/local/bin/guest-tests.py
 StandardOutput=journal+console
 StandardError=journal+console
-TimeoutStartSec=100s
+TimeoutStartSec=150s
 """,
     )
     put(
@@ -138,6 +138,23 @@ exec /sbin/init
         for ino, (name, data) in enumerate(files.items(), 1):
             output.write(entry(name, *data, ino=ino))
         output.write(entry("TRAILER!!!", 0))
+
+
+def start_vm(command, log):
+    # Apply the child-only limit in a fresh interpreter, without a Python
+    # preexec_fn callback. exec preserves the PID/session used for cleanup.
+    launcher = (
+        "import os, resource, sys\n"
+        "resource.setrlimit(resource.RLIMIT_MEMLOCK, (0, 0))\n"
+        "os.execvp(sys.argv[1], sys.argv[1:])\n"
+    )
+    return subprocess.Popen(
+        [sys.executable, "-I", "-S", "-c", launcher, *command],
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
 
 
 def run(args):
@@ -187,18 +204,8 @@ def run(args):
     (output / "command.json").write_text(json.dumps(command, indent=2) + "\n")
     start = time.monotonic()
 
-    def limits():
-        resource.setrlimit(resource.RLIMIT_MEMLOCK, (0, 0))
-
     with (output / "serial.log").open("wb") as log:
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            preexec_fn=limits,
-        )
+        process = start_vm(command, log)
 
         def interrupted(signum, frame):
             raise KeyboardInterrupt
@@ -208,7 +215,7 @@ def run(args):
             for sig in (signal.SIGTERM, signal.SIGINT)
         }
         try:
-            code = process.wait(timeout=130)
+            code = process.wait(timeout=180)
         except (subprocess.TimeoutExpired, KeyboardInterrupt):
             try:
                 os.killpg(process.pid, signal.SIGTERM)
@@ -233,20 +240,20 @@ def run(args):
         and "VM_RESULT FAIL" not in serial
         and "Kernel panic" not in serial
     )
-    result = dict(
-        passed=passed,
-        returncode=code,
-        elapsed_seconds=round(time.monotonic() - start, 2),
-        kernel_sha256=hashlib.sha256(kernel.read_bytes()).hexdigest(),
-        fixture_sha256=hashlib.sha256(fixture.read_bytes()).hexdigest(),
-        assertions=[line for line in serial.splitlines() if "VM_ASSERT" in line],
-        scope=(
+    result = {
+        "passed": passed,
+        "returncode": code,
+        "elapsed_seconds": round(time.monotonic() - start, 2),
+        "kernel_sha256": hashlib.sha256(kernel.read_bytes()).hexdigest(),
+        "fixture_sha256": hashlib.sha256(fixture.read_bytes()).hexdigest(),
+        "assertions": [line for line in serial.splitlines() if "VM_ASSERT" in line],
+        "scope": (
             "Real broker/runtime/IPC/logind/unit sandbox. File-backed replacement "
             "hardware Session/prepare/recover and sensors/switch; production "
             "hardware lease validation is unit-tested separately. "
             "No physical fan, RAPL or libinput validation."
         ),
-    )
+    }
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))
     return 0 if passed else 1

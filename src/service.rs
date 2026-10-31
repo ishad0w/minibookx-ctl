@@ -107,13 +107,19 @@ impl Session {
             .set_read_timeout(Some(Duration::from_secs(3)))?;
         Ok(session)
     }
-    pub fn activate(&mut self) -> io::Result<()> {
-        self.fan.client.call(Request::Activate)?;
+    pub fn activate(&mut self) -> io::Result<Option<u8>> {
+        let reply = self.fan.client.call(Request::Activate)?;
         self.fan.manual = self.fan_control;
-        Ok(())
+        if self.fan_control && reply.actual_raw.is_none() {
+            return Err(io::Error::other("broker omitted takeover duty"));
+        }
+        Ok(reply.actual_raw)
     }
     pub fn heartbeat(&mut self) -> io::Result<()> {
         self.fan.client.call(Request::Heartbeat).map(|_| ())
+    }
+    pub fn ready(&mut self) -> io::Result<()> {
+        self.fan.client.call(Request::Ready).map(|_| ())
     }
     pub fn apply_power(&mut self, config: &PowerConfig) -> io::Result<()> {
         config.validate().map_err(io::Error::other)?;

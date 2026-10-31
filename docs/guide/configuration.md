@@ -27,18 +27,20 @@ preset = quiet
 
 Brief heat spikes can pass without starting the fan. Once it is running,
 cooling delays and a minimum run time prevent repeated starts and stops.
-The emergency threshold bypasses normal delays. Exact defaults live in the
-[sample config](../../config/presets.conf); your installed config can differ.
+The emergency threshold bypasses normal delays. Check your installed template
+for the defaults supplied with your release; your active config can differ.
+High-temperature curves require your own load and case-temperature checks.
 
 To customize a profile, edit its existing `curve` line. For example:
 
 ```ini
 [balance]
-curve = 60:35,85:40,90:50,93:70
+curve = 55:40,70:50,82:70,90:80
 ```
 
-This means 35% duty at 60°C, 40% at 85°C, 50% at 90°C and 70% at 93°C, subject
-to the profile's delays. Keep the other settings in that section.
+This example requests 40% duty at 55°C, 50% at 70°C, 70% at 82°C and 80% at
+90°C, subject to the profile's delays. It is an example, not a shipped preset.
+Keep the other settings in that section.
 Duty is the fan's electrical PWM setting, **not a percentage of maximum RPM**.
 Keep the values within the [accepted ranges](../reference/configuration.md#fan-settings).
 
@@ -71,10 +73,11 @@ profile before enabling `power_control = true`:
 | `pl2_w` | Short-term CPU package power limit, in watts |
 | `firmware` | Restore the value captured before this service's first override |
 
-The shipped Performance power limits are **untested examples**, not a
-recommendation for this laptop's cooling. Hardware testing kept power control
-off. See [power-limit bounds and restoration](../reference/configuration.md#power-limits)
-before opting in, and avoid running competing power-limit controllers.
+All shipped profiles leave both limits at `firmware`. Existing custom values
+are preserved during updates; review those before opting in. Live overrides
+remain unqualified on this laptop. See
+[power-limit bounds and restoration](../reference/configuration.md#power-limits)
+and avoid running competing power-limit controllers.
 
 ## Apply and check
 

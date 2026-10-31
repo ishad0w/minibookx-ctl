@@ -5,6 +5,7 @@ The packager may import ``metadata`` and ``ensure_archive``. An explicit archive
 is always checked; ``offline=True`` also permits a verified cache hit without a
 network request. Building is a separate operation and never requires root.
 """
+
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
@@ -12,7 +13,6 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
 import re
 import shlex
 import shutil
@@ -22,6 +22,7 @@ import tarfile
 import tempfile
 import urllib.parse
 import urllib.request
+from pathlib import Path, PurePosixPath
 
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_CACHE = REPO / "target/native/source-cache"
@@ -65,11 +66,11 @@ def verify_archive(path: Path) -> Path:
             digest.update(chunk)
             remaining -= len(chunk)
         after = os.fstat(stream.fileno())
-        if (
-            (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
-            != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
-            or digest.hexdigest() != pin["sha256"]
-        ):
+        if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ) or digest.hexdigest() != pin["sha256"]:
             raise ValueError(f"libdbus source SHA-256 mismatch: {path}")
     return path
 
@@ -77,8 +78,13 @@ def verify_archive(path: Path) -> Path:
 class _PrimaryHttpsRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         destination = urllib.parse.urlsplit(newurl)
-        if destination.scheme != "https" or destination.netloc != "dbus.freedesktop.org":
-            raise ValueError("refusing libdbus download redirect outside upstream HTTPS")
+        if (
+            destination.scheme != "https"
+            or destination.netloc != "dbus.freedesktop.org"
+        ):
+            raise ValueError(
+                "refusing libdbus download redirect outside upstream HTTPS"
+            )
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -105,7 +111,9 @@ def ensure_archive(
     cache_dir.mkdir(parents=True, exist_ok=True)
     temp_path = None
     try:
-        with tempfile.NamedTemporaryFile(dir=cache_dir, prefix=".libdbus-", delete=False) as out:
+        with tempfile.NamedTemporaryFile(
+            dir=cache_dir, prefix=".libdbus-", delete=False
+        ) as out:
             temp_path = Path(out.name)
             opener = urllib.request.build_opener(_PrimaryHttpsRedirect())
             with opener.open(pin["url"], timeout=30) as response:
@@ -149,9 +157,20 @@ def _extract(archive: Path, destination: Path) -> Path:
 
 def _meson_array(values: list[str]) -> str:
     # Meson machine files use Python-like quoted strings, not shell commands.
-    if any(ord(character) < 32 or ord(character) == 127 for value in values for character in value):
+    if any(
+        ord(character) < 32 or ord(character) == 127
+        for value in values
+        for character in value
+    ):
         raise ValueError("compiler arguments must not contain control characters")
-    return "[" + ", ".join("'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'" for value in values) + "]"
+    return (
+        "["
+        + ", ".join(
+            "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+            for value in values
+        )
+        + "]"
+    )
 
 
 def _command(argv: list[str], **kwargs) -> None:
@@ -161,7 +180,9 @@ def _command(argv: list[str], **kwargs) -> None:
 
 def build(args) -> None:
     if os.geteuid() == 0:
-        raise ValueError("build as an ordinary user; libdbus needs no root installation")
+        raise ValueError(
+            "build as an ordinary user; libdbus needs no root installation"
+        )
     pin = metadata()
     archive = ensure_archive(args.cache_dir, args.archive, args.offline)
     prefix = args.prefix.expanduser().absolute()
@@ -176,7 +197,9 @@ def build(args) -> None:
     prefix.parent.mkdir(parents=True, exist_ok=True)
     # An isolated fresh source/build tree avoids reusing modified extracted code
     # or a Meson cache from a different C compiler. Only --prefix is installed.
-    with tempfile.TemporaryDirectory(prefix=".libdbus-build-", dir=prefix.parent) as temp:
+    with tempfile.TemporaryDirectory(
+        prefix=".libdbus-build-", dir=prefix.parent
+    ) as temp:
         temp = Path(temp)
         source = _extract(archive, temp)
         cross = temp / "musl.ini"
@@ -200,33 +223,81 @@ def build(args) -> None:
             encoding="utf-8",
         )
         _command([*cc, *cflags, "-static", str(probe), "-o", str(temp / "check-musl")])
-        elf = subprocess.check_output(["readelf", "-lW", str(temp / "check-musl")], text=True)
+        elf = subprocess.check_output(
+            ["readelf", "-lW", str(temp / "check-musl")], text=True
+        )
         if "INTERP" in elf:
-            raise ValueError("compiler produced a dynamic executable instead of static musl")
+            raise ValueError(
+                "compiler produced a dynamic executable instead of static musl"
+            )
         build_dir = temp / "build"
         options = [
-            "--buildtype=release", "--default-library=static", "--wrap-mode=nodownload",
-            f"--prefix={prefix}", "--libdir=lib", "--cross-file", str(cross),
-            "--sysconfdir=/etc", "--localstatedir=/var",
-            "-Dauto_features=disabled", "-Dchecks=true", "-Dasserts=false",
-            "-Dintrusive_tests=false", "-Dinstalled_tests=false", "-Dmodular_tests=disabled",
-            "-Dmessage_bus=false", "-Dtools=false", "-Dtraditional_activation=false",
-            "-Duser_session=false", "-Dx11_autolaunch=disabled", "-Dlaunchd=disabled",
-            "-Dapparmor=disabled", "-Dselinux=disabled", "-Dlibaudit=disabled",
-            "-Dsystemd=disabled", "-Dvalgrind=disabled", "-Dverbose_mode=false", "-Dstats=false",
-            "-Ddoxygen_docs=disabled", "-Dducktype_docs=disabled", "-Dxml_docs=disabled", "-Dqt_help=disabled",
-            "-Drelocation=disabled", "-Depoll=enabled", "-Dinotify=disabled", "-Dkqueue=disabled",
-            "-Dsystem_socket=/run/dbus/system_bus_socket", "-Druntime_dir=/run",
+            "--buildtype=release",
+            "--default-library=static",
+            "--wrap-mode=nodownload",
+            f"--prefix={prefix}",
+            "--libdir=lib",
+            "--cross-file",
+            str(cross),
+            "--sysconfdir=/etc",
+            "--localstatedir=/var",
+            "-Dauto_features=disabled",
+            "-Dchecks=true",
+            "-Dasserts=false",
+            "-Dintrusive_tests=false",
+            "-Dinstalled_tests=false",
+            "-Dmodular_tests=disabled",
+            "-Dmessage_bus=false",
+            "-Dtools=false",
+            "-Dtraditional_activation=false",
+            "-Duser_session=false",
+            "-Dx11_autolaunch=disabled",
+            "-Dlaunchd=disabled",
+            "-Dapparmor=disabled",
+            "-Dselinux=disabled",
+            "-Dlibaudit=disabled",
+            "-Dsystemd=disabled",
+            "-Dvalgrind=disabled",
+            "-Dverbose_mode=false",
+            "-Dstats=false",
+            "-Ddoxygen_docs=disabled",
+            "-Dducktype_docs=disabled",
+            "-Dxml_docs=disabled",
+            "-Dqt_help=disabled",
+            "-Drelocation=disabled",
+            "-Depoll=enabled",
+            "-Dinotify=disabled",
+            "-Dkqueue=disabled",
+            "-Dsystem_socket=/run/dbus/system_bus_socket",
+            "-Druntime_dir=/run",
         ]
         # Do not allow host pkg-config libraries to enter the cross build.
-        env = {**os.environ, "PKG_CONFIG_LIBDIR": str(temp / "empty-pkg-config"), "PKG_CONFIG_PATH": ""}
+        env = {
+            **os.environ,
+            "PKG_CONFIG_LIBDIR": str(temp / "empty-pkg-config"),
+            "PKG_CONFIG_PATH": "",
+        }
         (temp / "empty-pkg-config").mkdir()
         _command(["meson", "setup", str(build_dir), str(source), *options], env=env)
         # Upstream's default all target still contains some non-installed test
         # programs even with modular/intrusive tests disabled. Build just the
         # public library; no test server or daemon needs to be linked or run.
-        _command(["meson", "compile", "-C", str(build_dir), "-j", str(args.jobs), "dbus-1"], env=env)
-        _command(["meson", "install", "-C", str(build_dir), "--no-rebuild", "--tags", "devel"], env=env)
+        _command(
+            ["meson", "compile", "-C", str(build_dir), "-j", str(args.jobs), "dbus-1"],
+            env=env,
+        )
+        _command(
+            [
+                "meson",
+                "install",
+                "-C",
+                str(build_dir),
+                "--no-rebuild",
+                "--tags",
+                "devel",
+            ],
+            env=env,
+        )
         # This generated ABI header is install_data() without an upstream
         # development tag. Copy only that required header, not static doc/XML
         # assets that upstream otherwise installs even when doc builds are off.
@@ -235,9 +306,13 @@ def build(args) -> None:
         shutil.copyfile(build_dir / "dbus/dbus-arch-deps.h", arch_header)
         library = prefix / "lib/libdbus-1.a"
         if not library.is_file() or list(prefix.rglob("*.so*")):
-            raise ValueError("libdbus install did not contain only the expected static library")
+            raise ValueError(
+                "libdbus install did not contain only the expected static library"
+            )
         if any((prefix / part).exists() for part in ["bin", "libexec", "share"]):
-            raise ValueError("unexpected libdbus executable, daemon, data or documentation was installed")
+            raise ValueError(
+                "unexpected libdbus executable, daemon, data or documentation was installed"
+            )
         info = {
             "source": pin,
             "compiler": cc,
@@ -245,7 +320,9 @@ def build(args) -> None:
             "meson_options": options,
             "static_library_sha256": hashlib.sha256(library.read_bytes()).hexdigest(),
         }
-        (prefix / "build-info.json").write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
+        (prefix / "build-info.json").write_text(
+            json.dumps(info, indent=2) + "\n", encoding="utf-8"
+        )
     print(f"Static libdbus {pin['version']} prefix: {prefix}")
     print(f"Validated source archive: {archive}")
     print("Use these environment variables for the musl Cargo build:")
@@ -264,13 +341,29 @@ def main() -> None:
     for name in ["archive", "build"]:
         command = sub.add_parser(name)
         command.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE)
-        command.add_argument("--archive", type=Path, help="use an exact bundled tarball instead of downloading")
-        command.add_argument("--offline", action="store_true", help="allow verified local sources only")
+        command.add_argument(
+            "--archive",
+            type=Path,
+            help="use an exact bundled tarball instead of downloading",
+        )
+        command.add_argument(
+            "--offline", action="store_true", help="allow verified local sources only"
+        )
         if name == "build":
             command.add_argument("--prefix", type=Path, default=DEFAULT_PREFIX)
-            command.add_argument("--cc", default=os.environ.get("CC_x86_64_unknown_linux_musl", "musl-gcc"))
-            command.add_argument("--cc-arg", action="append", default=[], help="one extra compiler argument; repeat as needed")
-            command.add_argument("--jobs", type=int, default=min(os.cpu_count() or 1, 8))
+            command.add_argument(
+                "--cc",
+                default=os.environ.get("CC_x86_64_unknown_linux_musl", "musl-gcc"),
+            )
+            command.add_argument(
+                "--cc-arg",
+                action="append",
+                default=[],
+                help="one extra compiler argument; repeat as needed",
+            )
+            command.add_argument(
+                "--jobs", type=int, default=min(os.cpu_count() or 1, 8)
+            )
     args = parser.parse_args()
     if args.command == "archive":
         print(ensure_archive(args.cache_dir, args.archive, args.offline))

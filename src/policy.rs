@@ -26,8 +26,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            // Quiet candidate: actual EC writes and lifecycle protection belong
-            // to the runtime. PWM is electrical duty, not a fraction of RPM.
+            // Actual EC writes and lifecycle protection belong to the runtime.
+            // PWM is electrical duty, not a fraction of RPM.
             steps: vec![
                 Step {
                     at_mc: 60_000,
@@ -195,6 +195,7 @@ pub struct Controller {
     emergency_cool_since: Option<Duration>,
     previous: Option<(Duration, i32)>,
     last_emitted: Option<u8>,
+    takeover_pwm: Option<u8>,
 }
 
 impl Controller {
@@ -212,7 +213,40 @@ impl Controller {
             emergency_cool_since: None,
             previous: None,
             last_emitted: None,
+            takeover_pwm: None,
         })
+    }
+
+    /// First live sample after startup/resume. Do not stop a firmware-running
+    /// fan or wait out start/up holds on a CPU that is already hot. Keep a duty
+    /// above the curve until the normal cooling hold permits a lower stage.
+    pub fn takeover(&mut self, now: Duration, temp_mc: i32, raw: u8) -> Result<Decision, String> {
+        if self.previous.is_some()
+            || !(1_000..=125_000).contains(&temp_mc)
+            || (raw != 0 && !(crate::ec::MIN_RAW..=crate::ec::MAX_RAW).contains(&raw))
+        {
+            return Err("invalid initial fan sample".into());
+        }
+        let pwm = ((u16::from(raw) * 100 + 46) / 92).min(80) as u8;
+        self.takeover_pwm = (raw != 0).then_some(pwm);
+        let heat_level = self
+            .config
+            .steps
+            .iter()
+            .take_while(|s| temp_mc >= s.at_mc)
+            .count();
+        let running_level = if raw == 0 {
+            0
+        } else {
+            self.config
+                .steps
+                .iter()
+                .position(|s| s.pwm_percent >= pwm)
+                .map_or(self.config.steps.len(), |i| i + 1)
+        };
+        self.level = heat_level.max(running_level);
+        self.on_since = (self.level > 0).then_some(now);
+        self.sample(now, temp_mc)
     }
 
     /// Reconfigure without clearing an emergency latch or the real minimum-on
@@ -291,6 +325,7 @@ impl Controller {
                 let since = *self.emergency_cool_since.get_or_insert(now);
                 if now.saturating_sub(since) >= EMERGENCY_COOL_HOLD {
                     self.emergency = false;
+                    self.takeover_pwm = None;
                     self.emergency_cool_since = None;
                     self.level = self
                         .config
@@ -365,6 +400,7 @@ impl Controller {
                         && now.saturating_sub(since) >= self.config.down_hold
                     {
                         self.level = target;
+                        self.takeover_pwm = None;
                         self.pending_down = None;
                         if target == 0 {
                             self.on_since = None;
@@ -396,7 +432,9 @@ impl Controller {
         } else if self.level == 0 {
             0
         } else {
-            self.config.steps[self.level - 1].pwm_percent
+            self.config.steps[self.level - 1]
+                .pwm_percent
+                .max(self.takeover_pwm.unwrap_or(0))
         };
         // CTR=91, interior duty only. A value of255 would not mean full speed.
         let raw_duty = ((u16::from(pwm_percent) * 92 + 50) / 100) as u8;
@@ -417,10 +455,10 @@ impl Controller {
 
     fn track_higher_thresholds(&mut self, now: Duration, temp_mc: i32) {
         for (i, since) in self.up_since.iter_mut().enumerate() {
-            if i + 1 > self.level && temp_mc >= self.config.steps[i].at_mc {
-                since.get_or_insert(now);
-            } else {
+            if i < self.level || temp_mc < self.config.steps[i].at_mc - self.config.hysteresis_mc {
                 *since = None;
+            } else if temp_mc >= self.config.steps[i].at_mc {
+                since.get_or_insert(now);
             }
         }
     }
@@ -498,14 +536,56 @@ mod tests {
     }
 
     #[test]
-    fn short_upper_burst_does_not_raise_fan_after_it_ends() {
-        trace("0,82,82,0\n12,82,82,35\n20,93,93,35\n21,82,82,35\n60,82,82,35");
+    fn cooling_below_upper_hysteresis_band_cancels_the_pending_raise() {
+        trace("0,82,82,0\n12,82,82,35\n20,93,93,35\n21,79,79,35\n60,79,79,35");
     }
 
     #[test]
-    fn falling_below_a_higher_threshold_resets_only_its_hold() {
+    fn falling_below_a_higher_hysteresis_band_resets_only_its_hold() {
         trace(
-            "0,82,82,0\n12,82,82,35\n13,93,93,35\n30,90,90,35\n33,90,90,50\n34,93,93,50\n53,93,93,50\n54,93,93,70",
+            "0,82,82,0\n12,82,82,35\n13,93,93,35\n30,87,87,35\n33,87,87,50\n34,93,93,50\n53,93,93,50\n54,93,93,70",
+        );
+    }
+
+    #[test]
+    fn upper_hold_survives_temperature_noise_inside_the_hysteresis_band() {
+        let mut c = Controller::new(Config::default()).unwrap();
+        at(&mut c, 0, 82);
+        at(&mut c, 12, 82);
+        for s in 13..33 {
+            assert_eq!(
+                at(&mut c, s, if s % 2 == 0 { 92 } else { 94 }).pwm_percent,
+                35
+            );
+        }
+        assert_eq!(at(&mut c, 33, 92).pwm_percent, 70);
+    }
+
+    #[test]
+    fn hot_takeover_preserves_firmware_duty_until_a_cooling_hold() {
+        let mut c = Controller::new(Config::default()).unwrap();
+        assert_eq!(c.takeover(Duration::ZERO, 90_000, 74).unwrap().raw_duty, 74);
+        for s in 1..40 {
+            assert_eq!(at(&mut c, s, 90).pwm_percent, 80);
+        }
+        assert_eq!(at(&mut c, 40, 87).pwm_percent, 80);
+        assert_eq!(at(&mut c, 69, 87).pwm_percent, 80);
+        assert_eq!(at(&mut c, 70, 87).pwm_percent, 50);
+    }
+
+    #[test]
+    fn hot_takeover_with_stopped_firmware_fan_bypasses_start_and_up_holds() {
+        let mut c = Controller::new(Config::default()).unwrap();
+        assert_eq!(
+            c.takeover(Duration::ZERO, 93_000, 0).unwrap().pwm_percent,
+            70
+        );
+        let mut c = Controller::new(Config::default()).unwrap();
+        assert_eq!(c.takeover(Duration::ZERO, 95_000, 0).unwrap().raw_duty, 74);
+        let mut c = Controller::new(Config::default()).unwrap();
+        assert_eq!(
+            c.takeover(Duration::ZERO, 40_000, 0).unwrap().pwm_percent,
+            0
         );
     }
 

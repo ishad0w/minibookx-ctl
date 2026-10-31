@@ -28,10 +28,11 @@ Check the [requirements and packages](docs/guide/install.md#requirements), then
 run as your ordinary user:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ishad0w/minibookx-ctl/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ishad0w/minibookx-ctl/2ba14f40b8d353527adca3e94e8e226b5d79b16e/install.sh | sh
 ```
 
-The installer asks for sudo, creates the service account and starts the service.
+This reviewed bootstrap downloads the latest release. The installer asks for
+sudo, creates the service account and starts the service.
 Defaults are Balance fan control and tablet detection; CPU power limits stay
 unchanged. Repeat the command to update while keeping your configuration.
 

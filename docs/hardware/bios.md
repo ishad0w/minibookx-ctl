@@ -10,6 +10,12 @@ value and make one change at a time. Check the effective result after both boot
 and resume: a visible Intel reference-platform option may have no useful
 implementation on this board.
 
+The catalogue is a read-only reference, not a raw-NVRAM editing guide. A tested
+recovery procedure for a non-booting board or lost panel output is not available
+here. Do not change panel selection, voltage, memory training or flash locks
+without a model-specific recovery method. Loading Setup defaults is useful only
+while Setup remains reachable; it is not a guaranteed recovery from these faults.
+
 ## Can BIOS replace the workarounds?
 
 | Goal | Relevant setting | Current recommendation |

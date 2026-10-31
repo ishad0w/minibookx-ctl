@@ -12,6 +12,12 @@ const RECORD: &str = "sensor.lease";
 const SETTLE: Duration = Duration::from_millis(500);
 const MAX_RECORD: u64 = 96;
 
+/// A record can survive failed discovery without a live Sensors object.
+/// Invalid records and metadata errors still mean recovery is incomplete.
+pub(super) fn recovery_pending(dir: &Path) -> bool {
+    !matches!(fs::symlink_metadata(dir.join(RECORD)), Err(error) if error.kind() == io::ErrorKind::NotFound)
+}
+
 pub(super) trait SensorIo {
     /// Also recheck the fixed adapter, unclaimed address and chip identity.
     fn control(&self) -> io::Result<u8>;
@@ -58,6 +64,35 @@ pub(super) struct Lease {
     dir: PathBuf,
     id: String,
     owner: u32,
+}
+
+/// Keep attribution when automatic cleanup is unsafe, without making a later
+/// explicit restore look successful merely because Drop was suppressed.
+pub(super) struct Ownership {
+    lease: Option<Lease>,
+    restore_on_drop: bool,
+}
+impl Ownership {
+    pub(super) fn new(lease: Option<Lease>) -> Self {
+        Self {
+            lease,
+            restore_on_drop: true,
+        }
+    }
+    pub(super) fn retain(&mut self) {
+        self.restore_on_drop = false;
+    }
+    pub(super) fn restore_on_drop(&self) -> bool {
+        self.restore_on_drop
+    }
+    pub(super) fn restore(&mut self, sensor: &impl SensorIo) -> io::Result<()> {
+        if let Some(lease) = &self.lease {
+            lease.restore(sensor)?;
+            self.lease = None;
+        }
+        self.restore_on_drop = true;
+        Ok(())
+    }
 }
 
 impl Lease {
@@ -121,6 +156,19 @@ impl Lease {
         owner: u32,
         settle: impl FnOnce(Duration),
     ) -> io::Result<Option<Self>> {
+        Self::acquire_with_writer(sensor, dir, id, owner, settle, |file, bytes| {
+            file.write_all(bytes)
+        })
+    }
+
+    fn acquire_with_writer(
+        sensor: &impl SensorIo,
+        dir: &Path,
+        id: &str,
+        owner: u32,
+        settle: impl FnOnce(Duration),
+        write: impl FnOnce(&mut File, &[u8]) -> io::Result<()>,
+    ) -> io::Result<Option<Self>> {
         trusted_directory(dir, owner)?;
         if !invocation(id) {
             return Err(invalid("invalid sensor invocation"));
@@ -143,10 +191,21 @@ impl Lease {
             .mode(0o600)
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(dir.join(RECORD))?;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        file.write_all(Self::text(id).as_bytes())?;
-        file.sync_all()?;
-        File::open(dir)?.sync_all()?;
+        let recorded = (|| {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            write(&mut file, Self::text(id).as_bytes())?;
+            file.sync_all()?;
+            File::open(dir)?.sync_all()
+        })();
+        if let Err(error) = recorded {
+            // create_new succeeded, but no sensor write has been attempted.
+            // A partial record must not turn into permanent recovery ownership.
+            fs::remove_file(dir.join(RECORD)).map_err(|cleanup| {
+                io::Error::other(format!("sensor journal: {error}; cleanup: {cleanup}"))
+            })?;
+            File::open(dir)?.sync_all()?;
+            return Err(error);
+        }
         let lease = Self {
             dir: dir.into(),
             id: id.into(),
@@ -346,6 +405,70 @@ mod tests {
         let resumed = f.wake().unwrap().unwrap();
         resumed.restore(&f.sensor).unwrap();
         assert_eq!(&*f.sensor.writes.borrow(), &[0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn recovery_pending_includes_orphaned_and_unreadable_records_without_hardware() {
+        let f = Fixture::new(1);
+        assert!(!recovery_pending(&f.dir));
+        fs::write(f.record(), "invalid attribution").unwrap();
+        assert!(recovery_pending(&f.dir));
+        // Metadata errors are not proof that attribution has disappeared.
+        assert!(recovery_pending(&f.record()));
+        fs::remove_file(f.record()).unwrap();
+        symlink("missing", f.record()).unwrap();
+        assert!(recovery_pending(&f.dir));
+        fs::remove_file(f.record()).unwrap();
+        assert!(!recovery_pending(&f.dir));
+        assert_eq!(f.sensor.reads.get(), 0);
+        assert!(f.sensor.writes.borrow().is_empty());
+        let lease = f.wake().unwrap().unwrap();
+        let before = f.sensor.reads.get();
+        assert!(recovery_pending(&f.dir));
+        assert_eq!(f.sensor.reads.get(), before);
+        lease.restore(&f.sensor).unwrap();
+        let before = f.sensor.reads.get();
+        assert!(!recovery_pending(&f.dir));
+        assert_eq!(f.sensor.reads.get(), before);
+        assert_eq!(&*f.sensor.writes.borrow(), &[0, 1]);
+    }
+
+    #[test]
+    fn retained_ownership_still_restores_or_reports_the_real_error() {
+        let f = Fixture::new(1);
+        let mut ownership = Ownership::new(f.wake().unwrap());
+        ownership.retain();
+        assert!(!ownership.restore_on_drop());
+        assert!(f.record().exists());
+        f.sensor.fault.set(Fault::Read);
+        assert!(ownership.restore(&f.sensor).is_err());
+        assert!(f.record().exists());
+        assert_eq!(&*f.sensor.writes.borrow(), &[0]);
+        f.sensor.fault.set(Fault::None);
+        ownership.restore(&f.sensor).unwrap();
+        assert_eq!(&*f.sensor.writes.borrow(), &[0, 1]);
+        assert!(ownership.restore_on_drop());
+        assert!(Lease::read(&f.dir, None, owner()).unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_partial_journal_write_leaves_no_record_or_sensor_mutation() {
+        let f = Fixture::new(1);
+        let result = Lease::acquire_with_writer(
+            &f.sensor,
+            &f.dir,
+            ID,
+            owner(),
+            |_| panic!("must not settle"),
+            |file, bytes| {
+                file.write_all(&bytes[..7])?;
+                Err(io::Error::from_raw_os_error(libc::ENOSPC))
+            },
+        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOSPC));
+        assert!(f.sensor.writes.borrow().is_empty());
+        assert_eq!(f.sensor.value.get(), 1);
+        assert!(Lease::read(&f.dir, None, owner()).unwrap().is_none());
     }
 
     #[test]

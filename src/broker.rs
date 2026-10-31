@@ -17,7 +17,7 @@ use std::{
     fs,
     io::{self, Read, Write},
     os::{
-        fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
+        fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
         unix::{
             fs::{MetadataExt, PermissionsExt},
             net::{UnixDatagram, UnixStream},
@@ -43,6 +43,48 @@ const TACH_GRACE: Duration = Duration::from_secs(10);
 const CPU_INTERVAL: Duration = Duration::from_secs(1);
 const CHILD_INTERVAL: Duration = Duration::from_secs(1);
 const DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(5);
+const POLICY_TIMEOUT: Duration = Duration::from_secs(12);
+
+#[derive(Default)]
+struct TabletRetry {
+    next: Option<Duration>,
+    failures: u32,
+}
+impl TabletRetry {
+    fn failed(&mut self, now: Duration) {
+        self.next = Some(now + Duration::from_secs((30_u64 << self.failures.min(4)).min(300)));
+        self.failures = self.failures.saturating_add(1);
+    }
+    fn due(&self, now: Duration) -> bool {
+        self.next.is_some_and(|next| now >= next)
+    }
+}
+
+fn transient_sample_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EIO | libc::EREMOTEIO | libc::ETIMEDOUT | libc::EAGAIN | libc::EINTR)
+    )
+}
+
+fn setup_tablet(
+    control: &hardware::Control,
+    guardian: &mut Option<Guardian>,
+    sensors: &mut Option<Sensors>,
+    lid: &mut Option<Lid>,
+) -> io::Result<()> {
+    if let Some(g) = guardian {
+        g.off()?;
+        // Discovery can outlast the awake heartbeat. Keep OFF confirmed while
+        // it runs; the first estimate explicitly rearms supervision.
+        g.send(b'P')?;
+    }
+    restore_sensors(sensors)?;
+    crate::tablet::recover_sensor(control.directory(), None)?;
+    *lid = Some(Lid::discover()?);
+    *sensors = Some(Sensors::discover(control)?);
+    Ok(())
+}
 
 /// Keep only the newest unsaved value. New observations must not reset a
 /// failed write's deadline or multiply attempts during frequent FD wakes.
@@ -406,16 +448,33 @@ fn policy_directory(uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
     fs::set_permissions(p, fs::Permissions::from_mode(0o755))
 }
 fn isolate_fd(fd: RawFd) -> io::Result<RawFd> {
+    Ok(isolate_fds(&[fd])?[0])
+}
+fn isolate_fds(fds: &[RawFd]) -> io::Result<Vec<RawFd>> {
+    let first_closed = 3 + fds.len() as u32;
+    let mut copies = Vec::new();
+    for fd in fds {
+        // SAFETY: duplicate above every destination so crossed fd numbers
+        // cannot overwrite the other inherited descriptor during isolation.
+        let copy = unsafe { libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, first_closed as i32) };
+        if copy < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        copies.push(unsafe { OwnedFd::from_raw_fd(copy) });
+    }
+    for (index, fd) in copies.iter().enumerate() {
+        if unsafe { libc::dup2(fd.as_raw_fd(), 3 + index as i32) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    drop(copies);
     // SAFETY: fd is owned by this post-fork process. Retain it as fd3, then
     // close all inherited raw EC/I2C/guardian/lease descriptors before setuid.
-    if fd != 3 && unsafe { libc::dup2(fd, 3) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if unsafe { libc::syscall(libc::SYS_close_range, 4_u32, u32::MAX, 0_u32) } < 0 {
+    if unsafe { libc::syscall(libc::SYS_close_range, first_closed, u32::MAX, 0_u32) } < 0 {
         let fds: Vec<_> = fs::read_dir("/proc/self/fd")?
             .filter_map(|e| e.ok())
             .filter_map(|e| e.file_name().to_string_lossy().parse::<i32>().ok())
-            .filter(|n| *n > 3)
+            .filter(|n| *n >= first_closed as i32)
             .collect();
         for n in fds {
             unsafe {
@@ -423,7 +482,7 @@ fn isolate_fd(fd: RawFd) -> io::Result<RawFd> {
             }
         }
     }
-    Ok(3)
+    Ok((3..first_closed as i32).collect())
 }
 fn drop_user(uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
     let before = fs::read_to_string("/proc/self/status")
@@ -549,12 +608,14 @@ impl Drop for Child {
 enum OffConfirmation {
     Acknowledged,
     GuardianExited,
+    BrokerBackup,
 }
 impl OffConfirmation {
     fn reason(&self) -> &'static str {
         match self {
             Self::Acknowledged => "StoppedOffAcknowledged",
             Self::GuardianExited => "StoppedGuardianExited",
+            Self::BrokerBackup => "StoppedBrokerBackup",
         }
     }
 }
@@ -565,9 +626,12 @@ struct GuardianShutdown {
 struct Guardian {
     socket: UnixStream,
     child: Child,
+    backup: Option<VirtualSwitch>,
+    off_pending: bool,
 }
 impl Guardian {
-    fn spawn() -> io::Result<Self> {
+    fn spawn(uid: libc::uid_t, gid: libc::gid_t) -> io::Result<Self> {
+        let switch = VirtualSwitch::create()?;
         let (mut parent, child_socket) = UnixStream::pair()?;
         parent.set_read_timeout(Some(Duration::from_secs(3)))?;
         parent.set_write_timeout(Some(Duration::from_millis(200)))?;
@@ -578,9 +642,17 @@ impl Guardian {
         }
         if pid == 0 {
             let result = (|| {
-                let fd = isolate_fd(child_socket.into_raw_fd())?;
-                let socket = unsafe { UnixStream::from_raw_fd(fd) };
-                guardian_loop(socket)
+                let fds =
+                    isolate_fds(&[child_socket.into_raw_fd(), switch.into_fd().into_raw_fd()])?;
+                let socket = unsafe { UnixStream::from_raw_fd(fds[0]) };
+                let switch = VirtualSwitch::from_fd(unsafe { OwnedFd::from_raw_fd(fds[1]) });
+                if unsafe { libc::prctl(libc::PR_SET_NAME, c"minibookx-guard".as_ptr(), 0, 0, 0) }
+                    != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                drop_user(uid, gid)?;
+                guardian_loop(socket, switch)
             })();
             if let Err(e) = &result {
                 eprintln!("tablet guardian: {e}")
@@ -599,12 +671,23 @@ impl Guardian {
         Ok(Self {
             socket: parent,
             child,
+            backup: Some(switch),
+            off_pending: false,
         })
     }
     fn send(&mut self, b: u8) -> io::Result<()> {
         self.socket.write_all(&[b])
     }
     fn off(&mut self) -> io::Result<()> {
+        if self.off_pending {
+            return Err(io::Error::other(
+                "previous tablet OFF unconfirmed; guardian must be stopped",
+            ));
+        }
+        // After any incomplete exchange, a late ACK is ambiguous. Never reuse
+        // that stream for another OFF; teardown reaps the writer and uses the
+        // original switch descriptor if needed.
+        self.off_pending = true;
         self.send(b'0')?;
         // An acknowledgement means the same still-live uinput FD received OFF.
         self.socket.set_read_timeout(Some(Duration::from_secs(1)))?;
@@ -613,12 +696,19 @@ impl Guardian {
         if ack != *b"0" {
             return Err(io::Error::other("tablet OFF acknowledgement missing"));
         }
+        self.off_pending = false;
         Ok(())
     }
     fn stop(&mut self) -> GuardianShutdown {
         let acknowledgement = self.off();
         let _ = self.socket.shutdown(std::net::Shutdown::Both);
         let exited = self.child.stop();
+        // Reap the other writer before the final OFF; it can no longer race us
+        // with an old queued ON command. The original device stays alive here.
+        let backup_off = self.backup.as_mut().map(VirtualSwitch::force_off);
+        if backup_off.as_ref().is_some_and(Result::is_ok) {
+            std::thread::sleep(Duration::from_millis(250));
+        }
         // systemd sends TERM to the whole cgroup. The guardian may therefore
         // finish OFF/settle and close before our separate OFF request is read.
         // Only its preserved successful exit status proves that path completed.
@@ -629,14 +719,18 @@ impl Guardian {
             Some(OffConfirmation::Acknowledged)
         } else if clean_exit {
             Some(OffConfirmation::GuardianExited)
+        } else if backup_off.as_ref().is_some_and(Result::is_ok) {
+            eprintln!("tablet OFF confirmed through broker's original switch descriptor");
+            Some(OffConfirmation::BrokerBackup)
         } else {
             None
         };
         let error = (!clean_exit).then(|| {
             io::Error::other(format!(
-                "tablet guardian shutdown failed; OFF acknowledgement: {acknowledgement:?}; guardian exit: {exited:?}"
+                "tablet guardian shutdown failed; OFF acknowledgement: {acknowledgement:?}; guardian exit: {exited:?}; backup OFF: {backup_off:?}"
             ))
         });
+        self.backup.take();
         GuardianShutdown {
             confirmation,
             error,
@@ -645,20 +739,18 @@ impl Guardian {
 }
 impl Drop for Guardian {
     fn drop(&mut self) {
-        if self.child.status.is_none() {
+        if self.child.status.is_none() || self.backup.is_some() {
             let _ = self.stop();
         }
     }
 }
-fn guardian_loop(mut socket: UnixStream) -> io::Result<()> {
+fn guardian_loop(mut socket: UnixStream, mut switch: VirtualSwitch) -> io::Result<()> {
     STOP.store(false, Ordering::Relaxed);
     install_signals()?;
     // Remain OFF during setup. EOF still detects a dead broker; arm the
     // heartbeat timeout only after the first explicit 0/1 command.
     socket.set_read_timeout(None)?;
     socket.set_write_timeout(Some(Duration::from_millis(200)))?;
-    let mut switch = VirtualSwitch::create()?;
-    capabilities(false)?;
     socket.write_all(b"R")?;
     let result = (|| {
         let mut b = [0; 1];
@@ -717,6 +809,10 @@ fn spawn_policy(
         let result = (|| {
             let fd = isolate_fd(socket.into_raw_fd())?;
             let socket = unsafe { UnixDatagram::from_raw_fd(fd) };
+            fs::write("/proc/self/oom_score_adj", b"0\n")?;
+            if unsafe { libc::prctl(libc::PR_SET_NAME, c"minibookx-work".as_ptr(), 0, 0, 0) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
             drop_user(uid, gid)
                 .map_err(|e| io::Error::other(format!("worker privilege boundary: {e}")))?;
             // SAFETY: this child remains single-threaded; no environment readers.
@@ -760,7 +856,7 @@ fn disable_tablet(
     snapshot: &mut PendingSnapshot,
     error: io::Error,
 ) -> io::Result<()> {
-    eprintln!("tablet detection unavailable until service restart: {error}");
+    eprintln!("tablet detection unavailable; retry scheduled: {error}");
     if let Some(g) = guardian {
         g.off()?;
         g.send(b'P')?;
@@ -859,7 +955,7 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
     let (uid, gid) = user()?;
     policy_directory(uid, gid)?;
     let mut guardian = if tablet_enabled {
-        Some(Guardian::spawn()?)
+        Some(Guardian::spawn(uid, gid)?)
     } else {
         None
     };
@@ -870,7 +966,7 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
     let notify = crate::systemd::Notifier::from_environment()?;
     STOP.store(false, Ordering::Relaxed);
     RELOAD.store(false, Ordering::Relaxed);
-    install_signals()?;
+    let signals = crate::systemd::Signals::for_process()?;
     let (fan_control, sequence) = await_startup(&parent, &mut child)?;
     // Fork both children before opening any hardware/ownership descriptor.
     let mut lid = None;
@@ -879,12 +975,9 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
     let control = hardware::Control::open()?;
     let mut sensors = None;
     let mut tablet_failed = false;
+    let mut tablet_retry = TabletRetry::default();
     if tablet_enabled {
-        let setup = (|| {
-            lid = Some(Lid::discover()?);
-            sensors = Some(Sensors::discover(&control)?);
-            Ok::<_, io::Error>(())
-        })();
+        let setup = setup_tablet(&control, &mut guardian, &mut sensors, &mut lid);
         if let Err(error) = setup {
             disable_tablet(
                 &mut guardian,
@@ -894,6 +987,7 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                 error,
             )?;
             tablet_failed = true;
+            tablet_retry.failed(Duration::ZERO);
         }
     }
     // Configuration has only been parsed in the fully unprivileged worker.
@@ -921,6 +1015,7 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
     );
     let epoch = Instant::now();
     let mut last_request = Instant::now();
+    let mut last_duty = epoch.elapsed();
     let mut schedule = Schedule::new(epoch.elapsed());
     let mut health = FanHealth::default();
     let mut tablet_report = TabletReport::default();
@@ -932,6 +1027,16 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
     let mut ready = false;
     let result = (|| {
         while !STOP.load(Ordering::Relaxed) {
+            for signal in signals.drain()? {
+                if signal == libc::SIGHUP {
+                    RELOAD.store(true, Ordering::Relaxed);
+                } else {
+                    STOP.store(true, Ordering::Relaxed);
+                }
+            }
+            if STOP.load(Ordering::Relaxed) {
+                break;
+            }
             if RELOAD.swap(false, Ordering::Relaxed) {
                 unsafe {
                     libc::kill(child.pid, libc::SIGHUP);
@@ -939,10 +1044,9 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
             }
             if schedule.children.take(epoch.elapsed()) {
                 if let Some(status) = child.exited()? {
-                    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
-                        break;
-                    }
-                    return Err(io::Error::other("policy process exited unexpectedly"));
+                    return Err(io::Error::other(format!(
+                        "policy process exited unexpectedly: {status}"
+                    )));
                 }
                 if let Some(g) = &mut guardian
                     && g.child.exited()?.is_some()
@@ -950,7 +1054,11 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                     return Err(io::Error::other("tablet guardian exited"));
                 }
             }
-            if !paused && last_request.elapsed() >= Duration::from_secs(12) {
+            let manual = session.fan.as_ref().is_some_and(|fan| fan.may_be_manual());
+            if !paused && manual && epoch.elapsed().saturating_sub(last_duty) >= POLICY_TIMEOUT {
+                return Err(io::Error::other("policy duty updates expired"));
+            }
+            if !paused && last_request.elapsed() >= POLICY_TIMEOUT {
                 return Err(io::Error::other("policy heartbeat expired"));
             }
             let mut deadline = schedule.deadline(
@@ -962,8 +1070,13 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                 deadline = deadline.min(next);
             }
             if !paused {
-                deadline =
-                    deadline.min(last_request.duration_since(epoch) + Duration::from_secs(12));
+                deadline = deadline.min(last_request.duration_since(epoch) + POLICY_TIMEOUT);
+                if manual {
+                    deadline = deadline.min(last_duty + POLICY_TIMEOUT);
+                }
+                if let Some(next) = tablet_retry.next {
+                    deadline = deadline.min(next);
+                }
             }
             let source = |fd, events| libc::pollfd {
                 fd,
@@ -982,6 +1095,7 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                 ),
                 // No guardian data is unsolicited; watch only disconnects.
                 source(guardian.as_ref().map_or(-1, |g| g.socket.as_raw_fd()), 0),
+                source(signals.fd(), libc::POLLIN),
             ];
             // SAFETY: all descriptors remain owned outside this bounded poll.
             let n = unsafe {
@@ -1000,8 +1114,19 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
             }
             // TERM may arrive with a readable request/socket closure. Enter
             // cleanup before talking to a guardian that is also shutting down.
-            if STOP.load(Ordering::Relaxed) {
-                break;
+            if sources[3].revents != 0 {
+                // Drain before processing hardware IPC. A signal queued just
+                // before poll is readable, so there is no check/poll race.
+                for signal in signals.drain()? {
+                    if signal == libc::SIGHUP {
+                        RELOAD.store(true, Ordering::Relaxed);
+                    } else {
+                        STOP.store(true, Ordering::Relaxed);
+                    }
+                }
+                if STOP.load(Ordering::Relaxed) {
+                    break;
+                }
             }
             for index in [0, 2] {
                 if sources[index].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
@@ -1043,12 +1168,21 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                             "READY=1\nWATCHDOG=1\nSTATUS=Controller active; firmware fan control"
                         })?;
                         ready = true;
+                        if tablet_failed {
+                            notify.send("STATUS=Cooling active; tablet detection unavailable, retry scheduled")?;
+                        }
                         Ok(())
                     }
                     Request::Ready => {
                         Err(io::Error::other("policy readiness already acknowledged"))
                     }
                     Request::Heartbeat => {
+                        if !paused
+                            && session.fan.as_ref().is_some_and(|fan| fan.may_be_manual())
+                            && epoch.elapsed().saturating_sub(last_duty) >= POLICY_TIMEOUT
+                        {
+                            return Err(io::Error::other("policy duty updates expired"));
+                        }
                         if ready {
                             notify.send("WATCHDOG=1")?;
                         }
@@ -1057,17 +1191,9 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                     Request::Activate => {
                         if paused {
                             estimator.reset();
-                            if tablet_enabled && !tablet_failed {
-                                let setup = (|| {
-                                    sensors = Some(Sensors::discover(&control)?);
-                                    if let Some(lid) = &mut lid {
-                                        lid.resync()?;
-                                    }
-                                    if let Some(g) = &mut guardian {
-                                        g.off()?;
-                                    }
-                                    Ok::<_, io::Error>(())
-                                })();
+                            if tablet_enabled {
+                                let setup =
+                                    setup_tablet(&control, &mut guardian, &mut sensors, &mut lid);
                                 if let Err(error) = setup {
                                     disable_tablet(
                                         &mut guardian,
@@ -1077,6 +1203,10 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                                         error,
                                     )?;
                                     tablet_failed = true;
+                                    tablet_retry.failed(epoch.elapsed());
+                                } else {
+                                    tablet_failed = false;
+                                    tablet_retry = TabletRetry::default();
                                 }
                             }
                             schedule.posture.next = epoch.elapsed();
@@ -1084,6 +1214,7 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                             schedule.cpu.next = epoch.elapsed();
                         }
                         paused = false;
+                        last_duty = epoch.elapsed();
                         session.activate()
                     }
                     Request::Duty(raw) => {
@@ -1104,6 +1235,7 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                         reply.changed = fan.apply(target)?;
                         health.duty(epoch.elapsed(), target);
                         health.refresh(fan, epoch.elapsed())?;
+                        last_duty = epoch.elapsed();
                         Ok(())
                     }
                     Request::Restore => {
@@ -1127,12 +1259,23 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                             }
                             Ok(())
                         };
-                        restore_results([fan, rapl, sensor, off])?;
+                        let sensor_pending = sensor.is_err()
+                            || crate::tablet::sensor_recovery_pending(control.directory());
+                        reply.recovery_pending =
+                            sensor_pending || rapl.is_err() || power.restoration_pending();
+                        for (name, result) in [("sensor", sensor), ("power", rapl)] {
+                            if let Err(error) = result {
+                                eprintln!("{name} recovery deferred while paused: {error}");
+                            }
+                        }
+                        restore_results([fan, off])?;
                         snapshots.tablet.set(tablet_status_text(
                             Some(false),
                             None,
-                            !tablet_failed,
-                            if tablet_failed {
+                            !tablet_failed && !sensor_pending,
+                            if sensor_pending {
+                                "RecoveryPending"
+                            } else if tablet_failed {
                                 "Unavailable"
                             } else {
                                 "Paused"
@@ -1146,7 +1289,14 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                 let fatal_power = power.uncertain();
                 if let Err(e) = &operation {
                     eprintln!("broker operation rejected: {e}");
-                    reply.rejected = true;
+                    if power_request && !fatal_power {
+                        // The bounded optional request is declined, not applied.
+                        // Keep the worker's healthy fan/tablet policy alive and
+                        // expose the explicit deferred outcome and diagnostic.
+                        reply.recovery_pending = true;
+                    } else {
+                        reply.rejected = true;
+                    }
                 }
                 if report_power {
                     snapshots.power.set(power.diagnostic_status().to_string());
@@ -1186,12 +1336,26 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                 health.refresh(fan, epoch.elapsed())?;
             }
             let tablet_result = (|| {
+                if !paused && tablet_retry.due(epoch.elapsed()) {
+                    setup_tablet(&control, &mut guardian, &mut sensors, &mut lid)?;
+                    tablet_failed = false;
+                    tablet_retry = TabletRetry::default();
+                    estimator.reset();
+                    tablet_report = TabletReport::default();
+                    schedule.posture.next = epoch.elapsed();
+                    schedule.heartbeat.restart(epoch.elapsed());
+                    notify.send("STATUS=Controller active; tablet detection recovered")?;
+                }
                 if let Some(error) = lid_error {
                     return Err(error);
                 }
                 if let Some(g) = &mut guardian {
                     if !paused && !tablet_failed && schedule.posture.take(epoch.elapsed()) {
-                        let sample = sensors.as_ref().map(Sensors::sample).transpose()?;
+                        let sample = match sensors.as_ref().map(Sensors::sample).transpose() {
+                            Ok(sample) => sample,
+                            Err(error) if transient_sample_error(&error) => None,
+                            Err(error) => return Err(error),
+                        };
                         let estimate = estimator.update(
                             sample,
                             lid.as_ref().and_then(Lid::closed),
@@ -1234,6 +1398,9 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                     error,
                 )?;
                 tablet_failed = true;
+                tablet_retry.failed(epoch.elapsed());
+                notify
+                    .send("STATUS=Cooling active; tablet detection unavailable, retry scheduled")?;
                 estimator.reset();
             }
             let state = (
@@ -1297,7 +1464,9 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
     };
     let released = fan_result.is_ok()
         && power_result.is_ok()
+        && !power.restoration_pending()
         && sensor_result.is_ok()
+        && !crate::tablet::sensor_recovery_pending(control.directory())
         && tablet_error.is_none();
     match child.stop_while(|| acknowledge_shutdown(&parent, released)) {
         Ok(status) if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 => {
@@ -1339,6 +1508,50 @@ fn restore_results<const N: usize>(results: [io::Result<()>; N]) -> io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tablet_retry_is_bounded_and_identity_errors_are_not_transient() {
+        let mut retry = TabletRetry::default();
+        assert!(!retry.due(Duration::from_secs(999)));
+        let mut now = Duration::ZERO;
+        for expected in [30, 60, 120, 240, 300, 300] {
+            retry.failed(now);
+            let next = now + Duration::from_secs(expected);
+            assert!(!retry.due(next - Duration::from_nanos(1)));
+            assert!(retry.due(next));
+            now = next;
+        }
+        assert!(transient_sample_error(&io::Error::from_raw_os_error(
+            libc::EREMOTEIO
+        )));
+        assert!(!transient_sample_error(&io::Error::new(
+            io::ErrorKind::InvalidData,
+            "foreign CONTROL"
+        )));
+        assert!(!transient_sample_error(&io::Error::from_raw_os_error(
+            libc::ENODEV
+        )));
+    }
+
+    #[test]
+    fn killed_guardian_uses_brokers_copy_of_the_original_switch() {
+        let path = std::env::temp_dir().join(format!("minibookx-backup-{}", std::process::id()));
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut guardian = guardian_fixture(GuardianBehavior::Stalled);
+        guardian.backup = Some(VirtualSwitch::from_fd(file.into()));
+        // The stand-in FD accepts production input_event writes. A failed
+        // child cannot acknowledge OFF, so only the retained FD proves it.
+        let shutdown = guardian.stop();
+        assert_eq!(shutdown.confirmation, Some(OffConfirmation::BrokerBackup));
+        assert!(shutdown.error.is_some());
+        assert!(!fs::read(&path).unwrap().is_empty());
+        fs::remove_file(path).unwrap();
+    }
     use crate::policy::{Config, Controller};
     use std::{cell::RefCell, rc::Rc};
 
@@ -1684,6 +1897,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum GuardianBehavior {
         Acknowledge,
+        LateAcknowledgement,
         ExitWithoutAcknowledgement(i32),
         FailAfterAcknowledgement,
         Killed,
@@ -1717,12 +1931,25 @@ mod tests {
                     libc::_exit(110);
                 }
                 match behavior {
-                    GuardianBehavior::Acknowledge | GuardianBehavior::FailAfterAcknowledgement => {
+                    GuardianBehavior::Acknowledge
+                    | GuardianBehavior::LateAcknowledgement
+                    | GuardianBehavior::FailAfterAcknowledgement => {
                         let mut message = 0_u8;
                         if libc::read(child_fd, (&raw mut message).cast(), 1) != 1
                             || message != b'0'
-                            || libc::write(child_fd, b"0".as_ptr().cast(), 1) != 1
                         {
+                            libc::_exit(111);
+                        }
+                        if matches!(behavior, GuardianBehavior::LateAcknowledgement) {
+                            libc::nanosleep(
+                                &libc::timespec {
+                                    tv_sec: 1,
+                                    tv_nsec: 100_000_000,
+                                },
+                                std::ptr::null_mut(),
+                            );
+                        }
+                        if libc::write(child_fd, b"0".as_ptr().cast(), 1) != 1 {
                             libc::_exit(111);
                         }
                         if matches!(behavior, GuardianBehavior::FailAfterAcknowledgement) {
@@ -1753,6 +1980,8 @@ mod tests {
         Guardian {
             socket: parent,
             child: Child { pid, status: None },
+            backup: None,
+            off_pending: false,
         }
     }
 
@@ -1766,6 +1995,19 @@ mod tests {
         assert!(libc::WIFEXITED(status));
         assert_eq!(libc::WEXITSTATUS(status), 0);
         assert_eq!(guardian.child.stop().unwrap(), status);
+    }
+
+    #[test]
+    fn a_late_off_ack_cannot_confirm_a_subsequent_transaction() {
+        let mut guardian = guardian_fixture(GuardianBehavior::LateAcknowledgement);
+        assert!(guardian.off().is_err(), "the first OFF must time out");
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(
+            guardian.off().is_err(),
+            "an old ACK must not confirm a new OFF"
+        );
+        let shutdown = guardian.stop();
+        assert_ne!(shutdown.confirmation, Some(OffConfirmation::Acknowledged));
     }
 
     #[test]

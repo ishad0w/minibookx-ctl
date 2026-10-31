@@ -68,6 +68,7 @@ def make_image(rootfs, fixture, destination):
         "usr/local/bin",
         "etc/systemd/system",
         "etc/systemd/system/minibookx-ctl.service.d",
+        "etc/systemd/system/systemd-suspend.service.d",
         "etc/systemd/system/multi-user.target.wants",
     ]:
         put(directory, mode=stat.S_IFDIR | 0o755)
@@ -92,13 +93,16 @@ def make_image(rootfs, fixture, destination):
     put("usr/local/bin/minibookx-ctl", fixture.read_bytes(), stat.S_IFREG | 0o755)
     put("etc/minibookx-ctl/config.conf", (REPO / "config/presets.conf").read_bytes())
     put(
+        "etc/systemd/system/systemd-suspend.service.d/test.conf",
+        "[Service]\nExecStart=\nExecStart=/bin/sleep 3\n",
+    )
+    put(
         "etc/systemd/system/minibookx-ctl.service",
         (REPO / "packaging/minibookx-ctl.service").read_bytes(),
     )
     put(
         "etc/systemd/system/minibookx-ctl.service.d/test.conf",
         """[Service]
-WatchdogSec=3s
 RestartSec=1s
 [Unit]
 StartLimitBurst=20
@@ -118,7 +122,7 @@ Type=oneshot
 ExecStart=/usr/bin/python3 /usr/local/bin/guest-tests.py
 StandardOutput=journal+console
 StandardError=journal+console
-TimeoutStartSec=150s
+TimeoutStartSec=300s
 """,
     )
     put(
@@ -215,7 +219,7 @@ def run(args):
             for sig in (signal.SIGTERM, signal.SIGINT)
         }
         try:
-            code = process.wait(timeout=180)
+            code = process.wait(timeout=330)
         except (subprocess.TimeoutExpired, KeyboardInterrupt):
             try:
                 os.killpg(process.pid, signal.SIGTERM)
@@ -249,8 +253,9 @@ def run(args):
         "assertions": [line for line in serial.splitlines() if "VM_ASSERT" in line],
         "scope": (
             "Real broker/runtime/IPC/logind/unit sandbox. File-backed replacement "
-            "hardware Session/prepare/recover and sensors/switch; production "
-            "hardware lease validation is unit-tested separately. "
+            "hardware Session/prepare/recover and sensors/switch; production sensor "
+            "ownership runs against a fake CONTROL byte. Fan/module lease validation "
+            "is unit-tested separately. Logind sleep uses a guest-only stub. "
             "No physical fan, RAPL or libinput validation."
         ),
     }

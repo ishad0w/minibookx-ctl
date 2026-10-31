@@ -46,11 +46,31 @@ const PACKAGES: &[&str] = &[
 ];
 
 fn backend(os: &OsRelease) -> Option<PackageBackend> {
-    match (os.id.as_str(), os.version.as_str()) {
-        ("debian", "13") | ("ubuntu", "24.04" | "26.04") => Some(PackageBackend::Dpkg),
-        ("fedora", "43" | "44") => Some(PackageBackend::Rpm),
-        ("arch" | "cachyos", _) => Some(PackageBackend::Pacman),
+    match os.id.as_str() {
+        "debian" | "ubuntu" => Some(PackageBackend::Dpkg),
+        "fedora" => Some(PackageBackend::Rpm),
+        "arch" | "cachyos" => Some(PackageBackend::Pacman),
         _ => None,
+    }
+}
+
+fn recipe_version(os: &OsRelease) -> &'static str {
+    match os.id.as_str() {
+        "debian" => "13",
+        "fedora" if os.version.parse::<u32>().is_ok_and(|v| v <= 43) => "43",
+        "fedora" => "44",
+        "ubuntu"
+            if os
+                .version
+                .split('.')
+                .next()
+                .and_then(|v| v.parse::<u32>().ok())
+                .is_some_and(|year| year <= 24) =>
+        {
+            "24.04"
+        }
+        "ubuntu" => "26.04",
+        _ => "rolling",
     }
 }
 
@@ -274,7 +294,10 @@ fn package_row(key: &str, label: &str, names: &[&str], inventory: &Inventory) ->
             key,
             label,
             &format!(
-                "optional package not installed: {}; see https://github.com/ishad0w/minibookx-ctl/blob/main/docs/guide/graphics.md",
+                concat!(
+                    "optional package not installed: {}; see ",
+                    doc_url!("guide/graphics.md")
+                ),
                 names.join(" or ")
             ),
         )
@@ -356,9 +379,22 @@ pub(super) fn collect(sources: &impl Sources, os: &Result<OsRelease, Missing>) -
     );
     fields.push(field("distribution", "Package distribution", Ok(identity)));
     let Some(backend) = backend(os) else {
-        fields.push(note("package_profile", "Graphics package profile", "no version-specific recipe for this distribution; check its current package documentation manually. ID_LIKE alone is not proof of package compatibility"));
+        fields.push(note("package_profile", "Graphics package profile", "no package recipe for this distribution ID; check its package documentation manually. ID_LIKE alone is not proof of package compatibility"));
         return section("graphics", "Optional Intel graphics setup", fields);
     };
+    let recipe = recipe_version(os);
+    if recipe != "rolling" && recipe != os.version {
+        fields.push(warning("package_profile", "Graphics package profile", &format!(
+            "unverified on {} {}; using package names checked on {} {}. Verify repository candidates before installing or replacing packages",
+            os.id, os.version, os.id, recipe
+        )));
+    } else {
+        fields.push(field(
+            "package_profile",
+            "Graphics package profile",
+            Ok(format!("{} {recipe} package recipe", os.id)),
+        ));
+    }
     let inventory = match sources.packages(backend) {
         Ok(inventory) => inventory,
         Err(error) => {
@@ -378,7 +414,7 @@ pub(super) fn collect(sources: &impl Sources, os: &Result<OsRelease, Missing>) -
             &["libgl1-mesa-dri"],
             &["mesa-vulkan-drivers"],
             &["intel-media-va-driver", "intel-media-va-driver-non-free"],
-            match (os.id.as_str(), os.version.as_str()) {
+            match (os.id.as_str(), recipe) {
                 ("debian", _) => &["firmware-intel-graphics"],
                 ("ubuntu", "26.04") => &["linux-firmware-intel-graphics", "linux-firmware"],
                 _ => &["linux-firmware"],
@@ -520,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn os_release_is_data_and_unrecognized_versions_do_not_guess() {
+    fn os_release_is_data_and_unknown_versions_are_explicitly_unverified() {
         for value in [
             "ID=ubuntu\nVERSION_ID=26.04\nID=debian",
             "ID=\"$(touch /tmp/no)\"",
@@ -538,12 +574,38 @@ mod tests {
                 inventory: Err("must not infer missing packages".into()),
             };
             let report = collect(&fake);
-            assert_eq!(row(&report, "package_profile")["state"], "unknown");
+            assert_eq!(
+                row(&report, "package_profile")["state"],
+                if os.contains("ID=example") {
+                    "unknown"
+                } else {
+                    "warning"
+                }
+            );
             assert!(
                 !report
                     .to_string()
                     .contains("optional package not installed")
             );
+        }
+    }
+
+    #[test]
+    fn newer_same_distribution_uses_a_marked_recipe_without_id_like_guessing() {
+        for os in ["ID=fedora\nVERSION_ID=45", "ID=ubuntu\nVERSION_ID=26.10"] {
+            let report = collect(&Fake {
+                os,
+                inventory: Ok(Inventory::new()),
+            });
+            let profile = row(&report, "package_profile");
+            assert_eq!(profile["state"], "warning");
+            assert!(
+                profile["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("unverified on ")
+            );
+            assert_eq!(row(&report, "mesa_gl")["state"], "warning");
         }
     }
 

@@ -8,6 +8,7 @@ headers or GPU packages does not add a missing EC driver.
 
 | Feature | Requirement |
 |---|---|
+| Standard systemd unit | `i2c-dev` and `uinput`, even with `--no-tablet` |
 | Managed fan | Writable `ec_sys`, mounted debugfs and CPU temperature readings (`coretemp` on U300) |
 | Firmware-managed fan | No EC, debugfs, temperature or tachometer access by the service |
 | Tablet detection | `i2c-dev`, `uinput` and the recognized lid IIO accelerometer (`mxc4005` on the tested unit) |
@@ -32,19 +33,13 @@ The standard unit prepares `uinput` and `i2c-dev` at activation, including when
 `--no-tablet` disables detection. Stock systemd module-load units run before its
 device filter is created so the allow-listed devices can be recognized.
 
-## Distribution observations
+## Distribution kernels
 
-These are checks of specific kernel builds, not guarantees about later updates
-or every flavor of a distribution's kernel.
-
-| Kernel checked | EC interface | Source / limit |
-|---|---|---|
-| Debian 13, 6.12.113-1 x86 | Built in (`=y`) | [Kernel config](https://salsa.debian.org/kernel-team/linux/-/blob/debian/6.12.113-1/debian/config/kernelarch-x86/config); no separate module file expected |
-| Ubuntu 24.04, 6.8.0-31-generic | Module (`=m`) | [Official headers/config package](https://archive.ubuntu.com/ubuntu/pool/main/l/linux/linux-headers-6.8.0-31-generic_6.8.0-31.31_amd64.deb) |
-| Ubuntu 26.04, 7.0.0-14-generic | Module (`=m`) | [Official headers/config package](https://archive.ubuntu.com/ubuntu/pool/main/l/linux/linux-headers-7.0.0-14-generic_7.0.0-14.14_amd64.deb) |
-| Arch linux 7.2.11 | Packaged `ec_sys.ko.zst` | [Package files](https://archlinux.org/packages/core/x86_64/linux/files/); rolling contents change |
-| CachyOS tested U300 kernel | Writable access worked | [Features and limits](../hardware/README.md#features-and-limits) |
-| Fedora 44 regular package query | No loadable module found; debug variant provided it | Check the running configuration too; a file search cannot detect a built-in driver |
+Inspect the **running kernel**, including its flavor. Package names alone do
+not prove that `CONFIG_ACPI_EC_DEBUGFS` is enabled or that writes are allowed.
+Debian can build the interface into the kernel; Ubuntu and Arch-family kernels
+can provide it as a module. In both cases use the checks above and Doctor,
+rather than installing headers or DKMS to try to create the interface.
 
 On Fedora, inspect the exact kernel and available packages:
 
@@ -53,9 +48,10 @@ modinfo -k "$(uname -r)" ec_sys
 dnf repoquery --whatprovides '*/ec_sys.ko*'
 ```
 
-The recorded query found it in `kernel-debug-modules-core`. A debug kernel has
-not been physically tested here; selecting another kernel is an administrator's
-choice, not an installer step. Alternatively,
+If a provider is `kernel-debug-modules-core`, it belongs to a matching debug
+kernel, not the regular running kernel. Do not mix its modules into another
+kernel. Selecting a debug kernel is an administrator's choice and is not
+physically qualified by this project. Alternatively,
 [disable managed fan control](../guide/install.md#without-fan-control).
 Tablet detection still needs its own drivers.
 

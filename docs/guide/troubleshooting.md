@@ -30,12 +30,8 @@ systemctl status minibookx-ctl.service --no-pager
 sudo journalctl -u minibookx-ctl.service -b
 ```
 
-For config errors, edit with `sudoedit` and validate:
-
-```sh
-sudo -u minibookx-ctl /usr/local/bin/minibookx-ctl \
-  --check-config /etc/minibookx-ctl/config.conf
-```
+For config errors, edit with `sudoedit` and follow
+[Apply and check](configuration.md#apply-and-check).
 
 `minibookx-ctl --status` shows the last accepted profile and hardware records.
 The [field reference](../reference/diagnostics.md) explains values that need
@@ -60,6 +56,38 @@ sudo /usr/local/bin/minibookx-ctl --recover
 ```
 
 If it still fails, leave the service stopped and report the error.
+
+## Legacy installer transaction
+
+If an update finds `/var/lib/minibookx-ctl/installer-transaction.json`, a
+previous installer left a durable backup. Keep the journal and its referenced
+directory under `/var/backups/minibookx-ctl/`; they are not runtime sensor or
+fan leases. Do not execute commands or trust arbitrary paths copied from JSON.
+
+1. Stop and disable the controller and any `minibookx-ctl-recover.service`
+   still installed. Run the installed executable's `--recover` as described
+   above. Do not replace that executable while hardware ownership is pending.
+2. As administrator, inspect the journal's `backup` and `states` fields and
+   that backup's `manifest.json`. They must be root-owned, private regular
+   files. The expected backup name is `install-<UTC timestamp>-<10 hex digits>`
+   under `/var/backups/minibookx-ctl/`.
+3. For each manifest entry marked `exists`, verify the numbered `.data` file
+   against its `sha256`, then restore the recorded bytes, mode, UID and GID to
+   the **fixed managed destination**. Entries marked absent describe files to
+   remove. Managed destinations are the controller executable, config, its
+   systemd units and its own documentation directory; unrelated paths are an
+   error, not something to restore. This is an administrator review of a file
+   backup, not a script to evaluate JSON as root.
+4. Run `sudo systemctl daemon-reload`. Restore each unit's saved enabled state
+   manually, but keep it stopped until all files and recovery are consistent.
+   Move the completed installer journal into the retained backup directory
+   instead of deleting the evidence. Retry the current installer, then start
+   the service and check Doctor.
+
+If a checksum, path, ownership check or hardware recovery fails, retain the
+backup and request help with the specific error. A malformed journal has no
+safe automatic interpretation. The current installer deliberately refuses to
+guess which interrupted file set is correct.
 
 ## Report an issue
 

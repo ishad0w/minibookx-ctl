@@ -73,9 +73,9 @@ profile before enabling `power_control = true`:
 | `pl2_w` | Short-term CPU package power limit, in watts |
 | `firmware` | Restore the value captured before this service's first override |
 
-All shipped profiles leave both limits at `firmware`. Existing custom values
-are preserved during updates; review those before opting in. Live overrides
-remain unqualified on this laptop. See
+All shipped profiles leave both limits at `firmware`. Updates preserve the
+configuration, including numeric limits in inactive profiles. Review **every
+profile's** `pl1_w` and `pl2_w` before opting in. See
 [power-limit bounds and restoration](../reference/configuration.md#power-limits)
 and avoid running competing power-limit controllers.
 

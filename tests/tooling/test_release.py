@@ -186,7 +186,14 @@ class PublicationTests(unittest.TestCase):
             self.assertEqual(publish.api("")["default_branch"], "main")
         self.assertEqual(run.call_args.args[0], ["gh", "api", "repos/" + publish.REPO])
 
-    def run_publish(self, head=None, tag=None, release=None, immutable=True):
+    def run_publish(
+        self,
+        head=None,
+        tag=None,
+        release=None,
+        immutable=True,
+        title="Release (v0.1.1)",
+    ):
         reads = 0
 
         def api(endpoint, data=None, missing=False):
@@ -194,6 +201,8 @@ class PublicationTests(unittest.TestCase):
             self.calls.append((endpoint, data))
             if endpoint == "":
                 return {"default_branch": "main"}
+            if endpoint == "commits/" + self.commit:
+                return {"commit": {"message": title}}
             if endpoint.startswith("git/ref/tags/"):
                 return tag
             if endpoint == "git/refs":
@@ -246,11 +255,18 @@ class PublicationTests(unittest.TestCase):
             release={
                 "draft": False,
                 "prerelease": False,
+                "immutable": True,
                 "html_url": "https://example.invalid/release",
             },
         )
         self.assertEqual(calls, [])
         self.assertEqual(checked, 1)
+
+    def test_repeated_publication_requires_immutability_and_canonical_commit(self):
+        with self.assertRaisesRegex(ValueError, "not immutable"):
+            self.run_publish(release={"draft": False, "immutable": False})
+        with self.assertRaisesRegex(ValueError, "canonical commit title"):
+            self.run_publish(title="ordinary development change")
 
     def test_old_main_build_cannot_replace_latest(self):
         calls, _ = self.run_publish(head="b" * 40)

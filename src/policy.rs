@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 const EMERGENCY_PWM: u8 = 80;
+pub(crate) const MAX_STEPS: usize = 16;
 const EMERGENCY_RELEASE_HYSTERESIS_MC: i32 = 5_000;
 const EMERGENCY_COOL_HOLD: Duration = Duration::from_secs(30);
 
@@ -61,7 +62,7 @@ impl Default for Config {
 impl Config {
     /// General policy validation also permits untested low PWM for simulation.
     pub fn validate(&self) -> Result<(), String> {
-        if self.steps.is_empty() || self.steps.len() > 16 {
+        if self.steps.is_empty() || self.steps.len() > MAX_STEPS {
             return Err("curve needs 1..16 steps".into());
         }
         let mut previous = (0, 0);
@@ -181,14 +182,15 @@ pub struct Decision {
 }
 
 /// Pure policy: no EC, sysfs, clocks, threads or write permissions.
-/// Delays measure observed continuous conditions between caller samples.
+/// Heating holds retain observed heat through brief cooling dips. A full
+/// cooling hold below a threshold's hysteresis band clears that heat budget.
 /// The runtime must reset/recreate this state after suspend, never integrate
-/// a sleeping machine or a missed sampling interval as a thermal measurement.
+/// a sleeping machine as a thermal measurement. Awake sampling is additionally
+/// bounded by the broker's independent policy-liveness deadline.
 pub struct Controller {
     config: Config,
     level: usize,
-    pending_start: Option<Duration>,
-    up_since: Vec<Option<Duration>>,
+    heating: Vec<HeatHold>,
     pending_down: Option<(usize, Duration)>,
     on_since: Option<Duration>,
     emergency: bool,
@@ -198,15 +200,59 @@ pub struct Controller {
     takeover_pwm: Option<u8>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct HeatHold {
+    elapsed: Duration,
+    hot: bool,
+    cool_since: Option<Duration>,
+}
+impl HeatHold {
+    fn observe(
+        &mut self,
+        now: Duration,
+        dt: Duration,
+        temperature: i32,
+        threshold: i32,
+        hysteresis: i32,
+        cooling_hold: Duration,
+    ) {
+        if self.hot {
+            self.elapsed = self.elapsed.saturating_add(dt);
+        }
+        if self
+            .cool_since
+            .is_some_and(|since| now.saturating_sub(since) >= cooling_hold)
+        {
+            self.elapsed = Duration::ZERO;
+        }
+        if temperature >= threshold {
+            self.hot = true;
+            self.cool_since = None;
+        } else if temperature < threshold - hysteresis {
+            self.hot = false;
+            let since = *self.cool_since.get_or_insert(now);
+            if now.saturating_sub(since) >= cooling_hold {
+                self.elapsed = Duration::ZERO;
+            }
+        } else {
+            // A band reading preserves the heat budget, but interrupts the
+            // continuous below-band cooling required to clear it.
+            self.cool_since = None;
+        }
+    }
+    fn ready(&self, hold: Duration) -> bool {
+        self.hot && self.elapsed >= hold
+    }
+}
+
 impl Controller {
     pub fn new(config: Config) -> Result<Self, String> {
         config.validate()?;
-        let up_since = vec![None; config.steps.len()];
+        let heating = vec![HeatHold::default(); config.steps.len()];
         Ok(Self {
             config,
             level: 0,
-            pending_start: None,
-            up_since,
+            heating,
             pending_down: None,
             on_since: None,
             emergency: false,
@@ -266,8 +312,7 @@ impl Controller {
                 .position(|s| s.pwm_percent >= previous_pwm)
                 .map_or(config.steps.len(), |i| i + 1);
         }
-        self.up_since = vec![None; config.steps.len()];
-        self.pending_start = None;
+        self.heating = vec![HeatHold::default(); config.steps.len()];
         self.pending_down = None;
         self.emergency_cool_since = None;
         self.config = config;
@@ -290,9 +335,8 @@ impl Controller {
         }
         self.emergency = true;
         self.emergency_cool_since = None;
-        self.pending_start = None;
         self.pending_down = None;
-        self.up_since.fill(None);
+        self.heating.fill(HeatHold::default());
     }
 
     /// A sampled EC70 control input may be supplied independently of the CPU
@@ -311,6 +355,24 @@ impl Controller {
         }
         if self.previous.is_some_and(|(before, _)| now < before) {
             return Err("sample clock moved backwards".into());
+        }
+
+        let dt = self
+            .previous
+            .map_or(Duration::ZERO, |(before, _)| now - before);
+        for (index, hold) in self.heating.iter_mut().enumerate() {
+            if index < self.level {
+                *hold = HeatHold::default();
+            } else {
+                hold.observe(
+                    now,
+                    dt,
+                    temp_mc,
+                    self.config.steps[index].at_mc,
+                    self.config.hysteresis_mc,
+                    self.config.down_hold,
+                );
+            }
         }
 
         if cpu_mc >= self.config.emergency_mc {
@@ -346,42 +408,35 @@ impl Controller {
                             self.pending_down = Some((0, since));
                         }
                     }
-                    self.up_since.fill(None);
+                    self.heating.fill(HeatHold::default());
                 }
             }
         } else if self.level == 0 {
             self.pending_down = None;
-            self.up_since.fill(None);
-            if temp_mc >= self.config.steps[0].at_mc {
-                let since = *self.pending_start.get_or_insert(now);
-                if now.saturating_sub(since) >= self.config.start_hold {
-                    // First start always uses the minimum configured step.
-                    // Higher thresholds begin their separate hold now.
-                    self.level = 1;
-                    self.on_since = Some(now);
-                    self.pending_start = None;
-                    self.track_higher_thresholds(now, temp_mc);
-                }
-            } else {
-                self.pending_start = None;
+            if self.heating[0].ready(self.config.start_hold) {
+                // Once the start delay is earned, use the current heat level;
+                // do not add a second up-hold to an already hot start.
+                self.level = self
+                    .config
+                    .steps
+                    .iter()
+                    .take_while(|step| temp_mc >= step.at_mc)
+                    .count()
+                    .max(1);
+                self.on_since = Some(now);
+                self.heating[..self.level].fill(HeatHold::default());
             }
         } else {
-            self.pending_start = None;
-            self.track_higher_thresholds(now, temp_mc);
             let mut higher = self.level;
-            for (i, since) in self.up_since.iter().enumerate() {
-                if i + 1 > self.level
-                    && since.is_some_and(|since| now.saturating_sub(since) >= self.config.up_hold)
-                {
+            for (i, hold) in self.heating.iter().enumerate() {
+                if i + 1 > self.level && hold.ready(self.config.up_hold) {
                     higher = i + 1;
                 }
             }
             if higher > self.level {
                 self.level = higher;
                 self.pending_down = None;
-                for since in &mut self.up_since[..self.level] {
-                    *since = None;
-                }
+                self.heating[..self.level].fill(HeatHold::default());
             } else {
                 let mut target = self.level;
                 while target > 0
@@ -418,8 +473,10 @@ impl Controller {
         let near_start = temp_mc >= self.config.steps[0].at_mc - 8_000;
         let next_sample = if self.emergency
             || self.level > 0
-            || self.pending_start.is_some()
-            || self.up_since.iter().any(Option::is_some)
+            || self
+                .heating
+                .iter()
+                .any(|hold| hold.hot || !hold.elapsed.is_zero())
             || near_start
             || rising
             || cpu_mc >= self.config.emergency_mc - 10_000
@@ -452,16 +509,6 @@ impl Controller {
     fn on_long_enough(&self, now: Duration) -> bool {
         self.on_since
             .is_none_or(|since| now.saturating_sub(since) >= self.config.min_on)
-    }
-
-    fn track_higher_thresholds(&mut self, now: Duration, temp_mc: i32) {
-        for (i, since) in self.up_since.iter_mut().enumerate() {
-            if i < self.level || temp_mc < self.config.steps[i].at_mc - self.config.hysteresis_mc {
-                *since = None;
-            } else if temp_mc >= self.config.steps[i].at_mc {
-                since.get_or_insert(now);
-            }
-        }
     }
 }
 
@@ -520,8 +567,8 @@ mod tests {
     }
 
     #[test]
-    fn first_start_needs_a_continuous_threshold_condition() {
-        trace("0,60,60,0\n11,59,59,0\n12,60,60,0\n23,60,60,0\n24,60,60,35");
+    fn first_start_survives_noise_inside_the_hysteresis_band() {
+        trace("0,60,60,0\n11,59,59,0\n12,60,60,35\n24,60,60,35");
     }
 
     #[test]
@@ -532,8 +579,102 @@ mod tests {
     }
 
     #[test]
-    fn hotter_start_does_not_skip_first_quiet_step_or_stack_ema_delay() {
-        trace("0,93,93,0\n12,93,93,35\n31,93,93,35\n32,93,93,70");
+    fn ordinary_hot_start_selects_current_temperature_after_the_start_hold() {
+        let mut c = Controller::new(Config::default()).unwrap();
+        at(&mut c, 0, 40);
+        for second in 1..13 {
+            assert_eq!(at(&mut c, second, 93).pwm_percent, 0);
+        }
+        assert_eq!(at(&mut c, 13, 93).pwm_percent, 70);
+    }
+
+    #[test]
+    fn recurrent_short_dips_do_not_starve_start_or_higher_cooling() {
+        let document =
+            crate::presets::Document::parse(include_str!("../config/presets.conf")).unwrap();
+        for (config, dip, deadline) in [
+            (
+                document.config(crate::presets::Preset::Quiet).clone(),
+                79,
+                24,
+            ),
+            (Config::default(), 59, 16),
+        ] {
+            let mut controller = Controller::new(config).unwrap();
+            let started = (0..=180)
+                .find(|second| {
+                    at(
+                        &mut controller,
+                        *second,
+                        if second % 4 == 3 { dip } else { 92 },
+                    )
+                    .pwm_percent
+                        > 0
+                })
+                .expect("periodic load must start cooling");
+            assert!(started <= deadline);
+        }
+        let mut controller = Controller::new(Config::default()).unwrap();
+        assert_eq!(
+            controller
+                .takeover(Duration::ZERO, 90_000, 46)
+                .unwrap()
+                .pwm_percent,
+            50
+        );
+        let raised = (1..=200)
+            .find(|second| {
+                at(
+                    &mut controller,
+                    *second,
+                    if second % 4 == 0 { 87 } else { 94 },
+                )
+                .pwm_percent
+                    >= 70
+            })
+            .expect("short dips must not starve the upper stage");
+        assert!(raised <= 30);
+    }
+
+    #[test]
+    fn full_cooling_hold_clears_heat_from_an_unfinished_start() {
+        let mut controller = Controller::new(Config::default()).unwrap();
+        for second in 0..7 {
+            assert_eq!(at(&mut controller, second, 82).pwm_percent, 0);
+        }
+        for second in 7..60 {
+            assert_eq!(at(&mut controller, second, 40).pwm_percent, 0);
+        }
+        for second in 60..72 {
+            assert_eq!(at(&mut controller, second, 93).pwm_percent, 0);
+        }
+        assert_eq!(at(&mut controller, 72, 93).pwm_percent, 70);
+    }
+
+    #[test]
+    fn returning_to_the_hysteresis_band_interrupts_the_cooling_reset() {
+        let mut controller = Controller::new(Config {
+            steps: vec![Step {
+                at_mc: 80_000,
+                pwm_percent: 35,
+            }],
+            start_hold: Duration::from_secs(20),
+            ..Config::default()
+        })
+        .unwrap();
+        for second in 0..=10 {
+            assert_eq!(at(&mut controller, second, 82).pwm_percent, 0);
+        }
+        assert_eq!(at(&mut controller, 11, 74).pwm_percent, 0);
+        // The brief cold dip pauses heat. Time back in the band must not
+        // count as continuous cooling below the band and erase that heat.
+        for second in 12..=60 {
+            assert_eq!(at(&mut controller, second, 77).pwm_percent, 0);
+        }
+        for second in 61..70 {
+            assert_eq!(at(&mut controller, second, 82).pwm_percent, 0);
+        }
+        assert_eq!(at(&mut controller, 70, 82).pwm_percent, 35);
     }
 
     #[test]
@@ -542,9 +683,9 @@ mod tests {
     }
 
     #[test]
-    fn falling_below_a_higher_hysteresis_band_resets_only_its_hold() {
+    fn brief_cooling_below_a_higher_band_pauses_its_budget() {
         trace(
-            "0,82,82,0\n12,82,82,35\n13,93,93,35\n30,87,87,35\n33,87,87,50\n34,93,93,50\n53,93,93,50\n54,93,93,70",
+            "0,82,82,0\n12,82,82,35\n13,93,93,35\n30,87,87,35\n33,87,87,50\n34,93,93,50\n36,93,93,50\n37,93,93,70",
         );
     }
 
@@ -605,7 +746,7 @@ mod tests {
     #[test]
     fn normal_cooling_obeys_every_hysteresis_boundary_and_down_hold() {
         trace(
-            "0,93,93,0\n12,93,93,35\n32,93,93,70\n33,89,89,70\n34,87,87,70\n63,87,87,70\n64,87,87,50\n65,85,85,50\n66,84,84,50\n95,84,84,50\n96,84,84,40\n97,80,80,40\n98,79,79,40\n128,79,79,35\n129,55,55,35\n130,54,54,35\n160,54,54,0",
+            "0,93,93,0\n12,93,93,70\n32,93,93,70\n33,89,89,70\n34,87,87,70\n63,87,87,70\n64,87,87,50\n65,85,85,50\n66,84,84,50\n95,84,84,50\n96,84,84,40\n97,80,80,40\n98,79,79,40\n128,79,79,35\n129,55,55,35\n130,54,54,35\n160,54,54,0",
         );
     }
 
@@ -733,8 +874,8 @@ mod tests {
         assert_eq!(at(&mut c, 301, 82).pwm_percent, 0);
         assert_eq!(at(&mut c, 302, 79).pwm_percent, 0);
         assert_eq!(at(&mut c, 303, 82).pwm_percent, 0);
-        assert_eq!(at(&mut c, 322, 82).pwm_percent, 0);
-        assert_eq!(at(&mut c, 323, 82).pwm_percent, 35);
+        assert_eq!(at(&mut c, 320, 82).pwm_percent, 0);
+        assert_eq!(at(&mut c, 321, 82).pwm_percent, 35);
         assert_eq!(at(&mut c, 400, 82).pwm_percent, 35);
     }
 
@@ -743,8 +884,8 @@ mod tests {
         let d = crate::presets::Document::parse(include_str!("../config/presets.conf")).unwrap();
         let mut c = Controller::new(d.config(crate::presets::Preset::Performance).clone()).unwrap();
         assert_eq!(at(&mut c, 0, 82).pwm_percent, 0);
-        assert_eq!(at(&mut c, 3, 82).pwm_percent, 35);
-        assert_eq!(at(&mut c, 7, 82).pwm_percent, 35);
+        assert_eq!(at(&mut c, 3, 82).pwm_percent, 80);
+        assert_eq!(at(&mut c, 7, 82).pwm_percent, 80);
         assert_eq!(at(&mut c, 8, 82).pwm_percent, 80);
         assert_eq!(at(&mut c, 9, 95).pwm_percent, 80);
     }

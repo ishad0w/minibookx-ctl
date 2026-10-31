@@ -224,7 +224,8 @@ else:
             self.assertEqual(result.returncode, 0, result.stderr)
             calls = [json.loads(line) for line in log.read_text().splitlines()]
             self.assertEqual(
-                [call[0] for call in calls], ["python3", "cargo", "python3", "cargo"]
+                [call[0] for call in calls],
+                ["python3", "cargo", "python3", "cargo", "cargo"],
             )
             self.assertEqual(
                 calls[0][1][:2], [str(scripts / "libdbus_source.py"), "build"]
@@ -235,7 +236,8 @@ else:
             self.assertEqual(
                 calls[2][1][:2], [str(scripts / "release_format.py"), "elf"]
             )
-            for _, arguments, environment in [calls[1], calls[3]]:
+            self.assertEqual(calls[3][1][-2:], ["--bin", "minibookx-ctl"])
+            for _, arguments, environment in [calls[1], calls[3], calls[4]]:
                 self.assertIn("--locked", arguments)
                 self.assertIn("x86_64-unknown-linux-musl", arguments)
                 self.assertEqual(environment["PKG_CONFIG_PATH"], "")
@@ -246,8 +248,8 @@ else:
                 self.assertEqual(environment["DBUS_1_STATIC"], "1")
                 self.assertEqual(environment["PKG_CONFIG_ALLOW_CROSS"], "1")
                 self.assertIn("target-feature=+crt-static", environment["RUSTFLAGS"])
-            self.assertIn("--features", calls[3][1])
-            features = calls[3][1][calls[3][1].index("--features") + 1].split(",")
+            self.assertIn("--features", calls[4][1])
+            features = calls[4][1][calls[4][1].index("--features") + 1].split(",")
             self.assertEqual(set(features), {"systemd-test-fixture", "dev-tools"})
 
             log.unlink()

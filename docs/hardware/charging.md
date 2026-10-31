@@ -46,8 +46,8 @@ The ID cache has no established per-read validity flag or timestamp. Doctor
 therefore reports an EC/charger identity as unknown unless Linux exports one;
 it does not open a debug interface or issue SMBus transactions to identify it.
 
-Three reads of the existing cache returned bytes `00 40 00 30`. The active
-firmware's initial packet table reads commands `0xFE/0xFF`; its normal cyclic
+The cache bytes `00 40 00 30` match those IDs. The active firmware's initial
+packet table reads commands `0xFE/0xFF`; its normal cyclic
 table does not. The bytes can therefore remain from initialization. Neither a
 completed initialization phase nor a plausible nonzero cache proves a fresh,
 successful transaction for each ID.

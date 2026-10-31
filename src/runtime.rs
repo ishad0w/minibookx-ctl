@@ -57,6 +57,7 @@ struct State {
     config_text: String,
     preset: Option<Preset>,
     config_error: bool,
+    power_deferred: bool,
     inhibitor: Option<OwnedFd>,
     epoch: Instant,
     last_feedback_status: Option<Instant>,
@@ -84,6 +85,7 @@ impl State {
             "active": true,
             "preset": self.preset.map_or_else(|| "custom".into(), |p| p.to_string()),
             "config_error": self.config_error,
+            "power_deferred": self.power_deferred,
             "paused_for_sleep": self.paused,
             "fan_control": self.fan_control,
             "manual": self.fan_control && !self.paused,
@@ -117,18 +119,15 @@ impl State {
         };
         let result = presets::load(path).and_then(|loaded| {
             validate_startup_mode(self.fan_control, loaded.fan_control)?;
-            loaded
-                .config
-                .validate_for_hardware()
-                .map_err(io::Error::other)?;
             // Validate everything before requesting any hardware change. The
             // broker applies PL1/PL2 transactionally or retains the old limits.
-            Controller::new(loaded.config.clone()).map_err(io::Error::other)?;
-            if (loaded.text != self.config_text || self.config_error)
+            if (loaded.text != self.config_text || self.config_error || self.power_deferred)
                 && self.started
                 && !self.paused
             {
-                self.session.apply_power(&loaded.power)?;
+                self.power_deferred =
+                    self.session.apply_power(&loaded.power)? == service::PowerOutcome::Deferred;
+                self.last_status = None;
             }
             Ok(loaded)
         });
@@ -281,7 +280,8 @@ impl State {
                 .fan_control
                 .then(|| CpuSensor::discover(Path::new("/sys/class/hwmon")))
                 .transpose()?;
-            self.session.apply_power(&self.power)?;
+            self.power_deferred =
+                self.session.apply_power(&self.power)? == service::PowerOutcome::Deferred;
             self.applied = self.session.activate()?.unwrap_or(0);
             self.epoch = Instant::now();
             self.initial_sample = true;
@@ -402,7 +402,6 @@ pub fn run(loaded: Loaded, config_path: Option<PathBuf>) -> io::Result<()> {
         text,
         fan_control,
     } = loaded;
-    config.validate_for_hardware().map_err(io::Error::other)?;
     // Block before acquiring any hardware session and keep that mask until the
     // policy child's _exit, including while its restoration destructors run.
     let signals = sd::Signals::for_process()
@@ -433,6 +432,7 @@ pub fn run(loaded: Loaded, config_path: Option<PathBuf>) -> io::Result<()> {
         config_text: text,
         preset,
         config_error: false,
+        power_deferred: false,
         inhibitor: None,
         epoch: Instant::now(),
         last_feedback_status: None,
@@ -469,10 +469,11 @@ pub fn run(loaded: Loaded, config_path: Option<PathBuf>) -> io::Result<()> {
         })?;
         state.inhibitor.take();
     } else {
-        state
+        state.power_deferred = state
             .session
             .apply_power(&state.power)
-            .map_err(|e| sd::context("apply startup power policy", e))?;
+            .map_err(|e| sd::context("apply startup power policy", e))?
+            == service::PowerOutcome::Deferred;
         state.applied = state
             .session
             .activate()
@@ -489,7 +490,20 @@ pub fn run(loaded: Loaded, config_path: Option<PathBuf>) -> io::Result<()> {
         .session
         .ready()
         .map_err(|e| sd::context("acknowledge policy readiness", e))?;
-    let result = event_loop(&mut state, &signals, watch.as_ref());
+    let mut result = event_loop(&mut state, &signals, watch.as_ref());
+    if result.is_err()
+        && signals
+            .drain()?
+            .iter()
+            .any(|signal| *signal != libc::SIGHUP)
+    {
+        // A concurrent broker stop can reject an in-flight heartbeat. Complete
+        // the explicit release exchange rather than misreporting normal TERM.
+        result = state.session.fan.restore();
+        if result.is_ok() {
+            state.inhibitor.take();
+        }
+    }
     if let Err(e) = &result {
         eprintln!("controller failure: {e}");
     }

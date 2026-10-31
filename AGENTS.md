@@ -84,9 +84,10 @@ and account/config validation with mocked service control. Graphics checks use
 repository metadata and solver-only transactions, without installing GPU packages
 or enabling external repositories on a host. They do not establish real service
 startup, physical graphics, sensors, suspend or EC compatibility.
-The separate systemd VM fixture validates production supervision with a fake
-hardware session/recovery model; it does not validate production lease guards,
-physical devices, RAPL or libinput behavior. Keep hardware qualification separate.
+The separate systemd VM fixture validates production supervision and sensor
+ownership with a fake hardware session and CONTROL byte. Production fan/module
+leases have filesystem tests, not VM hardware coverage. Physical devices, RAPL
+enforcement and libinput remain separate qualifications.
 
 Every new release must bump the patch version in `Cargo.toml` and `Cargo.lock`
 before its final commit. Follow the canonical
@@ -104,12 +105,14 @@ after the version bump. Native/musl fixture checks, the systemd VM and all
 distribution suites must pass before publication.
 
 The `Required CI checks` GitHub ruleset protects `main` without bypasses. Open a
-pull request and wait for its required checks before merging. Manual workflow
-runs alone do not satisfy this ruleset. Keep all nine required job names in
+pull request and wait for its required checks before merging. Direct updates,
+force-pushes and deletion are prohibited. Keep all nine required job names in
 sync with the workflow matrix. Squash a release PR with the canonical commit
 title, then build and publish from the resulting main commit.
-Release immutability is enabled for new releases starting with v0.1.5; verify
-the published release's immutable flag. Do not give CI an administration token
+Bootstrap changes need a separate PR merged without squashing so its pinned
+script commit remains an ancestor; follow the maintenance guide.
+Version tags are append-only and releases must be immutable; verify the
+published release's immutable flag, including on retries. Do not give CI an administration token
 to read or change repository settings.
 
 History rewrites and removal of public release artifacts require an explicit

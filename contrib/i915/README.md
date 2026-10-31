@@ -16,13 +16,10 @@ Changing a timeout does not make an unsupported refresh rate usable.
 |---|---|
 | [RFC artifact](ready-timeout-rfc.patch) | Based on Linux `32c52ec87d6245ee2d12ed5dd509e40062939b50`; apply/whitespace/checkpatch checks only |
 | Exact RFC build and boot | Not performed; no distribution/kernel combination is qualified for installation of this artifact |
-| Downstream CachyOS development modules | Runtime tests at 10000 µs; a separate 5000 µs reboot and S3 cycle passed |
-| Stock CachyOS `7.2.11-1-cachyos`, early 60 Hz VBT | One power-off/button start and one S3/deep cycle passed on the documented U300 |
 | Upstream failing baseline and full debug logs | Still needed |
 
-The downstream modules are not a compiled version of this exact upstream RFC.
-Their results explain the proposal but cannot qualify it. No cold-start result
-for a patched module is claimed. No validated replacement i915 binary is shipped.
+No validated replacement i915 binary is shipped. Success with the documented
+60 Hz setup does not qualify this separate driver proposal.
 
 ## Proposed override
 

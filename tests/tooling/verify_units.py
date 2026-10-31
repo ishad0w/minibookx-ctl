@@ -13,9 +13,10 @@ assert "WatchdogSignal=SIGTERM" in main_unit, "watchdog must allow guardian OFF 
 assert "KillMode=control-group" in main_unit
 assert "TimeoutAbortSec=3s" in main_unit
 assert "NotifyAccess=main" in main_unit.splitlines()
-assert [
-    line for line in main_unit.splitlines() if line.startswith("AmbientCapabilities=")
-] == ["AmbientCapabilities=CAP_SETUID"]
+assert not any(
+    line.startswith(("User=", "Group=", "AmbientCapabilities="))
+    for line in main_unit.splitlines()
+)
 assert "DevicePolicy=closed" in main_unit.splitlines()
 assert "ExecStopPost=/usr/local/bin/minibookx-ctl --recover" in main_unit.splitlines()
 assert "OnFailure=" not in main_unit

@@ -38,6 +38,8 @@ TOP_FILES = [
     "install.sh",
     "rust-toolchain.toml",
     "rustfmt.toml",
+    "ruff.toml",
+    "requirements-dev.txt",
     "clippy.toml",
 ]
 SOURCE_DIRS = [

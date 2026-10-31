@@ -242,13 +242,48 @@ pub struct Signals {
 }
 impl Signals {
     pub fn new() -> io::Result<Self> {
+        Self::with_mask(false)
+    }
+    pub(crate) fn installer() -> io::Result<Self> {
+        Self::with_mask(true)
+    }
+    pub(crate) fn installer_process() -> io::Result<Self> {
+        let mut signals = Self::installer()?;
+        // Remain blocked through final CLI error reporting and process exit.
+        signals.old_mask = None;
+        Ok(signals)
+    }
+    fn with_mask(installer: bool) -> io::Result<Self> {
         // SAFETY: sigset_t is an integer struct; pointers refer to live objects.
         let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
         let mut old_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
         unsafe {
-            libc::sigemptyset(&mut mask);
-            for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-                libc::sigaddset(&mut mask, signal);
+            if installer {
+                libc::sigfillset(&mut mask);
+                // Synchronous faults cannot safely be deferred. CHLD and the
+                // default nonterminating signals are not cancellation requests.
+                for signal in [
+                    libc::SIGSEGV,
+                    libc::SIGBUS,
+                    libc::SIGILL,
+                    libc::SIGFPE,
+                    libc::SIGTRAP,
+                    libc::SIGABRT,
+                    libc::SIGSYS,
+                    libc::SIGCHLD,
+                    libc::SIGCONT,
+                    libc::SIGWINCH,
+                    libc::SIGURG,
+                    libc::SIGKILL,
+                    libc::SIGSTOP,
+                ] {
+                    libc::sigdelset(&mut mask, signal);
+                }
+            } else {
+                libc::sigemptyset(&mut mask);
+                for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+                    libc::sigaddset(&mut mask, signal);
+                }
             }
         }
         // SAFETY: blocks only the supplied signals on the calling thread.

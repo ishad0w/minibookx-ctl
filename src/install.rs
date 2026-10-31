@@ -105,6 +105,10 @@ impl Options {
 pub fn run(install: bool, args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let options = Options::parse(install, args)?;
     let target = Target::new(options.destdir.as_deref())?;
+    let _signals = target
+        .live
+        .then(crate::systemd::Signals::installer_process)
+        .transpose()?;
     // Read the running image even if its original pathname was replaced. Its
     // executable bytes must match the embedded files from this same process.
     apply(
@@ -483,6 +487,7 @@ trait Host {
     fn state(&mut self, unit: &str) -> io::Result<State>;
     fn control(&mut self, args: &[&str]) -> io::Result<()>;
     fn recover(&mut self, binary: &Path) -> io::Result<()>;
+    fn startup_interval(&mut self) {}
 }
 
 struct LiveHost;
@@ -804,12 +809,15 @@ fn check_config_snapshot(account: Account, data: &[u8]) -> io::Result<()> {
     unsafe { check.pre_exec(move || config_child_privileges(account)) };
     execute(check, false, COMMAND_TIMEOUT).map(|_| ()).map_err(|error| {
         refuse(format!(
-            "existing config could not be validated as the service account: {error}; existing service left untouched; check it with sudo -u {NAME} {BINARY} --check-config {CONFIG}"
+            "existing config could not be validated by the new version as the service account: {error}; existing service left untouched; correct {CONFIG} and retry this installer"
         ))
     })
 }
 
 impl Host for LiveHost {
+    fn startup_interval(&mut self) {
+        std::thread::sleep(Duration::from_millis(250));
+    }
     fn account(&mut self) -> io::Result<Account> {
         service_account()
     }
@@ -927,7 +935,7 @@ fn stopped(target: &Target, host: &mut impl Host) -> io::Result<()> {
     target.leases_clear()
 }
 
-fn restore_state(host: &mut impl Host, state: State) -> io::Result<()> {
+fn restore_enablement(host: &mut impl Host, state: State) -> io::Result<()> {
     match state.enabled {
         Enabled::Permanent => host.control(&["enable", UNIT])?,
         Enabled::Runtime => {
@@ -935,9 +943,6 @@ fn restore_state(host: &mut impl Host, state: State) -> io::Result<()> {
             host.control(&["enable", "--runtime", UNIT])?;
         }
         Enabled::No => host.control(&["disable", UNIT])?,
-    }
-    if state.active {
-        start_service(host)?;
     }
     Ok(())
 }
@@ -947,12 +952,20 @@ fn start_service(host: &mut impl Host) -> io::Result<()> {
     // Resetting a rate limit is useful, but only a successful start and active
     // state are required. A missing reset target must not prevent rollback.
     if let Err(error) = host.control(&["reset-failed", UNIT]) {
-        eprintln!("could not reset failed state; attempting service start: {error}");
+        let _ = writeln!(
+            io::stderr(),
+            "could not reset failed state; attempting service start: {error}"
+        );
     }
     host.control(&["start", UNIT])?;
-    let current = host.state(UNIT)?;
-    if !current.active || current.transitioning {
-        return Err(refuse("service did not remain active"));
+    for _ in 0..4 {
+        host.startup_interval();
+        let current = host.state(UNIT)?;
+        if !current.active || current.transitioning {
+            return Err(refuse(
+                "service did not stay active during the startup check",
+            ));
+        }
     }
     Ok(())
 }
@@ -967,7 +980,10 @@ fn apply(
     // Defer termination during the transaction. Check pending signals between
     // steps; rollback stays protected until files and service state are settled.
     // Staging has no live service or hardware to protect.
-    let signals = target.live.then(crate::systemd::Signals::new).transpose()?;
+    let signals = target
+        .live
+        .then(crate::systemd::Signals::installer)
+        .transpose()?;
     let interrupted = || {
         if let Some(signals) = &signals
             && !signals.drain()?.is_empty()
@@ -979,7 +995,7 @@ fn apply(
     let _lock = target.lock()?;
     if target.capture(PENDING)?.is_some() {
         return Err(refuse(
-            "a legacy installer transaction is pending; rerun the original version's installer to recover before continuing; do not remove its journal",
+            "a legacy installer transaction is pending; follow docs/guide/troubleshooting.md#legacy-installer-transaction before continuing; do not remove its journal blindly",
         ));
     }
     // Executed image is already trusted by the caller. Open it once with a size
@@ -1103,8 +1119,9 @@ fn apply(
             && install
             && let Err(recovery) = stopped(target, host)
         {
+            let enablement = restore_enablement(host, state);
             return Err(refuse(format!(
-                "installation failed: {original}; recovery also failed: {recovery}; current files retained, service not restarted"
+                "installation failed: {original}; recovery also failed: {recovery}; enablement rollback={enablement:?}; current files retained, service not restarted"
             )));
         }
         let rollback = (|| {
@@ -1129,8 +1146,11 @@ fn apply(
                 if let Err(error) = host.control(&["daemon-reload"]) {
                     errors.push(error.to_string());
                 }
-                if state.loaded && errors.is_empty() {
-                    restore_state(host, state)?;
+                if let Err(error) = restore_enablement(host, state) {
+                    errors.push(format!("enablement: {error}"));
+                }
+                if state.active && errors.is_empty() {
+                    start_service(host)?;
                 }
             }
             if errors.is_empty() {

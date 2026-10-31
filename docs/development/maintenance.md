@@ -12,10 +12,15 @@ ShellCheck and systemd's unit-verification tools. Static builds also need a musl
 C compiler, Meson, Ninja and binutils. These are development dependencies; the
 installed controller does not need them.
 
+Install the pinned Python checks in a virtual environment before running Make:
+
 ```sh
 rustup toolchain install stable --profile minimal \
   --component rustfmt --component clippy --component rust-docs \
   --target x86_64-unknown-linux-musl
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install -r requirements-dev.txt
 make check
 make static-test
 ```
@@ -68,8 +73,9 @@ The container installer test substitutes `systemctl`. To test actual service
 supervision, use the separate file-backed QEMU fixture in `tests/systemd/`.
 It compiles the production broker, worker, IPC, service and logind code with fake
 EC, temperatures, posture sensors and a file sink for tablet events. Hardware
-session preparation, lease handling and recovery use a file-only model rather
-than the production `hardware.rs` implementation. The shipped
+session preparation and fan/module recovery use a file-only model rather
+than the production `hardware.rs` implementation. The sensor uses production
+lease/retain/restore code against a file-backed CONTROL byte. The shipped
 systemd unit runs under real PID 1. The feature-gated fixture is not part of a
 normal/release executable and refuses a host without its QEMU identity.
 
@@ -116,13 +122,19 @@ Fan-disabled cases start without debugfs, EC or CPU-temperature files, exercise
 profile reload and reject a changed startup flag. A guest-only fake debugfs
 source checks late EC-file creation through the unit's real private bind.
 It does not validate physical PWM, real sensor orientation, RAPL writes,
-production hardware lease/recovery guards, libinput consumption, panel output
-or suspend hardware. Production lease and hardware recovery checks remain covered
-by their filesystem/unit tests, not by this VM substitution.
+production fan/module lease guards, libinput consumption, panel output or
+suspend hardware. Those checks remain separate from the VM. Sensor ownership
+does use production lease code. A logind sleep cycle uses a guest-only
+three-second sleep service, not physical S3. The suite uses the production
+twenty-second watchdog; only the repeated-forgery scenario shortens it to six
+seconds to distinguish manager rejection from the broker's policy timeout.
 
 The suite also checks lid-event integration and descriptor
 isolation, bounded sampling under early wakes, diagnostic command suppression,
 fanless/no-tablet operation and thermal protection with a stopped worker.
+It kills the guardian and checks OFF through the retained original descriptor,
+tests sensor restore failure across logind pause/resume and discovery backoff,
+and rejects heartbeat-only policy and repeated forged worker watchdog messages.
 It covers the fake hardware model and
 namespace mechanics above, not real late loading of `ec_sys`. Re-run the suite
 after relevant changes; it does not qualify a new build on the physical laptop.
@@ -186,7 +198,7 @@ The executable reports `X.Y.Z+g<commit>`, using the source commit's first
 12 characters. Asset filenames keep the same build identity; metadata records
 the full commit, compiler and static libdbus identity. Make the final commit
 before building: changing even its message changes the hash and requires a new
-build. An older release does not need rebuilding when it is retired.
+build.
 
 Each release contains five assets:
 
@@ -219,10 +231,11 @@ The systemd VM runs alongside the seven container suites after the checked
 artifacts are ready. The [distribution matrix](#distribution-matrix) lists the
 container versions and scope.
 
-The `Required CI checks` ruleset protects `main`. It requires the build, systemd
-VM and seven distribution jobs on the commit being pushed, without bypasses.
-Push a review branch and open a pull request to start the required CI. Manual
-workflow runs are useful for additional checks but do not satisfy this ruleset.
+The `Required CI checks` ruleset protects `main`. It requires a pull request,
+the build, systemd VM and seven distribution jobs, without bypasses. Direct
+updates, force-pushes and deletion are prohibited. Push a review branch and
+open a pull request to start the required CI. Manual workflow runs remain
+available for additional checks; they do not replace the required PR.
 Merge only after all nine checks pass. Keep the ruleset's required job names in
 sync with the matrix.
 
@@ -245,9 +258,13 @@ retrying the exact same build can verify and resume it, but a different commit
 cannot reuse its tag or replace its assets. A new release must use a new version.
 The bootstrap URL pins a reviewed commit; update it only after reviewing a
 changed bootstrap. This is separate from selecting the latest released binary.
-GitHub release immutability is enabled for new releases starting with v0.1.5.
-The publisher checks that GitHub locked the published release. Older releases
-are not retroactively locked. The repository setting is managed separately;
+When changing `install.sh`, first commit the script, then update the README pin
+to that commit. Merge that bootstrap PR with a merge commit, preserving the pin
+in main's ancestry; squashing or rebasing it would invalidate the ancestry check.
+Release PRs still use the canonical squash title above.
+The publisher checks that GitHub locked the published release, including on
+retries. Version tags cannot be updated or deleted; fresh tags can be created.
+The repository setting is managed separately;
 CI does not receive an administration token. CI-skip markers can prevent GitHub
 from starting a workflow, so the required branch checks enforce the policy
 rather than a step inside that workflow.

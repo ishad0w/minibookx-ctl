@@ -10,7 +10,7 @@ systemd service:
 |---|---|---|
 | Hardware broker | Read temperatures/posture sensors, apply bounded fan and optional power requests | Fixed hardware interfaces; root |
 | Policy worker | Parse config, choose fan targets, handle reloads and sleep events | Dedicated service user; no raw hardware descriptors |
-| Tablet guardian | Keep the virtual tablet switch alive and send OFF during recovery | Its uinput descriptor; root |
+| Tablet guardian | Keep the virtual tablet switch alive and send OFF during recovery | Its uinput descriptor; dedicated service user |
 
 ```mermaid
 flowchart LR
@@ -32,14 +32,16 @@ can choose bounded settings, but cannot name commands, registers, device paths
 or privileged hooks. systemd further restricts capabilities and writable paths.
 See the [security model](../../SECURITY.md) for the trust boundary.
 
-`AmbientCapabilities=CAP_SETUID` retains the startup capability needed for that
-one-way drop. systemd's sandbox setup can otherwise remove it even for UID 0;
-see [exec-invoke](https://github.com/systemd/systemd/blob/v257/src/core/exec-invoke.c#L4860-L4865).
-The worker clears its capability sets afterwards; the VM checks this boundary.
+The unit starts as the system manager's default UID 0 without ambient
+capabilities. Both children drop UID/GID, supplementary groups and all capability
+sets; the VM checks this boundary. The broker then retains only `CAP_KILL` for
+child supervision, while still being a root process.
 
 The broker sends systemd READY only after the worker completes startup. A fixed
 worker heartbeat request, sent while awake and paused, permits the broker to
-ping the watchdog. The unit accepts notifications only from the main broker;
+ping the watchdog. While fan control is manual, a successful Duty request must
+also be less than 12 seconds old; heartbeats alone cannot extend policy life.
+The unit accepts notifications only from the main broker;
 the worker cannot replace MainPID or directly keep the manager's watchdog alive.
 
 After parsing configuration, the worker sends one fixed startup choice to the
@@ -86,8 +88,8 @@ actual fan run time.
 At startup and resume, the broker reports the firmware's existing duty without
 writing OFF. The worker seeds policy from that duty and a fresh temperature.
 Hot takeover bypasses the ordinary start/up holds; reducing inherited cooling
-still requires the cooling hold. Later speed increases use hysteresis so one
-sample just below a threshold cannot repeatedly cancel their timers.
+still requires the cooling hold. Later starts and speed increases share the
+[accumulated-heat rules](../reference/configuration.md#fan-settings).
 
 The broker waits for IPC, lid notifications or the nearest active monotonic
 deadline. Posture samples and guardian heartbeats have separate deadlines;
@@ -121,6 +123,9 @@ diagnostic changes are coalesced into five-second snapshots/logs; actual tablet
 transitions and failures are reported immediately. This does not change the
 estimator's thresholds or confirmation delays.
 
+Sensor discovery runs with confirmed OFF and the guardian timeout disarmed;
+the first estimate rearms it. A slow discovery must not expire an idle guardian.
+
 ## Recovery and sleep
 
 ```mermaid
@@ -141,7 +146,9 @@ journals and required access for another attempt. The same unit invokes `--recov
 `ExecStopPost`, including after startup failure. Before its next activation,
 `--prepare` retries orphan recovery before creating a new ownership lease.
 `Restart=on-failure` provides bounded retries under the unit's start-rate limit;
-persistent recovery failure leaves the service failed and its records intact.
+unresolved fan recovery leaves the service failed. Optional power/sensor
+recovery failures quarantine those features and retain their records, allowing
+healthy cooling to start. No unknown ownership is overwritten.
 
 During shutdown, the broker releases hardware before waiting for the policy
 worker. It then acknowledges a pending Restore request only if every release
@@ -159,7 +166,10 @@ it is separate from current fan ownership.
 
 For suspend, the worker uses a logind delay inhibitor. It requests firmware fan
 control, power restoration, tablet OFF and base-sensor restoration before
-releasing the inhibitor. Resume rechecks hardware and starts fresh policy timers;
+releasing the inhibitor. Fan release and OFF must succeed. An optional
+power/sensor failure is returned explicitly as deferred recovery, with its
+journal retained; it must never masquerade as complete restoration.
+Resume rechecks hardware and starts fresh policy timers;
 it does not reuse the old duty
 or count sleeping time as a temperature measurement. The service treats a D-Bus
 disconnect or logind owner change as a fault.
@@ -179,8 +189,14 @@ OFF. This matters because device removal alone may leave input inhibited in
 libinput.
 
 An acknowledgement confirms that the switch is known OFF through that live
-descriptor, not that the desktop consumed an event. The guardian cannot recover
-after its own SIGKILL or an input-subsystem failure. The service and watchdog
+descriptor, not that the desktop consumed an event. An incomplete OFF exchange
+invalidates further OFF requests on that connection: a late reply cannot confirm
+a later request. Cleanup instead reaps the guardian and uses its exit status or
+the broker's original descriptor. The broker retains a copy
+of that original descriptor. After reaping a failed guardian it forces OFF,
+keeps the device alive for event delivery, then closes its copy. Closing just
+one fork's reference must not destroy the shared device. An input-subsystem
+failure or loss of both processes remains outside this guarantee. The service and watchdog
 use graceful SIGTERM before systemd's forced-kill deadline so ordinary shutdown
 can send OFF.
 
@@ -204,22 +220,31 @@ or power restoration.
 
 Before sleep or normal shutdown, the live guardian must confirm tablet OFF
 before the broker powers down a sensor it woke. Resume reacquires the sensor
-and starts a new posture estimate. An I/O or identity failure clears tablet mode
-and disables detection until service restart, while fan/power supervision
-continues. It disarms the guardian heartbeat after OFF acknowledgement and
+and starts a new posture estimate. Transient I/O uses the bounded missing-sample
+budget; fresh motion preserves confirmed posture. Identity/ownership or lid
+failures clear tablet mode and schedule discovery with backoff, while fan/power
+supervision continues. Resume retries discovery immediately. A fault disarms the guardian heartbeat after OFF acknowledgement and
 closes the failed lid descriptor. A pending sensor-restore failure keeps its
 object and ownership record for final cleanup. Unconfirmed OFF still faults the
 whole service. Invalid gravity samples use the estimator's stale-data timeout.
 The unprivileged worker and guardian never inherit the I2C descriptor
 or the hardware lock.
 
+A retained sensor record also counts as pending recovery when discovery failed
+before a live sensor object existed. Suspend reports it as deferred; final
+shutdown cannot acknowledge complete release while that record remains.
+
 ### Power-limit recovery
 
 Optional PL1/PL2 writes use captured original values and a root-owned, within-boot
 journal. The broker validates bounds, preserves PL1≤PL2 during two-file updates
 and verifies readback. Recovery restores a value only when current state still
-matches an expected state from the journal; conflicting external changes cause
-a fault. Checks also precede rollback and each individual write. These sysfs
+matches an expected state from the journal; conflicting external changes retain
+the journal and quarantine new overrides. A declined optional power request is
+explicitly returned as Deferred, recorded as `power_deferred` by the worker and
+reported by Doctor. It does not prevent healthy fan/tablet startup or resume.
+An uncertain partial write still stops the broker for independent recovery.
+Checks also precede rollback and each individual write. These sysfs
 operations are not atomic with other writers: an external change after a check
 can still race the write. Run only one power-limit controller.
 The single unit allow-lists the package's fixed power-limit files.

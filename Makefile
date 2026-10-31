@@ -3,6 +3,7 @@
 
 RELEASE_DIR ?= dist
 COMMIT ?= $(shell git rev-parse HEAD)
+RUFF ?= ruff
 
 help:
 	@printf '%s\n' \
@@ -16,6 +17,8 @@ help:
 	  'make distros [DISTROS="debian ..."]  Run disposable container checks'
 
 check:
+	$(RUFF) check .
+	$(RUFF) format --check .
 	cargo fmt --all -- --check
 	cargo clippy --locked --bin minibookx-ctl -- -D warnings
 	cargo clippy --locked --all-targets --features systemd-test-fixture,dev-tools -- -D warnings

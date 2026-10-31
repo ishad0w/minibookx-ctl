@@ -62,7 +62,12 @@ impl ProxyFan {
         })
     }
     pub fn restore(&mut self) -> io::Result<()> {
-        self.client.call(Request::Restore)?;
+        let reply = self.client.call(Request::Restore)?;
+        if reply.recovery_pending {
+            eprintln!(
+                "cooling and tablet OFF released; optional sensor/power recovery remains pending (see doctor and journal)"
+            );
+        }
         self.release_on_drop = false;
         Ok(())
     }
@@ -77,6 +82,11 @@ impl Drop for ProxyFan {
 pub struct Session {
     pub fan: ProxyFan,
     fan_control: bool,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub enum PowerOutcome {
+    Applied,
+    Deferred,
 }
 impl Session {
     pub fn open(fan_control: bool) -> io::Result<Self> {
@@ -122,15 +132,20 @@ impl Session {
     pub fn ready(&mut self) -> io::Result<()> {
         self.fan.client.call(Request::Ready).map(|_| ())
     }
-    pub fn apply_power(&mut self, config: &PowerConfig) -> io::Result<()> {
+    pub fn apply_power(&mut self, config: &PowerConfig) -> io::Result<PowerOutcome> {
         config.validate().map_err(io::Error::other)?;
         // A failed reply cannot prove that a partial power transaction did not
         // happen. The fallback must also cover fan_control=false sessions.
         self.fan.release_on_drop = true;
-        self.fan
-            .client
-            .call(Request::Power(config.clone()))
-            .map(|_| ())
+        let reply = self.fan.client.call(Request::Power(config.clone()))?;
+        Ok(if reply.recovery_pending {
+            eprintln!(
+                "power override deferred; fan/tablet control continues; see doctor and journal"
+            );
+            PowerOutcome::Deferred
+        } else {
+            PowerOutcome::Applied
+        })
     }
 }
 pub fn write_status(text: &str) -> io::Result<()> {
@@ -163,62 +178,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn failed_power_request_still_releases_a_fanless_session_on_drop() {
-        let (worker, broker) = UnixDatagram::pair().unwrap();
-        for socket in [&worker, &broker] {
-            socket
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .unwrap();
-        }
-        let server = std::thread::spawn(move || {
-            let mut bytes = [0; crate::ipc::REQUEST_BYTES + 1];
-            let count = broker.recv(&mut bytes).unwrap();
-            let (request, sequence) = Request::decode(&bytes[..count]).unwrap();
-            assert!(matches!(request, Request::Power(_)));
-            broker
-                .send(
-                    &Reply {
-                        sequence,
-                        rejected: true,
-                        ..Reply::default()
-                    }
-                    .encode(),
-                )
-                .unwrap();
-            let count = broker.recv(&mut bytes).unwrap();
-            let (request, sequence) = Request::decode(&bytes[..count]).unwrap();
-            assert_eq!(request, Request::Restore);
-            broker
-                .send(
-                    &Reply {
-                        sequence,
-                        ..Reply::default()
-                    }
-                    .encode(),
-                )
-                .unwrap();
-        });
-        let mut session = Session {
-            fan: ProxyFan {
-                client: Client {
-                    socket: worker,
-                    sequence: 0,
+    fn declined_or_deferred_power_still_releases_a_fanless_session_on_drop() {
+        for rejected in [true, false] {
+            let (worker, broker) = UnixDatagram::pair().unwrap();
+            for socket in [&worker, &broker] {
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+            }
+            let server = std::thread::spawn(move || {
+                let mut bytes = [0; crate::ipc::REQUEST_BYTES + 1];
+                let count = broker.recv(&mut bytes).unwrap();
+                let (request, sequence) = Request::decode(&bytes[..count]).unwrap();
+                assert!(matches!(request, Request::Power(_)));
+                broker
+                    .send(
+                        &Reply {
+                            sequence,
+                            rejected,
+                            recovery_pending: !rejected,
+                            ..Reply::default()
+                        }
+                        .encode(),
+                    )
+                    .unwrap();
+                let count = broker.recv(&mut bytes).unwrap();
+                let (request, sequence) = Request::decode(&bytes[..count]).unwrap();
+                assert_eq!(request, Request::Restore);
+                broker
+                    .send(
+                        &Reply {
+                            sequence,
+                            ..Reply::default()
+                        }
+                        .encode(),
+                    )
+                    .unwrap();
+            });
+            let mut session = Session {
+                fan: ProxyFan {
+                    client: Client {
+                        socket: worker,
+                        sequence: 0,
+                    },
+                    release_on_drop: false,
                 },
-                release_on_drop: false,
-            },
-            fan_control: false,
-        };
-        assert!(
-            session
-                .apply_power(&PowerConfig {
-                    enabled: true,
-                    pl1_w: Some(12),
-                    pl2_w: Some(15)
-                })
-                .is_err()
-        );
-        drop(session);
-        server.join().unwrap();
+                fan_control: false,
+            };
+            let result = session.apply_power(&PowerConfig {
+                enabled: true,
+                pl1_w: Some(12),
+                pl2_w: Some(15),
+            });
+            if rejected {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap(), PowerOutcome::Deferred);
+            }
+            drop(session);
+            server.join().unwrap();
+        }
     }
 
     #[test]

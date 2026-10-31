@@ -10,8 +10,6 @@ StartLimitBurst=3
 [Service]
 Type=notify
 NotifyAccess=main
-User=root
-Group=root
 ExecStartPre=/usr/local/bin/minibookx-ctl --prepare
 ExecStart=/usr/local/bin/minibookx-ctl --daemon --config /etc/minibookx-ctl/config.conf
 ExecStopPost=/usr/local/bin/minibookx-ctl --recover
@@ -33,9 +31,6 @@ LimitCORE=0
 OOMScoreAdjust=-250
 NoNewPrivileges=yes
 CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_MODULE
-# systemd's sandbox setup can drop SETUID unless requested as ambient. Keep it
-# for the worker's UID drop; the VM checks all worker capability sets are empty.
-AmbientCapabilities=CAP_SETUID
 PrivateDevices=no
 DevicePolicy=closed
 DeviceAllow=char-input r

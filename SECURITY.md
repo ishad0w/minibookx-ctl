@@ -14,9 +14,20 @@ Configuration is parsed after the worker drops privileges. It cannot specify
 commands, register addresses, device paths or hooks. The service account has no
 login, raw-device access, sudoers rule or file capabilities.
 
-The broker and guardian remain root processes. Dropping capabilities does not
-make UID 0 unprivileged. The unit protects the normal filesystem and restricts
-device access to input, I2C and uinput. Only the broker sends systemd readiness
+The broker remains UID 0 and narrows its capabilities to `CAP_KILL` after setup;
+that does not make it unprivileged. Worker and guardian use the dedicated
+service UID with empty capability sets, no supplementary groups and no ptrace
+access. Only the guardian and broker retain the original uinput descriptor;
+the worker receives no hardware descriptors. The broker can send OFF on that
+same device after a killed guardian has been reaped.
+
+The unit uses no ambient capabilities. Its device allow-list is intentionally
+broader than the code's fixed identities: `char-input r` permits all input
+devices and `char-i2c rw` all I2C adapters. Root-side identity checks narrow the
+actual opens; the device filter alone does not enforce those identities.
+`OOMScoreAdjust=-250` favors broker/guardian recovery; the worker resets its
+score to zero before dropping UID. This is not immunity from OOM termination.
+Only the broker sends systemd readiness
 and watchdog messages; the worker reports readiness and liveness over bounded
 IPC. These restrictions supplement the process boundary, not replace it.
 
@@ -45,7 +56,8 @@ does not change live services, accounts or hardware.
 An update requires recovery before replacing the executable. If copying or
 startup fails, rollback attempts to restore the old files and service state,
 including when a failed start is waiting to restart. Catchable termination
-signals are deferred through recovery/rollback. Power loss or SIGKILL can still
+signals are deferred through recovery/rollback and final reporting. Synchronous
+faults, power loss, SIGKILL or SIGSTOP can still
 interrupt installation. Keep an independent
 [manual backup](docs/reference/manual-install.md#manual-updates) when needed.
 Administrator-created systemd drop-ins remain the administrator's responsibility.
@@ -57,9 +69,9 @@ the suggested changes.
 
 Checksums detect inconsistent downloads; they are not independent signatures
 and do not protect against a compromised publisher. The publishing tool refuses
-to replace existing public assets. GitHub release immutability is enabled for
-new releases starting with v0.1.5; older releases are not retroactively locked.
-The publisher verifies the immutable flag after publication. Source and checksum
+to replace existing public assets and requires an immutable published release,
+including on retries. Version tags cannot be moved or deleted through normal
+repository access. Source and checksum
 files are included with each release.
 
 ## Recovery limits

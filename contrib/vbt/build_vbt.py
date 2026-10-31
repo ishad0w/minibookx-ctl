@@ -86,7 +86,7 @@ def derive(blob):
             "clock_kHz": clock,
             "sha256": expected,
             "changed_offsets": [
-                i for i, (a, b) in enumerate(zip(stock, data)) if a != b
+                i for i, (a, b) in enumerate(zip(stock, data, strict=True)) if a != b
             ],
         }
     cpio = newc(files)

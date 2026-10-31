@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import re
+import subprocess
 import sys
 import unicodedata
 import urllib.parse
@@ -39,6 +40,52 @@ def anchors(text):
     return result
 
 
+def source_links(repo):
+    errors = []
+    for source in (repo / "src").rglob("*.rs"):
+        for link in re.findall(r'doc_url!\("([^"\n]+)"\)', source.read_text()):
+            parsed = urllib.parse.urlsplit(link)
+            target = (repo / "docs" / urllib.parse.unquote(parsed.path)).resolve()
+            if not target.is_relative_to(repo / "docs") or not target.is_file():
+                errors.append(f"{source.name}: missing documentation target {link}")
+            elif parsed.fragment and parsed.fragment not in anchors(target.read_text()):
+                errors.append(f"{source.name}: missing documentation anchor {link}")
+    return errors
+
+
+def bootstrap_pin(repo):
+    pins = re.findall(
+        r"https://raw\.githubusercontent\.com/ishad0w/minibookx-ctl/([0-9a-f]{40})/install\.sh",
+        (repo / "README.md").read_text(),
+    )
+    if len(pins) != 1:
+        return ["README.md: require one canonical bootstrap commit pin"]
+    if not (repo / ".git").exists():
+        # Corresponding source archives have no Git metadata. CI must perform
+        # the ancestry/content check in its full-history checkout.
+        return []
+    pin = pins[0]
+    ancestor = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", pin, "HEAD"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+    )
+    if ancestor.returncode:
+        return [
+            "README.md: bootstrap pin must be an ancestor of HEAD (full history required)"
+        ]
+    contents = subprocess.run(
+        ["git", "show", pin + ":install.sh"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+    )
+    if contents.returncode or contents.stdout != (repo / "install.sh").read_bytes():
+        return ["README.md: pinned bootstrap differs from the reviewed install.sh"]
+    return []
+
+
 def main():
     paths = [
         REPO / name
@@ -52,7 +99,7 @@ def main():
     ]
     for directory in ("docs", "packaging", "contrib"):
         paths.extend((REPO / directory).rglob("*.md"))
-    errors = []
+    errors = source_links(REPO) + bootstrap_pin(REPO)
     for path in sorted(set(paths)):
         text = path.read_text(encoding="utf-8")
         label = path.relative_to(REPO)

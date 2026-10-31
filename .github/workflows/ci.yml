@@ -22,12 +22,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Install build and verification tools
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools build-essential pkg-config binutils libdbus-1-dev meson ninja-build shellcheck
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy --component rust-docs --target x86_64-unknown-linux-musl
           rustc -Vv
+          python3 -m pip install --user --break-system-packages -r requirements-dev.txt
       - name: Native checks
         run: make check
       - name: RustSec advisory check

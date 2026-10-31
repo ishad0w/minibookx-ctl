@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Runs ONLY in the disposable QEMU guest, under real systemd PID 1."""
 
+import ctypes
 import errno
 import json
 import os
+import pwd
 import signal
 import socket
 import stat
@@ -433,6 +435,146 @@ def notify_boundary():
     )
 
 
+def watchdog_rejects_worker_spoof():
+    dropin = Path("/etc/systemd/system/minibookx-ctl.service.d/spoof-watchdog.conf")
+    dropin.write_text("[Service]\nWatchdogSec=6s\n")
+    command("systemctl", "daemon-reload")
+    start()
+    main = props()["MainPID"]
+    policy = worker(int(main))
+    original = CONFIG.read_text()
+    since = str(int(time.time()))
+    (ROOT / "spoof-watchdog").touch()
+    try:
+        CONFIG.write_text(original + "\n# watchdog spoof test\n")
+        wait_for(
+            lambda: reads(policy, "spoof-watchdog") >= 5,
+            "worker did not send repeated forgeries",
+        )
+        wait_for(
+            lambda: props()["MainPID"] != main,
+            "forged watchdog kept the service alive",
+            15,
+        )
+        (ROOT / "spoof-watchdog").unlink(missing_ok=True)
+        CONFIG.write_text(original)
+        wait_for(
+            lambda: (
+                props()["MainPID"] not in (main, "0")
+                and props()["ActiveState"] == "active"
+            ),
+            "service did not restart after rejecting watchdog forgeries",
+        )
+    finally:
+        (ROOT / "spoof-watchdog").unlink(missing_ok=True)
+        CONFIG.write_text(original)
+        command("systemctl", "stop", UNIT)
+        dropin.unlink()
+        command("systemctl", "daemon-reload")
+    journal = command(
+        "journalctl", "-b", "-u", UNIT, "--since=@" + since, "--no-pager", "-o", "cat"
+    )
+    assert "watchdog timeout" in journal.lower(), journal
+    stopped()
+    print(
+        "VM_ASSERT PASS repeated worker WATCHDOG forgeries cannot keep the unit alive",
+        flush=True,
+    )
+
+
+def heartbeat_without_policy_expires():
+    start()
+    main = props()["MainPID"]
+    policy = worker(int(main))
+    os.kill(policy, signal.SIGSTOP)
+    wait_for(
+        lambda: "\nState:\tT" in Path(f"/proc/{policy}/status").read_text(),
+        "worker not stopped",
+    )
+    pidfd = os.pidfd_open(policy)
+    libc = ctypes.CDLL(None, use_errno=True)
+    duplicate = libc.syscall(438, pidfd, 3, 0)  # x86_64 pidfd_getfd; guest root only
+    os.close(pidfd)
+    assert duplicate >= 0, os.strerror(ctypes.get_errno())
+    begin = time.monotonic()
+    accepted = 0
+    with socket.socket(fileno=duplicate) as ipc:
+        ipc.settimeout(2)
+        for sequence in range(1, 65):
+            packet = bytearray(16)
+            packet[:3] = b"X\x01\x08"  # bounded Heartbeat
+            packet[8:12] = sequence.to_bytes(4, "little")
+            try:
+                ipc.send(packet)
+                reply = ipc.recv(17)
+            except OSError:
+                break
+            if len(reply) != 16 or reply[2]:
+                break
+            accepted += 1
+            time.sleep(0.25)
+    assert accepted >= 20, accepted
+    wait_for(
+        lambda: (
+            props()["MainPID"] not in (main, "0") and props()["ActiveState"] == "active"
+        ),
+        "heartbeat-only worker kept manual cooling indefinitely",
+    )
+    assert time.monotonic() - begin < 17
+    journal = command("journalctl", "-b", f"_PID={main}", "--no-pager", "-o", "cat")
+    assert "policy duty updates expired" in journal, journal
+    command("systemctl", "stop", UNIT)
+    stopped()
+    print(
+        "VM_ASSERT PASS recent heartbeats cannot replace successful Duty updates",
+        flush=True,
+    )
+
+
+def production_watchdog_timeout():
+    dropin = Path(
+        "/etc/systemd/system/minibookx-ctl.service.d/production-watchdog.conf"
+    )
+    dropin.write_text("[Service]\nWatchdogSec=20s\n")
+    command("systemctl", "daemon-reload")
+    try:
+        start()
+        main = props()["MainPID"]
+        since = str(int(time.time()))
+        assert "WatchdogUSec=20s" in command(
+            "systemctl", "show", UNIT, "-p", "WatchdogUSec"
+        )
+        os.kill(int(main), signal.SIGSTOP)
+        wait_for(
+            lambda: (
+                props()["MainPID"] not in (main, "0")
+                and props()["ActiveState"] == "active"
+            ),
+            "production watchdog failed to recover a stopped broker",
+            30,
+        )
+        journal = command(
+            "journalctl",
+            "-b",
+            "-u",
+            UNIT,
+            "--since=@" + since,
+            "--no-pager",
+            "-o",
+            "cat",
+        )
+        assert "watchdog timeout" in journal.lower(), journal
+    finally:
+        command("systemctl", "stop", UNIT)
+        dropin.unlink()
+        command("systemctl", "daemon-reload")
+    stopped()
+    print(
+        "VM_ASSERT PASS production 20-second watchdog and ExecStopPost recovery",
+        flush=True,
+    )
+
+
 def sandbox():
     block = Path("/dev/minibookx-test-block")
     os.mknod(block, stat.S_IFBLK | 0o600, os.makedev(7, 0))
@@ -520,9 +662,12 @@ def release_with_stalled_guardian(target):
         assert "\nState:\tT" in Path(f"/proc/{guardian}/status").read_text()
         assert reads(main, "sensor-restore") == restores
         os.kill(guardian, signal.SIGCONT)
-        if target == "sensor":
+        if target in ("sensor", "worker"):
             wait_for(
-                lambda: props()["MainPID"] != str(main),
+                lambda: (
+                    props()["MainPID"] not in (str(main), "0")
+                    and props()["ActiveState"] == "active"
+                ),
                 "sensor fault did not stop broker",
             )
         else:
@@ -556,8 +701,17 @@ def fanless():
     ROOT.mkdir(exist_ok=True)
     (ROOT / "forbid-ec").touch()
     CONFIG.write_text(disabled)
-    start()
+    (ROOT / "slow-discovery").touch()
+    try:
+        start()
+    finally:
+        (ROOT / "slow-discovery").unlink()
     main = int(props()["MainPID"])
+    assert props()["NRestarts"] == "0", props()
+    print(
+        "VM_ASSERT PASS slow sensor discovery keeps guardian OFF without expiring",
+        flush=True,
+    )
     worker(main)
     lid_checks(main)
     snapshot = json.loads((ROOT / "policy/status.json").read_text())
@@ -642,11 +796,14 @@ def fanless():
 def worker(main):
     children = Path(f"/proc/{main}/task/{main}/children").read_text().split()
     for pid in children:
+        if Path(f"/proc/{pid}/comm").read_text().strip() != "minibookx-work":
+            continue
         status = Path(f"/proc/{pid}/status").read_text()
         uid = next(
             line for line in status.splitlines() if line.startswith("Uid:")
         ).split()[1]
         if uid != "0":
+            assert Path(f"/proc/{pid}/oom_score_adj").read_text().strip() == "0"
             assert "NoNewPrivs:\t1" in status
             for capability in ["CapInh", "CapPrm", "CapEff", "CapAmb"]:
                 assert f"{capability}:\t0000000000000000" in status
@@ -658,6 +815,263 @@ def worker(main):
             assert all(value != "0" for value in gids.split()[1:]), gids
             return int(pid)
     raise AssertionError(f"unprivileged worker missing from {children}")
+
+
+def guardian_backup_and_privileges():
+    start()
+    main = int(props()["MainPID"])
+    policy = worker(main)
+    children = Path(f"/proc/{main}/task/{main}/children").read_text().split()
+    guard = next(int(pid) for pid in children if int(pid) != policy)
+    status = Path(f"/proc/{guard}/status").read_text()
+    uid = str(pwd.getpwnam("minibookx-ctl").pw_uid)
+    assert (
+        next(line for line in status.splitlines() if line.startswith("Uid:")).split()[
+            1:
+        ]
+        == [uid] * 4
+    )
+    for capability in ("CapInh", "CapPrm", "CapEff", "CapAmb"):
+        assert f"{capability}:\t0000000000000000" in status
+    original = str(ROOT / "switch-events")
+    assert original in fd_links(main) and original in fd_links(guard)
+    assert original not in fd_links(policy)
+    old = len(events())
+    os.kill(guard, signal.SIGKILL)
+    wait_for(
+        lambda: (
+            "tablet OFF confirmed through broker's original switch descriptor"
+            in command("journalctl", "-b", f"_PID={main}", "--no-pager", "-o", "cat")
+        ),
+        "original switch backup unused",
+    )
+    assert "0" in events()[old:]
+    wait_for(
+        lambda: (
+            props()["MainPID"] not in ("0", str(main))
+            and props()["ActiveState"] == "active"
+        ),
+        "guardian failure did not restart the service",
+    )
+    command("systemctl", "stop", UNIT)
+    stopped()
+    print(
+        "VM_ASSERT PASS unprivileged guardian death sends OFF on broker's original FD",
+        flush=True,
+    )
+
+
+def deferred_sensor_and_resume_retry():
+    # Use actual production lease/retain/restore code with a fake CONTROL byte.
+    start()
+    main = props()["MainPID"]
+    (ROOT / "fail-sensor-restore").touch()
+    (ROOT / "fail-posture").touch()
+    try:
+        wait_for(
+            lambda: (
+                json.loads((ROOT / "tablet.json").read_text())["reason"]
+                == "Unavailable"
+            ),
+            "sensor fault not isolated",
+        )
+        assert (ROOT / "sensor.lease").is_file()
+        assert (ROOT / "sensor-control").read_text() == "0"
+        command(
+            "busctl",
+            "call",
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+            "Suspend",
+            "b",
+            "false",
+        )
+        wait_for(
+            lambda: (
+                json.loads((ROOT / "tablet.json").read_text())["reason"]
+                == "RecoveryPending"
+            ),
+            "deferred restoration not reported",
+        )
+        assert props()["MainPID"] == main
+        assert not EC.read_bytes()[0x4F] & 0x40
+        (ROOT / "fail-sensor-restore").unlink()
+        (ROOT / "fail-posture").unlink()
+        # Real logind emits PrepareForSleep, but the guest sleep service only
+        # waits three seconds. No host or physical device is suspended.
+        wait_for(
+            lambda: EC.read_bytes()[0x4F] & 0x40, "fan did not reactivate after resume"
+        )
+        wait_for(lambda: events()[-1] == "1", "tablet did not recover after resume")
+        assert props()["MainPID"] == main
+        assert (ROOT / "sensor-control").read_text() == "0"
+    finally:
+        (ROOT / "fail-sensor-restore").unlink(missing_ok=True)
+        (ROOT / "fail-posture").unlink(missing_ok=True)
+        command("systemctl", "stop", UNIT)
+    stopped()
+    print(
+        "VM_ASSERT PASS deferred sensor restoration survives logind sleep and retries on resume",
+        flush=True,
+    )
+
+
+def discovery_retry():
+    (ROOT / "fail-discovery-once").touch()
+    start(tablet=False)
+    main = props()["MainPID"]
+    wait_for(
+        lambda: (
+            json.loads((ROOT / "tablet.json").read_text())["reason"] == "Unavailable"
+        ),
+        "one-shot discovery failure not reported",
+    )
+    assert "tablet detection unavailable" in command(
+        "systemctl", "show", UNIT, "-p", "StatusText"
+    )
+    wait_for(lambda: events()[-1] == "1", "scheduled tablet retry failed", 35)
+    assert props()["MainPID"] == main
+    command("systemctl", "stop", UNIT)
+    stopped()
+    print(
+        "VM_ASSERT PASS one-shot discovery failure recovers with bounded backoff",
+        flush=True,
+    )
+
+
+def orphan_sensor_recovery_stays_pending():
+    # Invalid attribution prevents discovery, so there is no live Sensors
+    # object. Its absence must not turn the retained record into a clean ACK.
+    lease = ROOT / "sensor.lease"
+    contents = "injected orphan sensor recovery\n"
+    lease.write_text(contents)
+    lease.chmod(0o600)
+    try:
+        start(tablet=False)
+        main = props()["MainPID"]
+        policy = worker(int(main))
+        wait_for(
+            lambda: (
+                json.loads((ROOT / "tablet.json").read_text())["reason"]
+                == "Unavailable"
+            ),
+            "orphan sensor record was not quarantined",
+        )
+        assert EC.read_bytes()[0x4F] & 0x40
+        command(
+            "busctl",
+            "call",
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+            "Suspend",
+            "b",
+            "false",
+        )
+        wait_for(
+            lambda: (
+                json.loads((ROOT / "tablet.json").read_text())["reason"]
+                == "RecoveryPending"
+            ),
+            "orphan sensor attribution was falsely reported restored",
+        )
+        assert not EC.read_bytes()[0x4F] & 0x40
+        assert events()[-1] == "0"
+        assert lease.read_text() == contents
+        wait_for(
+            lambda: (
+                "optional sensor/power recovery remains pending"
+                in command(
+                    "journalctl", "-b", f"_PID={policy}", "--no-pager", "-o", "cat"
+                )
+            ),
+            "worker did not receive the explicit deferred-recovery reply",
+        )
+        wait_for(
+            lambda: EC.read_bytes()[0x4F] & 0x40,
+            "orphan sensor quarantine blocked fan resume",
+        )
+        assert props()["MainPID"] == main
+        assert lease.read_text() == contents
+    finally:
+        command("systemctl", "stop", UNIT, check=False)
+        lease.unlink(missing_ok=True)  # fixed fake record; no hardware ownership
+        command("systemctl", "reset-failed", UNIT, check=False)
+    stopped()
+    print(
+        "VM_ASSERT PASS orphan sensor journal stays pending across logind sleep",
+        flush=True,
+    )
+
+
+def pending_power_with_opt_in_keeps_other_domains_alive():
+    original = CONFIG.read_text()
+    lease = ROOT / "power.lease"
+    contents = "injected pending optional recovery\n"
+    lease.write_text(contents)
+    lease.chmod(0o600)
+    CONFIG.write_text(
+        original.replace("power_control = false", "power_control = true", 1)
+    )
+    try:
+        start()
+        main = props()["MainPID"]
+        wait_for(
+            lambda: json.loads((ROOT / "policy/status.json").read_text())[
+                "power_deferred"
+            ],
+            "declined startup power request was not reported",
+        )
+        assert EC.read_bytes()[0x4F] & 0x40
+        assert lease.read_text() == contents
+        command(
+            "busctl",
+            "call",
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+            "Suspend",
+            "b",
+            "false",
+        )
+        wait_for(
+            lambda: json.loads((ROOT / "policy/status.json").read_text())[
+                "paused_for_sleep"
+            ],
+            "power quarantine prevented sleep preparation",
+        )
+        wait_for(
+            lambda: (
+                json.loads((ROOT / "tablet.json").read_text())["reason"] == "Paused"
+            ),
+            "deferred power recovery incorrectly changed tablet diagnostics",
+        )
+        wait_for(
+            lambda: (
+                not json.loads((ROOT / "policy/status.json").read_text())[
+                    "paused_for_sleep"
+                ]
+            ),
+            "power quarantine prevented resume",
+        )
+        wait_for(
+            lambda: events()[-1] == "1",
+            "tablet failed to resume with quarantined power",
+        )
+        assert props()["MainPID"] == main
+        assert EC.read_bytes()[0x4F] & 0x40
+        assert json.loads((ROOT / "policy/status.json").read_text())["power_deferred"]
+        assert lease.read_text() == contents
+    finally:
+        CONFIG.write_text(original)
+        command("systemctl", "stop", UNIT)
+        lease.unlink(missing_ok=True)  # fixed fake record; no hardware ownership
+    stopped()
+    print(
+        "VM_ASSERT PASS opted-in power quarantine preserves fan/tablet startup and resume",
+        flush=True,
+    )
 
 
 def fail_and_restart(label, target, sig):
@@ -739,10 +1153,18 @@ def run():
     )
     print("VM_ASSERT PASS stop, ExecStopPost, fan auto, tablet OFF", flush=True)
     hot_takeover()
+    guardian_backup_and_privileges()
+    deferred_sensor_and_resume_retry()
+    orphan_sensor_recovery_stays_pending()
+    pending_power_with_opt_in_keeps_other_domains_alive()
+    discovery_retry()
     tablet_faults()
     missing_tablet_and_status_errors()
     status_retry_recovery()
     notify_boundary()
+    watchdog_rejects_worker_spoof()
+    heartbeat_without_policy_expires()
+    production_watchdog_timeout()
     sandbox()
     installer_rollback()
     release_with_stalled_guardian("broker")
@@ -751,10 +1173,7 @@ def run():
     independent_thermal_guard()
     fail_and_restart("worker SIGKILL", "worker", signal.SIGKILL)
     fail_and_restart("broker SIGKILL", "broker", signal.SIGKILL)
-    fail_and_restart("systemd watchdog after worker SIGSTOP", "worker", signal.SIGSTOP)
-    journal = command("journalctl", "-u", UNIT, "-b", "--no-pager", "-o", "cat")
-    assert "Watchdog timeout" in journal or "watchdog timeout" in journal, journal
-    assert journal.count("VM_RECOVER completed") >= 7
+    fail_and_restart("policy expiry after worker SIGSTOP", "worker", signal.SIGSTOP)
 
     # Inject only a fake backend restore error. Pending attribution must survive.
     start()

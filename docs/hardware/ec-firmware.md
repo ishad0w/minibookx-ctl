@@ -123,14 +123,14 @@ heatsink temperature; the live controller uses Linux CPU-temperature readings.
 These are bounded findings from selected paths. They do not prove that every
 vendor interface elsewhere in the banked firmware has been excluded.
 
-## Active-code capture and exit
+## PMC2 flash service and exit
 
-Reading XDATA is not reading executable flash. The successful capture used the
-EC's separate PMC2 service; the original `0x268/0x26C` pair was enabled in the EC
-but was not routed by the host bridge. A pre-existing COMA decode at `0x3F8–0x3FF`
-provided a temporary route after checking that both ITE UARTs and host users of
-that range were inactive. The four PMC2 address registers were restored afterward;
-PCH routing itself was not changed. This routing is specific to the tested board.
+Reading XDATA is not reading executable flash. The separate PMC2 service uses
+host-decoded ports. On this board the EC's `0x268/0x26C` pair lacks host routing;
+COMA has a decode at `0x3F8–0x3FF`. A temporary PMC2 mapping requires proving
+that both ITE UARTs and host users of that range are inactive, and restoring
+all four PMC2 address registers afterward. This is board-specific routing,
+not a portable flash-read interface.
 
 The relevant bank 0 locations preserve the distinction between a warm exit and
 a hardware reset:
@@ -142,17 +142,16 @@ a hardware reset:
 | `0xD5CC–0xD65F` | Flash transaction selectors: begin, opcode, address/dummy payload, read byte and finish |
 | `0xD666–0xD66F` | Command `0xFC` writes warm-start marker `0x33` to XDATA `0x0045` |
 | `0xD696`, then `0x0459–0x0480` | Jump through `0x0400`, remove the service mapping, clear the marker and resume normal handlers |
-| `0xD67C–0xD694` | Separate `0xFE` hardware-reset path; not used for this capture |
+| `0xD67C–0xD694` | Separate `0xFE` hardware-reset path |
 
-The capture used only SPI status, ID and fast-read operations (`0x05`, `0x9F`,
-`0x0B`), never write-enable, erase or program. The observed ID response
-`FF FF FE FF` does not establish flash capacity. The checked exit finished the
-transaction selectors, used `0xFC`, then verified ordinary operation and routing
-restoration separately from verifying the data bytes.
+SPI status, ID and fast-read operations are `0x05`, `0x9F` and `0x0B`.
+The response `FF FF FE FF` is not a reliable capacity ID. Correct exit requires
+finishing the transaction selectors, using `0xFC`, and checking ordinary EC
+operation and routing restoration independently of the captured bytes.
 
 Read-only flash operations still change the EC's execution state: normal
-temperature-policy scheduling was paused during the roughly ten seconds of
-capture. This is not a background monitoring interface or a generic safe dump
+temperature-policy scheduling is paused inside this service. It is not a
+background monitoring interface or a generic safe dump
 recipe. No raw reader or firmware image is shipped with the controller.
 
 ## References

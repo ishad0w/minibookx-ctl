@@ -15,6 +15,7 @@ battery readings, power metadata and hardware references. Both are read-only.
 | Installed unit | A unit exists; it may not be running |
 | Populated cgroup and recent policy record | Processes and recent status exist; physical behavior still needs checking |
 | Accepted config | Last validated worker settings, not necessarily the current file on disk |
+| `power_deferred` | The requested optional override was not applied; other control remains active |
 | Fan control disabled | Firmware controls the fan; missing EC readings are intentional |
 | Active display mode | Needs permission to read GPU debugfs; reports timing from a recognized active CRTC, not advertised modes |
 | Intel driver binding | Sysfs associates the GPU with a driver; an application can still use software rendering |
@@ -25,9 +26,13 @@ status; an invalid or newer on-disk edit is not treated as an applied policy.
 An invalid reload keeps the previous settings. A changed `fan_control` requires
 a restart and causes the whole reload to be rejected until then.
 
+Report schema version 3 includes contextual availability and tablet recovery
+warnings. Documentation links are pinned to the executable's release version.
+
 Package profiles cover Debian 13, Ubuntu 24.04/26.04, Fedora 43/44 and
-Arch/CachyOS rolling releases. Unknown versions remain unknown; `ID_LIKE`
-does not select an unverified recipe. Queries are fixed, bounded and read-only;
+Arch/CachyOS rolling releases. Another version of the same distribution uses
+the nearest checked recipe, explicitly marked unverified. Unknown distribution
+IDs remain unknown; `ID_LIKE` does not select a recipe. Queries are fixed, bounded and read-only;
 privileged reports drop the query child's privileges. A query failure does not
 become a list of missing packages. The daemon and installer do not run them.
 
@@ -99,7 +104,8 @@ Leftover files alone do not establish liveness.
 |---|---|
 | `StoppedOffAcknowledged` | Guardian confirmed OFF through its live descriptor, writing an event if needed |
 | `StoppedGuardianExited` | Guardian completed its successful OFF/shutdown path before a separate acknowledgement reached the broker |
-| `StopUnconfirmed` | Neither proof is available; `tablet` is null and `reliable` is false |
+| `StoppedBrokerBackup` | After reaping the guardian, the broker sent OFF through its copy of the original descriptor |
+| `StopUnconfirmed` | None of these proofs is available; `tablet` is null and `reliable` is false |
 
 An OFF acknowledgement does not prove desktop consumption. A later cleanup
 error still fails shutdown. Final records may remain, but ordinary status
@@ -109,9 +115,11 @@ reports the stopped state rather than presenting them as live. See
 During normal operation, tablet-mode transitions update the tablet record
 immediately. Angle, reliability and reason changes are coalesced into snapshots
 at most five seconds apart; diagnostic churn does not send another switch
-command. Sensor/lid errors send OFF and report `Unavailable`; detection remains
-disabled until restart while cooling continues. Unconfirmed OFF still triggers
-service-wide recovery.
+command. Sensor/lid errors send OFF and report `Unavailable`; discovery retries
+with backoff and after resume while cooling continues. `RecoveryPending` means
+sensor restoration remains incomplete, including an orphaned recovery record.
+A deferred power restore alone does not change the tablet reason. Unconfirmed
+OFF still triggers service-wide recovery.
 
 A temporary write failure can leave an older record visible. The broker keeps
 the newest state and [retries publication](../development/design.md#config-and-status-files)

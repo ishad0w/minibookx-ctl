@@ -14,7 +14,7 @@ video=DSI-1:panel_orientation=right_side_up
 
 It tells Linux how the panel is mounted, so GNOME can return to the correct
 landscape orientation after unfolding. It works at both 50 and 60 Hz, and also
-needs the [Mutter fix](tablet-mode.md#setup). It does not fix display corruption.
+needs the [Mutter fix](tablet-mode.md#gnome). It does not fix display corruption.
 
 Use [adding kernel arguments](#adding-kernel-arguments) below, reboot, then
 check orientation before and after folding.
@@ -89,9 +89,7 @@ The tested stock GRUB did not support rotating its menu. `GRUB_GFXMODE` changes
 resolution, not orientation. Linux's panel and console arguments still work
 after GRUB hands over to the kernel.
 
-An earlier experiment used a custom GRUB patch, but it is not maintained here.
-Replacing the EFI executable is not part of this guide. If rotating the menu
-matters, Limine has native support; changing bootloaders is a separate choice.
+Limine supports menu rotation natively; changing bootloaders is a separate choice.
 
 <details>
 <summary>GRUB framebuffer settings</summary>

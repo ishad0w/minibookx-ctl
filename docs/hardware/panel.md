@@ -20,8 +20,8 @@ clock divided by horizontal total and vertical total:
 | 60 Hz | 165920 kHz | 1272 | 2174 | Stock-driver cold start and S3 passed on the matching panel |
 | Above 60 Hz | — | — | — | 70 Hz corrupted the physical output; unsupported |
 
-The [qualification record](README.md#hardware-qualification) identifies the
-hardware and software used. A screenshot or clean kernel log cannot establish
+The [hardware reference](README.md) identifies the supported revision and
+limitations. A screenshot or clean kernel log cannot establish
 the physical output quality.
 
 ### Fixed mode and readiness

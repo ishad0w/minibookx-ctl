@@ -56,12 +56,12 @@ targets. Detailed build/release instructions are in
 
 | Path | Responsibility |
 |---|---|
-| [scripts/build-static.sh](scripts/build-static.sh) | Rootless musl build, static verification and optional musl tests |
+| [scripts/build-static.sh](scripts/build-static.sh) | Rootless musl build, static verification, musl tests and separate VM fixture build |
 | [scripts/libdbus_source.py](scripts/libdbus_source.py) | Verify, prepare and build the pinned libdbus source |
 | [scripts/package_release.py](scripts/package_release.py) | Package a clean commit, matching binary, notices and corresponding sources |
 | [scripts/release_format.py](scripts/release_format.py) | Read-only ELF, archive, checksum and metadata validation |
 | [scripts/publish_release.py](scripts/publish_release.py) | Guarded GitHub publication from the main-branch workflow |
-| [.github/workflows/ci.yml](.github/workflows/ci.yml) | Checks, static artifacts, distribution matrix and publication gates |
+| [.github/workflows/ci.yml](.github/workflows/ci.yml) | Checks, static artifacts, distribution matrix, systemd VM and explicit manual publication |
 | [src/install/tests.rs](src/install/tests.rs) | Installer failure, ownership and rollback fixtures; other Rust tests are beside their modules |
 | [tests/tooling/](tests/tooling/) | Python regression tests plus offline Markdown/unit checks |
 | [tests/containers/](tests/containers/) | Distribution prerequisites, package advice and staged/mocked-service installer checks |
@@ -81,7 +81,7 @@ belong in `docs/hardware/`; source and release instructions belong in
 
 Keep mutable facts in one place: shipped defaults in `config/presets.conf`,
 accepted ranges in the configuration reference, sensor timings in the sensor
-reference, and physical results in the hardware qualification record. Other
+reference, and supported hardware/limits in the hardware overview. Other
 pages should summarize and link. An explicitly illustrative config example or
 a dated test observation is not a second specification of current defaults.
 
@@ -89,7 +89,7 @@ a dated test observation is not a second specification of current defaults.
 |---|---|
 | [docs/guide/install.md](docs/guide/install.md) | Install, update, remove; runtime package commands by distribution |
 | [docs/guide/configuration.md](docs/guide/configuration.md) | Everyday fan/profile settings and optional power limits |
-| [docs/guide/tablet-mode.md](docs/guide/tablet-mode.md) | Folding, GNOME setup and Mutter requirements |
+| [docs/guide/tablet-mode.md](docs/guide/tablet-mode.md) | Linux tablet switch, GNOME/Mutter setup and other desktop integration |
 | [docs/guide/display.md](docs/guide/display.md) | 60 Hz setup, native initramfs inclusion, validation and rollback |
 | [docs/guide/boot.md](docs/guide/boot.md) | Orientation and persistent arguments; optional appearance tips |
 | [docs/guide/graphics.md](docs/guide/graphics.md) | Intel acceleration packages by distribution |

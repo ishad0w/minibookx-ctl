@@ -6,9 +6,10 @@ Edit the installed configuration:
 sudoedit /etc/minibookx-ctl/config.conf
 ```
 
-Change existing entries rather than adding duplicate keys or sections. The
-[sample file](../../config/presets.conf) shows all defaults;
-[configuration reference](../reference/configuration.md) lists accepted values.
+Change existing entries rather than adding duplicate keys or sections. Your
+release's template is `/usr/local/share/doc/minibookx-ctl/presets.conf`; the
+[repository sample](../../config/presets.conf) may contain unreleased changes.
+The [configuration reference](../reference/configuration.md) lists accepted values.
 
 ## Fan profiles
 

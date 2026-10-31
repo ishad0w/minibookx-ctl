@@ -1,9 +1,10 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0
 set -eu
-case ${1:-} in
-    ''|--test) ;;
-    *) echo 'Usage: build-static.sh [--test]' >&2; exit 2 ;;
+task_mode=${1:-}
+case $task_mode in
+    ''|--test|--fixture) ;;
+    *) echo 'Usage: build-static.sh [--test|--fixture]' >&2; exit 2 ;;
 esac
 script_dir=$(CDPATH='' cd -P -- "$(dirname -- "$0")" && pwd)
 cd "$script_dir/.."
@@ -35,8 +36,14 @@ PKG_CONFIG_PATH=''
 PKG_CONFIG_ALLOW_CROSS=1
 DBUS_1_STATIC=1
 export PKG_CONFIG_LIBDIR PKG_CONFIG_PATH PKG_CONFIG_ALLOW_CROSS DBUS_1_STATIC
-cargo build --locked --release --target "$target"
-python3 "$script_dir/release_format.py" elf "target/$target/release/minibookx-ctl"
-if [ "${1:-}" = --test ]; then
-    cargo test --locked --target "$target"
+task_binary=minibookx-ctl
+if [ "$task_mode" = --fixture ]; then
+    task_binary=minibookx-systemd-fixture
+    cargo build --locked --release --target "$target" --features systemd-test-fixture --bin "$task_binary"
+else
+    cargo build --locked --release --target "$target" --bin "$task_binary"
+fi
+python3 "$script_dir/release_format.py" elf "target/$target/release/$task_binary"
+if [ "$task_mode" = --test ]; then
+    cargo test --locked --target "$target" --features systemd-test-fixture
 fi

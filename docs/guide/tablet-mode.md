@@ -1,17 +1,23 @@
-# Tablet mode and GNOME
+# Tablet mode
 
 Tablet detection is enabled when the service starts. Folding the screen behind
 the keyboard tells Linux it is in tablet mode: the built-in keyboard and touchpad
-stop responding, while the touchscreen stays usable. GNOME handles rotation
-and the on-screen keyboard.
+stop responding, while the touchscreen stays usable.
 
-## Setup
+## Linux integration
+
+The service publishes the standard `SW_TABLET_MODE` switch. libinput uses it to
+inhibit built-in input; rotation and the on-screen keyboard belong to the desktop.
+The daemon does not require GNOME or Mutter. Install and start the
+[service](install.md), then configure the desktop you use below.
+
+## GNOME
 
 Use GNOME on Wayland with `iio-sensor-proxy` installed; it is included in the
 [runtime package instructions](install.md#packages). No GNOME extension or
 manual sensor-register setup is needed.
 
-For correct orientation after unfolding, two things matter:
+For correct GNOME orientation after unfolding, two things matter:
 
 1. GNOME's **Mutter compositor must contain fix !4898**, included in Mutter 51.1.
    An older distribution package may have a backport. The GNOME Shell version
@@ -32,16 +38,16 @@ Update through your distribution, then log out and back in or reboot to load
 the new compositor. Keep GNOME Shell and Mutter from a compatible desktop stack.
 
 <details>
-<summary>CachyOS still offers Mutter 51.0</summary>
+<summary>CachyOS offers a Mutter package without the fix</summary>
 
-The tested fresh installation offered CachyOS `51.0-3`, while the already
-enabled Arch `extra` repository had `51.1-1`. Check the packages currently offered:
+Compare the candidates from the repositories already enabled on your system:
 
 ```sh
 pacman -Si mutter extra/mutter
 ```
 
-If the same mismatch applies, review a full update selecting the fixed package:
+If the default candidate lacks the fix and `extra/mutter` supplies a compatible
+fixed version, review a full update selecting that package:
 
 ```sh
 sudo pacman -Syu extra/mutter
@@ -87,9 +93,13 @@ The [sensor reference](../hardware/tablet-sensors.md) explains these limits.
 sudo systemctl stop minibookx-ctl.service
 ```
 
-Other desktops need their own sensor and on-screen keyboard integration. Plasma
-6.6+ offers automatic rotation settings, including an optional tablet-only
-restriction, but has not been physically tested by this project.
+## Plasma and other desktops
+
+The same Linux tablet switch is used; the GNOME/Mutter requirements above do not
+apply. Configure sensor integration, automatic rotation and the virtual keyboard
+for your desktop. Plasma provides rotation controls, including an optional
+tablet-only restriction. These desktops have not been physically tested by
+this project.
 
 Sources: [Mutter 51.1](https://github.com/GNOME/mutter/blob/51.1/NEWS),
 [fix !4898](https://gitlab.gnome.org/GNOME/mutter/-/merge_requests/4898),

@@ -110,7 +110,7 @@ previous service state; it does not stop an already running service.
 
 Try normal laptop use, then fold into a tablet and unfold again. Built-in input
 should turn off while folded and return afterwards; touch stays available.
-Follow [GNOME setup](tablet-mode.md) if rotation or the on-screen keyboard needs
+Follow [desktop setup](tablet-mode.md) if rotation or the on-screen keyboard needs
 attention. Finally, test sleep and wake with your usual desktop controls.
 
 The fan can stay off at cool idle. [Fan profiles](configuration.md#fan-profiles)

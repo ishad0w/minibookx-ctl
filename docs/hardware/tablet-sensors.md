@@ -86,7 +86,7 @@ in [base-sensor recovery](../development/design.md#base-sensor-recovery).
 ## Desktop integration
 
 GNOME's normal orientation must account for the physical mounting of the panel.
-Use the [GNOME setup requirements](../guide/tablet-mode.md#setup) for the Mutter
+Use the [GNOME setup requirements](../guide/tablet-mode.md#gnome) for the Mutter
 fix and mounting hint. Without that hint, the tested connector reports `Normal`
 rather than the required `Right Side Up`.
 

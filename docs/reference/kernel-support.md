@@ -39,7 +39,7 @@ or every flavor of a distribution's kernel.
 | Ubuntu 24.04, 6.8.0-31-generic | Module (`=m`) | [Official headers/config package](https://archive.ubuntu.com/ubuntu/pool/main/l/linux/linux-headers-6.8.0-31-generic_6.8.0-31.31_amd64.deb) |
 | Ubuntu 26.04, 7.0.0-14-generic | Module (`=m`) | [Official headers/config package](https://archive.ubuntu.com/ubuntu/pool/main/l/linux/linux-headers-7.0.0-14-generic_7.0.0-14.14_amd64.deb) |
 | Arch linux 7.2.11 | Packaged `ec_sys.ko.zst` | [Package files](https://archlinux.org/packages/core/x86_64/linux/files/); rolling contents change |
-| CachyOS tested U300 kernel | Writable access worked | [Physical qualification](../hardware/README.md#hardware-qualification) |
+| CachyOS tested U300 kernel | Writable access worked | [Features and limits](../hardware/README.md#features-and-limits) |
 | Fedora 44 regular package query | No loadable module found; debug variant provided it | Check the running configuration too; a file search cannot detect a built-in driver |
 
 On Fedora, inspect the exact kernel and available packages:

@@ -890,6 +890,11 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                 }
                 return Err(error);
             }
+            // TERM may arrive with a readable request/socket closure. Enter
+            // cleanup before talking to a guardian that is also shutting down.
+            if STOP.load(Ordering::Relaxed) {
+                break;
+            }
             for index in [0, 2] {
                 if sources[index].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
                     return Err(io::Error::other("broker child connection lost"));
@@ -968,14 +973,14 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                         emergency = EmergencyGuard::default();
                         health = FanHealth::default();
                         estimator.reset();
+                        // Return cooling/power before any blocking guardian
+                        // exchange. A failure must not skip another domain.
+                        let fan = session.restore();
+                        let rapl = power.restore();
                         let off = guardian
                             .as_mut()
                             .map_or(Ok(()), |g| g.off().and_then(|()| g.send(b'P')));
-                        // A failed domain must never prevent independent
-                        // thermal or power recovery. Keep sensor attribution
-                        // if OFF could not be confirmed by the guardian.
-                        let fan = session.restore();
-                        let rapl = power.restore();
+                        // Keep sensor attribution if OFF is unconfirmed.
                         let sensor = if off.is_ok() {
                             restore_sensors(&mut sensors)
                         } else {
@@ -1038,8 +1043,8 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                     let sample = match sensors.as_ref().map(Sensors::sample).transpose() {
                         Ok(sample) => sample,
                         Err(error) => {
-                            g.off()?;
-                            tablet_status(Some(false), None, false, "SensorFailure")?;
+                            // Common cleanup restores cooling before guardian
+                            // OFF, including when the sensor itself has failed.
                             return Err(io::Error::other(format!("tablet sensor failed: {error}")));
                         }
                     };
@@ -1090,6 +1095,11 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
         }
         Ok(())
     })();
+    // Do not leave the fan in manual mode while waiting for guardian OFF/exit.
+    let fan_result = session.restore();
+    let _ = fan_status(session.fan.as_ref(), false, &health, epoch.elapsed());
+    let power_result = power.restore();
+    power_status(&power);
     let tablet_shutdown = guardian.as_mut().map(Guardian::stop);
     let (tablet, reliable, reason) = match &tablet_shutdown {
         Some(GuardianShutdown {
@@ -1104,10 +1114,6 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
     if let Some(error) = &tablet_error {
         eprintln!("{error}");
     }
-    let fan_result = session.restore();
-    let _ = fan_status(session.fan.as_ref(), false, &health, epoch.elapsed());
-    let power_result = power.restore();
-    power_status(&power);
     let sensor_result = if reliable {
         restore_sensors(&mut sensors)
     } else {

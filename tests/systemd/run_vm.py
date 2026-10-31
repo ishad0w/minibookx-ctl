@@ -34,7 +34,7 @@ def make_image(rootfs, fixture, destination):
             if (
                 not name
                 or name in (".dockerenv", ".containerenv")
-                or name.startswith(("dev/", "proc/", "sys/", "run/"))
+                or name.startswith(("dev/", "proc/", "sys/", "run/", "boot/"))
             ):
                 continue
             if name.startswith("/") or ".." in Path(name).parts:

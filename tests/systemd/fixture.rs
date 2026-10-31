@@ -304,11 +304,14 @@ mod tablet {
             Ok(Self)
         }
         pub fn restore(&mut self) -> io::Result<()> {
-            Ok(())
+            super::count("sensor-restore")
         }
         pub fn retain_for_recovery(&mut self) {}
         pub fn sample(&self) -> io::Result<Sample> {
             super::count("posture")?;
+            if std::path::Path::new("/run/minibookx-ctl/fail-posture").exists() {
+                return Err(io::Error::other("injected posture read failure"));
+            }
             if std::path::Path::new("/run/minibookx-ctl/posture-rotated").exists() {
                 // Same hinge angle after rotating both gravity vectors.
                 return Ok(Sample {

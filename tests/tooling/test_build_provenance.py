@@ -164,6 +164,19 @@ else:
                 self.assertEqual(environment['DBUS_1_STATIC'], '1')
                 self.assertEqual(environment['PKG_CONFIG_ALLOW_CROSS'], '1')
                 self.assertIn('target-feature=+crt-static', environment['RUSTFLAGS'])
+            self.assertIn('--features', calls[3][1])
+            self.assertIn('systemd-test-fixture', calls[3][1])
+
+            log.unlink()
+            result = subprocess.run(['/bin/sh', str(driver), '--fixture'], env=env,
+                                    text=True, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertEqual([call[0] for call in calls], ['python3', 'cargo', 'python3'])
+            self.assertIn('--features', calls[1][1])
+            self.assertIn('systemd-test-fixture', calls[1][1])
+            self.assertEqual(calls[1][1][-2:], ['--bin', 'minibookx-systemd-fixture'])
+            self.assertTrue(calls[2][1][-1].endswith('/minibookx-systemd-fixture'))
 
 
 if __name__ == "__main__":

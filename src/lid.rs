@@ -192,26 +192,36 @@ fn candidate(paths: &[PathBuf]) -> io::Result<&Path> {
     }
 }
 
+/// Unidentified hotplug entries may vanish while sysfs is being scanned. Once
+/// an entry names the lid, failures stay visible rather than hiding that source.
+fn discover_paths(input: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(input)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name
+            .strip_prefix("event")
+            .is_some_and(|s| !s.is_empty() && s.bytes().all(|v| v.is_ascii_digit()))
+        {
+            continue;
+        }
+        let device = entry.path().join("device");
+        let identity = match fs::read_to_string(device.join("name")) {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if identity.trim() == NAME && fs::read_to_string(device.join("phys"))?.trim() == PHYS {
+            candidates.push(Path::new("/dev/input").join(name));
+        }
+    }
+    Ok(candidates)
+}
+
 impl Lid {
     pub fn discover() -> io::Result<Self> {
-        let mut candidates = Vec::new();
-        for entry in fs::read_dir("/sys/class/input")? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if !name
-                .strip_prefix("event")
-                .is_some_and(|s| !s.is_empty() && s.bytes().all(|v| v.is_ascii_digit()))
-            {
-                continue;
-            }
-            let device = entry.path().join("device");
-            if fs::read_to_string(device.join("name"))?.trim() == NAME
-                && fs::read_to_string(device.join("phys"))?.trim() == PHYS
-            {
-                candidates.push(Path::new("/dev/input").join(name));
-            }
-        }
+        let candidates = discover_paths(Path::new("/sys/class/input"))?;
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
@@ -251,7 +261,33 @@ impl Lid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
+    use std::{collections::VecDeque, os::unix::fs::symlink};
+
+    struct InputTree(PathBuf);
+    impl InputTree {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "minibookx-lid-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+        fn device(&self, event: &str, name: &str) -> PathBuf {
+            let device = self.0.join(event).join("device");
+            fs::create_dir_all(&device).unwrap();
+            fs::write(device.join("name"), name).unwrap();
+            device
+        }
+    }
+    impl Drop for InputTree {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
 
     #[derive(Default)]
     struct Fake {
@@ -440,6 +476,47 @@ mod tests {
         let paths = [PathBuf::from("/dev/input/event72")];
         assert_eq!(candidate(&paths).unwrap(), paths[0]);
         assert!(candidate(&[paths[0].clone(), PathBuf::from("/dev/input/event3")]).is_err());
+    }
+
+    #[test]
+    fn vanished_unidentified_devices_do_not_hide_a_lid_or_change_missing_to_open() {
+        let tree = InputTree::new();
+        let removed = tree.device("event0", "USB keyboard");
+        fs::remove_dir_all(removed).unwrap();
+        // sysfs entries can also remain as dangling links after removal.
+        symlink(tree.0.join("removed"), tree.0.join("event8")).unwrap();
+        tree.device("event2", "USB mouse"); // No phys read for unrelated input.
+        let paths = discover_paths(&tree.0).unwrap();
+        assert_eq!(
+            candidate(&paths).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        let lid = tree.device("event72", NAME);
+        fs::write(lid.join("phys"), PHYS).unwrap();
+        assert_eq!(
+            discover_paths(&tree.0).unwrap(),
+            [PathBuf::from("/dev/input/event72")]
+        );
+    }
+
+    #[test]
+    fn identified_lid_failures_and_unreadable_identity_remain_errors() {
+        let tree = InputTree::new();
+        let lid = tree.device("event72", NAME);
+        assert_eq!(
+            discover_paths(&tree.0).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        fs::write(lid.join("phys"), PHYS).unwrap();
+        let other = tree.device("event3", "USB keyboard");
+        fs::write(other.join("name"), [0xff]).unwrap();
+        assert_eq!(
+            discover_paths(&tree.0).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        fs::write(other.join("name"), NAME).unwrap();
+        fs::write(other.join("phys"), PHYS).unwrap();
+        assert!(candidate(&discover_paths(&tree.0).unwrap()).is_err());
     }
 
     #[test]

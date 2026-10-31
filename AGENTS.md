@@ -49,6 +49,7 @@ make check                 # Rust format/lints/tests, Python tests, unit verific
 make format                # rustfmt; documentation remains ordinary Markdown
 make static                # rootless static musl build, pinned libdbus source
 make static-test           # also run musl tests
+make systemd-fixture       # separate static executable for the systemd VM
 make package               # requires a clean checkout and matching build provenance
 make verify-release        # verify dist/ against the current source commit
 make distros               # disposable OS/package/installer checks
@@ -73,8 +74,11 @@ Keep register maps, field semantics and test evidence in `docs/reference/` or
 Personal choices such as quiet boot, timeout and menu colors are optional tips,
 never required setup steps. Keep the installation path readable without the
 technical references; do not repeat defensive implementation details at every step.
-Keep observations, inferences and unknowns separate. Do not label downstream
-hardware tests as upstream-kernel tests or old development tests as new passes.
+Keep observations, inferences and unknowns separate. Document support and limits
+without embedding personal test logs, build hashes or run chronology in user
+guides. Retain firmware identity where register/code addresses depend on it.
+Do not label downstream hardware tests as upstream-kernel tests or old
+development tests as new passes.
 Container checks cover runtime prerequisites, read-only reports, staged updates
 and account/config validation with mocked service control. Graphics checks use
 repository metadata and solver-only transactions, without installing GPU packages
@@ -89,6 +93,11 @@ before its final commit. Follow the canonical
 [release procedure](docs/development/maintenance.md#release-files-and-versions)
 for commit/tag naming, build identity and publication checks. Never relabel an
 old binary or reuse a published version for different source.
+
+Normal pushes and PRs run CI without publishing; do not use CI-skip commit
+markers. Publishing requires an explicit manual run on main with `publish=true`
+after the version bump. Native/musl fixture checks, the systemd VM and all
+distribution suites must pass before publication.
 
 History rewrites and removal of public release artifacts require an explicit
 human request; normal releases preserve earlier versions. Keep release

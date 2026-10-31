@@ -25,80 +25,43 @@ service checks the hardware profile before enabling control.
 A matching laptop name or EC chip is not enough: register behavior also depends
 on firmware. Do not bypass the profile check to use another revision.
 
-## Tested software
+## Software requirements
 
-The clean-OS setup was checked on 22 October 2026 with these packages.
+Physical checks used CachyOS with GNOME on Wayland and the packaged i915 driver.
+Other distributions and desktops have not been tested on the laptop.
 
-| Component | Version |
+| Component | Requirement |
 |---|---|
-| Distribution | CachyOS |
-| Kernel | `7.2.11-1-cachyos` |
-| Desktop | GNOME 51.1, Wayland |
-| Compositor | Mutter `51.1-1` from the enabled `extra` repository |
-| Mesa / Intel Vulkan | 26.2.4 |
-| VA-API | libva 2.24.1, intel-media-driver 26.3.5 |
-| Intel firmware package | `linux-firmware-intel 20260916` |
-| Bootloader | Limine 12.9.3 |
-| Kernel-entry integration | limine-mkinitcpio-hook 1.40.0 |
-| Service manager | systemd 262.1 |
+| Service | x86_64 Linux, systemd and system D-Bus; [runtime packages](../guide/install.md#packages) |
+| Hardware access | Supported [kernel interfaces](../reference/kernel-support.md) |
+| GNOME | Wayland, `iio-sensor-proxy`, and Mutter with the unfolding-orientation fix; [desktop setup](../guide/tablet-mode.md#gnome) |
+| Display and bootloader | Separate [display](../guide/display.md) and [orientation](../guide/boot.md) settings; independent of controller installation |
 
-## Hardware qualification
+## Features and limits
 
-The following supervised checks used a completely reinstalled CachyOS/GNOME
-system on 22 October 2026. Public `install.sh` installed controller build
-`0.1.0+gb1a8bccb67d0`; its binary matched the published checksum. The
-[user guides](../README.md#user-guides) cover the separate desktop, display and
-boot configuration steps.
+The table summarizes physical checks on this unit, not qualification of every
+release or firmware version. Repeat the
+[post-update checks](../development/maintenance.md#after-kernel-bios-or-firmware-updates)
+after relevant changes. Container and VM tests have
+[different scopes](../development/maintenance.md#evidence-boundaries).
 
-The runtime implementation is retained for v0.1.1. These are physical results
-for the recorded build, not a new hardware test of the repackaged binary.
-Container and VM results remain [separate evidence](../development/maintenance.md#evidence-boundaries).
-
-| Check | Result |
+| Feature | Supported behavior and limits |
 |---|---|
-| Public installation | Public bootstrap installed the fixed build and enabled one service; locked account and default Balance verified; config and manual boot/display files preserved byte-for-byte on update |
-| Privilege separation | Worker has no effective capabilities, supplementary groups or raw EC/I2C/uinput descriptors; `NoNewPrivs` is enabled |
-| Base-sensor initialization | Starts from CONTROL `01`, wakes to `00` automatically; stopping restores `01` and clears ownership records; starting again detects folded posture |
-| Native display setup | Unmodified packaged kernel/i915; 1200×1920 at 165920 kHz / approximately 60 Hz, RGB888 / 24 bpp; ordinary mkinitcpio inclusion and generated Limine entries |
-| Panel mounting and boot menu | Correct panel mounting and Mutter 51.1; native 90° Limine menu without stretching |
-| Cold power-off/button start | Service starts automatically; clean, correctly oriented login screen before any sleep |
-| Ordinary laptop and approximately flat | Built-in keyboard and touchpad remain usable near 180°; the estimate is not a calibrated hinge measurement |
-| Tent and folded tablet | Built-in input is inhibited; touchscreen, folded landscape/portrait rotation and on-screen keyboard work |
-| Stop and restart while folded | Physical input returns on stop and is inhibited again after start |
-| Unfolding | Normal laptop orientation, keyboard and touchpad return |
-| Fan activation and release | 35% requested PWM gives plausible tachometer feedback and quiet, steady rotation; original Balance restored exactly and fan stops at cool idle |
-| Deep/S3 suspend and automatic wake | About 28 seconds suspended; same broker PID and no restart; folded touch/OSK/input, 60 Hz output and subsequent unfolding work |
-| Existing CPU power policy | Package RAPL and MMIO stay at PL1/PL2 12/15 W with unchanged windows; `power_control = false`, no override baseline or power lease |
-
-After S3, tablet mode returned about 1.06 seconds after the kernel's resume exit,
-including sensor startup and stable-pose confirmation. A transitional OFF sample
-does not establish a failed resume. This timing is one observation, not a
-latency guarantee.
-
-The LTS 50 Hz profile's arguments, images and hashes were checked, but that LTS
-boot was not physically repeated in this session. The owner's optional quiet
-black menu with a one-second timeout passed a cold boot; Esc was not separately
-pressed in that final window. These appearance choices are not prerequisites. The
-`fan_control = false` startup path, RAPL overrides, raised limits and all
-high-temperature fan stages remain outside this physical qualification.
-
-## Compatibility notes
-
-| Feature | Status |
-|---|---|
-| Fan profiles | Supported; higher-temperature stages have not all been load-tested |
-| Tablet input and GNOME on-screen keyboard | Supported; see [tablet mode](../guide/tablet-mode.md) |
-| Deep/S3 suspend | Supported; fan control returns to firmware before sleep |
-| Display fixes | Separate manual setup; see the [display guide](../guide/display.md) |
-| PL1/PL2 control | Optional; disabled by default. Existing-policy preservation is checked above; live overrides/restoration and raised limits remain untested on the hardware |
+| Fan control | Cool idle, 35% PWM, tachometer feedback and return to firmware checked; higher-temperature stages have not all been load-tested |
+| Tablet input | Laptop/flat positions keep input active; tent/folded positions inhibit built-in input; stopping restores it |
+| GNOME rotation and on-screen keyboard | Folded landscape/portrait use and normal orientation after unfolding checked; see [tablet mode](../guide/tablet-mode.md) |
+| Base-sensor initialization | Wakes the supported powered-down sensor and restores its original state on stop |
+| Deep/S3 suspend | Input, sensor detection and display work after resume; firmware controls the fan during sleep |
+| Display | Stock-driver 60 Hz cold start and resume checked on this panel; rated maximum unknown; 70 Hz produces corruption |
+| PL1/PL2 control | Disabled by default; BIOS policy preservation checked. Live overrides, restoration and raised limits remain untested on hardware |
+| `fan_control = false` | Covered by software/VM tests; not physically qualified |
 | PL4, voltage and GPU-frequency control | Not implemented |
 | Battery charge limit | Not implemented; see [battery and charging](charging.md) |
 | Keyboard-backlight brightness/timeout | No Linux setter in this utility; see [BIOS settings](bios.md) |
 
 Suspend can log `xHC error in resume, USBSTS 0x401, Reinit` for USB controller
 `0000:00:0d.0`. The controller reinitializes; this is separate from the DSI display
-issue. Physical operation on other distributions and desktop environments has
-not been tested; package/container checks are listed separately in
+issue. Package/container checks are listed separately in the
 [distribution test matrix](../development/maintenance.md#distribution-matrix).
 
 ## Firmware and controllers

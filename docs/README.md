@@ -10,7 +10,7 @@ desktop and bootloader changes are manual.
 |---|---|
 | Install, update or remove the utility | [Installation](guide/install.md) |
 | Change fan behavior or CPU power limits | [Configuration](guide/configuration.md) |
-| Use the laptop as a tablet | [Tablet mode and GNOME](guide/tablet-mode.md) |
+| Use the laptop as a tablet | [Tablet mode and desktop setup](guide/tablet-mode.md) |
 | Try 60 Hz or fix startup display corruption | [Display setup](guide/display.md) |
 | Correct screen, console or boot-menu orientation | [Boot settings](guide/boot.md) |
 | Check Intel video acceleration and packages | [Graphics](guide/graphics.md) |
@@ -30,7 +30,7 @@ You do not need to read these to use the controller.
 | [Configuration keys](reference/configuration.md) | Accepted values, timers and power-limit semantics |
 | [Diagnostic fields](reference/diagnostics.md) | Status records, readback and their limits |
 | [Kernel requirements](reference/kernel-support.md) | EC access, driver availability and debugfs |
-| [Hardware](hardware/README.md) | Tested revision and software, physical test results, BIOS, EC and charging |
+| [Hardware](hardware/README.md) | Supported revision, requirements, feature limits, BIOS, EC and charging |
 | [Panel](hardware/panel.md) | Timings, VBT, i915 readiness, GuC/HuC and FBC |
 | [Posture sensors](hardware/tablet-sensors.md) | Detection, ambiguous positions and sensor initialization |
 

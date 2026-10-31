@@ -100,7 +100,7 @@ clamp. No lease/heartbeat or independent emergency fan takeover was established
 in that path. The bounded host backend and its independent checks are therefore
 necessary; CPU thermal throttling does not prove an EC fan takeover.
 The accepted 35% start duty and manual/automatic transition were checked on the
-laptop; [hardware qualification](README.md#hardware-qualification) records
+laptop; [features and limits](README.md#features-and-limits) describe
 that physical scope separately from static analysis.
 
 Host temperature `0x70` comes from CPU PECI GetTemp: CODE `0xA345` calls `0xE933`,

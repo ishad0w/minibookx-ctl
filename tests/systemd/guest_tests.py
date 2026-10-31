@@ -205,6 +205,51 @@ def independent_thermal_guard():
     print("VM_ASSERT PASS independent thermal deadline with stopped worker", flush=True)
 
 
+def release_with_stalled_guardian(target):
+    start()
+    main = int(props()["MainPID"])
+    policy = worker(main)
+    children = Path(f"/proc/{main}/task/{main}/children").read_text().split()
+    guardian = next(int(pid) for pid in children if int(pid) != policy)
+    restores = reads(main, "sensor-restore")
+    os.kill(guardian, signal.SIGSTOP)
+    try:
+        wait_for(
+            lambda: "\nState:\tT" in Path(f"/proc/{guardian}/status").read_text(),
+            "guardian did not stop",
+        )
+        # Worker TERM exercises Restore, the same request used before sleep.
+        # None of these paths signals the guardian before the observation.
+        if target == "sensor":
+            (ROOT / "fail-posture").touch()
+        else:
+            os.kill(main if target == "broker" else policy, signal.SIGTERM)
+        wait_for(lambda: not EC.read_bytes()[0x4F] & 0x40, "fan stayed manual")
+        # A fan return after killing the guardian is too late. It must happen
+        # while that child is still stopped, before OFF/exit can be confirmed.
+        assert "\nState:\tT" in Path(f"/proc/{guardian}/status").read_text()
+        assert reads(main, "sensor-restore") == restores
+        os.kill(guardian, signal.SIGCONT)
+        if target == "sensor":
+            wait_for(lambda: props()["MainPID"] != str(main), "sensor fault did not stop broker")
+        else:
+            wait_for(lambda: props()["ActiveState"] == "inactive", "clean release did not finish")
+    finally:
+        (ROOT / "fail-posture").unlink(missing_ok=True)
+        try:
+            os.kill(guardian, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
+        command("systemctl", "stop", UNIT)
+        if target == "sensor":
+            # stop may already have collected the inactive unit. Recovery is
+            # still verified below; reset-failed need not find a loaded unit.
+            command("systemctl", "reset-failed", UNIT, check=False)
+    stopped()
+    assert reads(main, "sensor-restore") > restores
+    print(f"VM_ASSERT PASS {target} release: fan auto precedes guardian; sensor waits for OFF", flush=True)
+
+
 def fanless():
     original = CONFIG.read_text()
     assert "fan_control = true" in original
@@ -352,6 +397,9 @@ def run():
     command("systemctl", "stop", UNIT)
     stopped()
     print("VM_ASSERT PASS stop, ExecStopPost, fan auto, tablet OFF", flush=True)
+    release_with_stalled_guardian("broker")
+    release_with_stalled_guardian("worker")
+    release_with_stalled_guardian("sensor")
     independent_thermal_guard()
     fail_and_restart("worker SIGKILL", "worker", signal.SIGKILL)
     fail_and_restart("broker SIGKILL", "broker", signal.SIGKILL)

@@ -172,7 +172,7 @@ daemon's tablet backend disabled.
 
 Screen Rotation Policy affects preboot presentation separately from Linux panel
 orientation. It cannot repair i915 link-readiness failures or the
-[Mutter rotation bug](../guide/tablet-mode.md#setup).
+[Mutter rotation bug](../guide/tablet-mode.md#gnome).
 
 GPU frequency is independent of panel refresh rate. LCD-type entries include
 generic LVDS modes and should not be selected as experimental DSI timings.

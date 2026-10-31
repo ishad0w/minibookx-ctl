@@ -40,8 +40,9 @@ CC_x86_64_unknown_linux_musl=/absolute/path/to/compiler-wrapper \
 | Command | Purpose |
 |---|---|
 | `make format` | Format Rust source |
-| `make check` | Formatting, Clippy, Rust/Python tests, unit checks, documentation links and ShellCheck |
-| `make static-test` | Build, verify and test the static musl executable |
+| `make check` | Formatting, Clippy, Rust/Python tests including the VM fixture, unit checks, documentation links and ShellCheck |
+| `make static-test` | Build and verify the static executable; run Rust tests including the fixture under musl |
+| `make systemd-fixture` | Build and verify the separate static VM executable |
 | `make distros` | Check prerequisites, package advice and staged/mocked-service installation in seven images across five distributions |
 | `make package` | Package a clean commit and its matching static build into `dist/` |
 | `make verify-release` | Check release assets against the current source commit |
@@ -67,41 +68,40 @@ than the production `hardware.rs` implementation. The shipped
 systemd unit runs under real PID 1. The feature-gated fixture is not part of a
 normal/release executable and refuses a host without its QEMU identity.
 
-Prerequisites are Docker, QEMU and a compatible prebuilt x86_64 guest kernel.
-The kernel needs initramfs/gzip, serial console, namespaces, cgroups, seccomp,
-proc/sysfs and the virtual devices required for systemd. KVM is the normal
-accelerator; `--accel tcg` is available when KVM is unavailable. No host unit or
-physical device is changed; the guest has no disk or network.
+Prerequisites are Docker, QEMU and the static-build tools above. The Dockerfile
+provides a Debian root filesystem and a prebuilt kernel from Debian's package
+repository. KVM is the normal accelerator; `--accel tcg` is available when KVM
+is unavailable. No host unit or physical device is changed; the guest has no
+disk or network.
 
-After the normal static build prepares libdbus, build the fixture with the same
-static inputs:
+Build the fixture and guest, then run the suite in a fresh temporary directory:
 
 ```sh
-PKG_CONFIG_LIBDIR="$PWD/target/native/libdbus-musl/lib/pkgconfig" \
-PKG_CONFIG_PATH='' PKG_CONFIG_ALLOW_CROSS=1 DBUS_1_STATIC=1 \
-CC_x86_64_unknown_linux_musl=musl-gcc \
-RUSTFLAGS='-C target-feature=+crt-static' \
-  cargo build --locked --release --target x86_64-unknown-linux-musl \
-  --features systemd-test-fixture --bin minibookx-systemd-fixture
-docker build -t minibookx-systemd-test -f tests/systemd/Dockerfile .
+make systemd-fixture
+docker build -t minibookx-systemd-test - < tests/systemd/Dockerfile
+task_vm_dir=$(mktemp -d -t minibookx-systemd.XXXXXX)
 vm_container=$(docker create minibookx-systemd-test)
-docker export --output systemd-rootfs.tar "$vm_container"
+docker export --output "$task_vm_dir/rootfs.tar" "$vm_container"
 docker rm "$vm_container"
+tar -xOf "$task_vm_dir/rootfs.tar" boot/vmlinuz > "$task_vm_dir/vmlinuz"
 python3 tests/systemd/run_vm.py \
-  --kernel /absolute/path/to/prebuilt-guest-bzImage \
-  --rootfs systemd-rootfs.tar \
+  --kernel "$task_vm_dir/vmlinuz" \
+  --rootfs "$task_vm_dir/rootfs.tar" \
   --fixture target/x86_64-unknown-linux-musl/release/minibookx-systemd-fixture \
-  --output /absolute/path/to/new-vm-results
+  --output "$task_vm_dir/results"
 ```
 
-Use your compiler wrapper instead of `musl-gcc` when applicable. Replace both
-absolute paths; the result directory must not exist. A failed export needs
-cleanup with `docker rm` for the container just created. Review `result.json`
-and `serial.log`; a pass requires the guest assertions and successful VM exit.
+Use `CC_x86_64_unknown_linux_musl` with `make systemd-fixture` if using a compiler
+wrapper. A failed export needs cleanup with `docker rm` for the container just
+created. Review `results/result.json` and `results/serial.log` inside
+`$task_vm_dir`; a pass requires the guest assertions and successful VM exit.
 
 The suite checks start/stop/restart, the sandbox and privilege drop, real logind
 authorization, worker/broker loss, systemd watchdog handling, `ExecStopPost`,
 tablet OFF and recovery-record retention after an injected restoration fault.
+Stalled-guardian scenarios cover final cleanup, the pre-sleep Restore request
+and sensor failure: cooling returns to firmware before waiting for OFF, while
+sensor restoration waits for confirmation.
 Fan-disabled cases start without debugfs, EC or CPU-temperature files, exercise
 profile reload and reject a changed startup flag. A guest-only fake debugfs
 source checks late EC-file creation through the unit's real private bind.
@@ -126,16 +126,8 @@ after relevant changes; it does not qualify a new build on the physical laptop.
 | QEMU with systemd PID 1 | Real process supervision, sandbox/logind and lifecycle against a file-only hardware session/recovery model |
 | Documented U300 observations | Physical behavior of the recorded software/device combination only |
 
-The current physical-check scope is recorded once in the
-[hardware qualification table](../hardware/README.md#hardware-qualification).
-It distinguishes a controller reinstall from a clean OS installation and
-existing power-policy preservation from untested RAPL overrides.
-
-Native firmware-inclusion mechanisms were checked with synthetic file data:
-mkinitcpio on Arch and dracut on Fedora produced images containing the file;
-Debian's initramfs-tools `copy_file` helper preserved its bytes in the merged-usr
-image layout. These checks validate inclusion mechanics, not panel timings or a
-physical boot through every distribution's loader.
+Physical support and its limits are summarized in the
+[hardware reference](../hardware/README.md#features-and-limits).
 
 The disposable CachyOS container disables its pacman's nested network-namespace
 sandbox so package hooks can run under Docker's restricted capabilities.
@@ -144,8 +136,8 @@ setting is never installed on a user's system.
 
 Re-run the relevant checks after material changes. A VM pass does not qualify a
 new binary on the laptop, and older physical results do not become tests of the
-current checkout. A clean-OS hardware installation and live RAPL write/restore
-under the current unit remain separate qualifications.
+current checkout. Live RAPL writes and physical operation under a new unit
+remain separate qualifications.
 
 ### Distribution matrix
 
@@ -211,21 +203,41 @@ Python release tooling is not part of installation. The bootstrap resolves
 `latest` once, validates that it names a tag in this repository, and downloads
 that tag's executable and checksums.
 
-Pull requests run checks without publishing. Main-branch builds publish only
-after the native checks, static build/tests, release validation and seven
-container suites pass. The [distribution matrix](#distribution-matrix)
-lists their versions and scope. Every push to `main` is a release candidate;
-bump the patch version before pushing it. Published versions are immutable:
+Pushes to `main`, pull requests and manual runs execute checks without publishing
+by default. Do not use CI-skip commit markers for documentation or code changes.
+The systemd VM runs alongside the seven container suites after the checked
+artifacts are ready. The [distribution matrix](#distribution-matrix) lists the
+container versions and scope.
+
+To publish, bump the patch version, commit the release and push it to `main`.
+Then run **Check, build and release** on `main` with its **publish** checkbox
+enabled, or use:
+
+```sh
+gh workflow run ci.yml --ref main -f publish=true
+```
+
+That run repeats all checks and publishes only if native checks, static tests,
+artifact validation, the VM and all container suites pass. Ordinary commits do
+not require a version bump; `main` may contain unreleased changes. The public
+installer downloads the latest published release and preserves existing config.
+
+Published versions are immutable:
 retrying the exact same build can verify and resume it, but a different commit
 cannot reuse its tag or replace its assets. A new release must use a new version.
 
 ```mermaid
 flowchart LR
-    C[Commit on main] --> T[Native checks and tests]
+    C[Push, PR or manual run] --> T[Native checks including fixture]
     T --> B[Static executable and tests]
     B --> P[Five validated release assets]
+    B --> F[Separate VM fixture]
     P --> D[Runtime, package advice and install checks in seven images]
-    D --> R[Versioned release for this commit]
+    F --> V[systemd VM]
+    D --> G[All checks passed]
+    V --> G
+    G --> M{Explicit publish on main?}
+    M -->|Yes| R[Versioned release for this commit]
 ```
 
 The source archive records its compiler in `BUILD-TOOLCHAIN.txt`. Future stable

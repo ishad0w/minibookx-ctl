@@ -48,7 +48,7 @@ not change panel timings, boot settings or distribution packages.
 
 ## Hardware notes
 
-[Hardware and test results](docs/hardware/README.md) ·
+[Hardware and limitations](docs/hardware/README.md) ·
 [BIOS options](docs/hardware/bios.md) ·
 [Embedded controller](docs/hardware/ec.md) ·
 [Charging](docs/hardware/charging.md)

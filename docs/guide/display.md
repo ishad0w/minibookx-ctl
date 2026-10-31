@@ -215,4 +215,4 @@ VBT override if you want it to retain 50 Hz.
 
 The [panel reference](../hardware/panel.md) has timing calculations, source
 references and the limits of the tests. Physical qualification remains limited
-to [one U300](../hardware/README.md#hardware-qualification).
+to [one U300](../hardware/README.md#features-and-limits).

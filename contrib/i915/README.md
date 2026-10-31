@@ -91,8 +91,8 @@ modinfo -p "$module"
 A failed patch application needs source review. Confirm target identity, symbol
 versions, the new parameter and required module signature. Vermagic alone is
 insufficient. Use the trusted signing process; disabling Secure Boot is not an
-installation step. An older downstream six-job module build took about 109
-seconds on the U300; this is neither a build result for the RFC nor a guarantee.
+installation step. Build time depends on the kernel source, configuration and
+available resources.
 
 ### 3. Install a separate override and regenerate the actual boot image
 

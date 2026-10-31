@@ -2,7 +2,6 @@
 """Exercise the piped bootstrap without network, privilege or host installation."""
 # SPDX-License-Identifier: Apache-2.0
 import hashlib
-import json
 import os
 from pathlib import Path
 import subprocess

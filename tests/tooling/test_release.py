@@ -2,6 +2,7 @@
 """Release trust-boundary fixtures. No network, credentials or real publishing."""
 # SPDX-License-Identifier: Apache-2.0
 from pathlib import Path
+import os
 import tarfile
 import tempfile
 import unittest
@@ -83,6 +84,31 @@ class PublicationTests(unittest.TestCase):
         self.metadata = {"tag": self.tag, "binary_version": "0.1.1+g" + self.commit[:12]}
         self.names = ["SHA256SUMS", "build-metadata.json", "binary.tar.gz", "sources.tar.gz"]
         self.calls = []
+
+    def test_only_explicit_dispatch_for_this_main_commit_can_publish(self):
+        allowed = {
+            "GITHUB_EVENT_NAME": "workflow_dispatch",
+            "GITHUB_REF": "refs/heads/main",
+            "GITHUB_REPOSITORY": publish.REPO,
+            "GITHUB_SHA": self.commit,
+            "MINIBOOKX_PUBLISH": "true",
+        }
+        args = ['publish_release.py', '--commit', self.commit]
+        with mock.patch('sys.argv', args), mock.patch.object(publish, 'publish') as publish_build:
+            for key, value in (
+                ('GITHUB_EVENT_NAME', 'push'), ('GITHUB_EVENT_NAME', 'pull_request'),
+                ('GITHUB_REF', 'refs/heads/other'), ('GITHUB_REPOSITORY', 'other/repo'),
+                ('GITHUB_SHA', 'b' * 40), ('MINIBOOKX_PUBLISH', ''),
+                ('MINIBOOKX_PUBLISH', 'false'),
+            ):
+                with self.subTest(key=key, value=value), \
+                     mock.patch.dict(os.environ, dict(allowed, **{key: value}), clear=True), \
+                     self.assertRaisesRegex(ValueError, 'explicit workflow dispatch'):
+                    publish.main()
+                publish_build.assert_not_called()
+            with mock.patch.dict(os.environ, allowed, clear=True):
+                publish.main()
+            publish_build.assert_called_once_with(Path('dist').resolve(), self.commit)
 
     def test_repository_request_has_no_trailing_slash_that_github_rejects(self):
         result = SimpleNamespace(returncode=0, stdout='{"default_branch":"main"}', stderr="")

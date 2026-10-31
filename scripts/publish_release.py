@@ -91,7 +91,7 @@ def publish(folder, commit):
     tag = metadata["tag"]
     repository = api("")
     if repository.get("default_branch") != "main":
-        raise ValueError("automatic publication requires main as the default branch")
+        raise ValueError("publication requires main as the default branch")
     reference = api("git/ref/tags/" + tag, missing=True)
     if reference is None:
         api("git/refs", {"ref": "refs/tags/" + tag, "sha": commit})
@@ -133,11 +133,12 @@ def main():
     parser.add_argument("--directory", type=Path, default=Path("dist"))
     parser.add_argument("--commit", required=True)
     args = parser.parse_args()
-    if (os.environ.get("GITHUB_EVENT_NAME") not in ("push", "workflow_dispatch") or
+    if (os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch" or
+            os.environ.get("MINIBOOKX_PUBLISH") != "true" or
             os.environ.get("GITHUB_REF") != "refs/heads/main" or
             os.environ.get("GITHUB_REPOSITORY") != REPO or
             os.environ.get("GITHUB_SHA") != args.commit):
-        raise ValueError("automatic publication is restricted to this repository's main branch")
+        raise ValueError("publication requires explicit workflow dispatch on this repository's main branch")
     publish(args.directory.resolve(), args.commit)
 
 

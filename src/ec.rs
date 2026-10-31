@@ -8,6 +8,12 @@ use std::{
 pub const MANUAL: u8 = 0x40;
 pub const MAX_RAW: u8 = 74;
 pub const MIN_RAW: u8 = 32;
+pub const PWM_PERIOD: u8 = 91;
+pub const PWM_COUNTS: u16 = PWM_PERIOD as u16 + 1;
+
+pub fn raw_percent(raw: u8) -> f64 {
+    f64::from(raw) / f64::from(PWM_COUNTS) * 100.
+}
 
 pub trait EcIo {
     fn read(&self, register: u8) -> io::Result<u8>;
@@ -70,7 +76,7 @@ impl<T: EcIo> Fan<T> {
         }
     }
     pub fn baseline(&self) -> io::Result<()> {
-        if self.io.read(0x4a)? != 91 {
+        if self.io.read(0x4a)? != PWM_PERIOD {
             return Err(io::Error::other("unsupported PWM period"));
         }
         if self.io.read(0x4f)? & MANUAL != 0 {
@@ -125,7 +131,7 @@ impl<T: EcIo> Fan<T> {
         Ok(true)
     }
     pub fn verify(&self) -> io::Result<()> {
-        if self.io.read(0x4a)? != 91 || self.io.read(0x4f)? & MANUAL == 0 {
+        if self.io.read(0x4a)? != PWM_PERIOD || self.io.read(0x4f)? & MANUAL == 0 {
             return Err(io::Error::other("EC mode or period changed"));
         }
         if self

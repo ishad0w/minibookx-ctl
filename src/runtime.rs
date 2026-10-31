@@ -92,7 +92,7 @@ impl State {
             "target_pwm_percent": self.fan_control.then_some(target),
             // Compatibility keys: these are the last broker-acknowledged values.
             "policy_applied_raw": (self.fan_control && !self.paused).then_some(self.applied),
-            "policy_applied_pwm_percent": (self.fan_control && !self.paused).then_some(f64::from(self.applied) / 92. * 100.),
+            "policy_applied_pwm_percent": (self.fan_control && !self.paused).then_some(crate::ec::raw_percent(self.applied)),
             "broker_emergency": self.broker_emergency,
             "fan_speed_ec": self.last_rpm,
             "broker_tach_state": self.tach_state.as_str(),
@@ -227,7 +227,7 @@ impl State {
                     f64::from(cpu) / 1000.,
                     decision.pwm_percent,
                     self.applied,
-                    f64::from(self.applied) / 92. * 100.,
+                    crate::ec::raw_percent(self.applied),
                     self.broker_emergency,
                     self.writes
                 );
@@ -305,14 +305,6 @@ fn validate_startup_mode(accepted: bool, requested: bool) -> io::Result<()> {
     }
     Ok(())
 }
-impl Drop for State {
-    fn drop(&mut self) {
-        if let Err(e) = self.session.fan.restore() {
-            eprintln!("auto restore on shutdown failed: {e}");
-        }
-        self.inhibitor.take();
-    }
-}
 fn pollfd(fd: RawFd, events: i16) -> libc::pollfd {
     libc::pollfd {
         fd,
@@ -321,12 +313,7 @@ fn pollfd(fd: RawFd, events: i16) -> libc::pollfd {
     }
 }
 fn timeout_ms(deadline: Instant, now: Instant) -> i32 {
-    // Round up rather than busy-spin for the last fractional millisecond.
-    deadline
-        .saturating_duration_since(now)
-        .as_nanos()
-        .div_ceil(1_000_000)
-        .min(i32::MAX as u128) as i32
+    sd::poll_timeout(deadline.saturating_duration_since(now))
 }
 fn event_loop(
     state: &mut State,
@@ -416,10 +403,10 @@ pub fn run(loaded: Loaded, config_path: Option<PathBuf>) -> io::Result<()> {
         fan_control,
     } = loaded;
     config.validate_for_hardware().map_err(io::Error::other)?;
-    // Block before acquiring any hardware session. Drop order restores hardware
-    // before the original signal mask is restored at function exit.
-    let signals =
-        sd::Signals::new().map_err(|e| sd::context("initialize policy signal source", e))?;
+    // Block before acquiring any hardware session and keep that mask until the
+    // policy child's _exit, including while its restoration destructors run.
+    let signals = sd::Signals::for_process()
+        .map_err(|e| sd::context("initialize policy signal source", e))?;
     let watch = config_path
         .as_deref()
         .map(sd::ConfigWatch::new)
@@ -506,7 +493,8 @@ pub fn run(loaded: Loaded, config_path: Option<PathBuf>) -> io::Result<()> {
     if let Err(e) = &result {
         eprintln!("controller failure: {e}");
     }
-    // State's Drop returns to firmware on all errors and ordinary shutdown.
+    // The proxy's drop requests release on errors; broker cleanup independently
+    // restores every domain when this worker exits or loses its private channel.
     result
 }
 

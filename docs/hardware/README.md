@@ -47,7 +47,7 @@ after relevant changes. Container and VM tests have
 
 | Feature | Supported behavior and limits |
 |---|---|
-| Fan control | Cool idle, 35% PWM, tachometer feedback and return to firmware checked; higher-temperature stages have not all been load-tested |
+| Fan control | Idle, sustained moderate load at 35–40% PWM, warm restart, tachometer feedback and return to firmware checked; higher-temperature stages and hot resume remain unqualified |
 | Tablet input | Laptop/flat positions keep input active; tent/folded positions inhibit built-in input; stopping restores it |
 | GNOME rotation and on-screen keyboard | Folded landscape/portrait use and normal orientation after unfolding checked; see [tablet mode](../guide/tablet-mode.md) |
 | Base-sensor initialization | Wakes the supported powered-down sensor and restores its original state on stop |

@@ -1,5 +1,5 @@
 //! Optional graphics package advice; no renderer or raw-device probes.
-use super::{Missing, Sources, clean, field, note, section, text, warning};
+use super::{Missing, OsRelease, Sources, clean, field, note, section, text, warning};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
@@ -45,53 +45,7 @@ const PACKAGES: &[&str] = &[
     "gstreamer1-plugin-openh264",
 ];
 
-#[derive(Debug, PartialEq, Eq)]
-struct Os {
-    id: String,
-    version: String,
-    like: String,
-}
-
-fn parse_os(input: &str) -> Result<Os, Missing> {
-    let mut values = BTreeMap::new();
-    for line in input.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if !["ID", "VERSION_ID", "ID_LIKE"].contains(&key) {
-            continue;
-        }
-        let value = value.trim();
-        let value = match value.as_bytes().first() {
-            Some(b'\"') if value.ends_with('\"') && value.len() >= 2 => &value[1..value.len() - 1],
-            Some(b'\'') if value.ends_with('\'') && value.len() >= 2 => &value[1..value.len() - 1],
-            _ => value,
-        };
-        if value.len() > 128
-            || !value.bytes().all(|b| {
-                b.is_ascii_alphanumeric() || b"._-".contains(&b) || (key == "ID_LIKE" && b == b' ')
-            })
-            || values.insert(key, value.to_owned()).is_some()
-        {
-            return Err(Missing::Invalid);
-        }
-    }
-    let id = values
-        .remove("ID")
-        .filter(|v| !v.is_empty())
-        .ok_or(Missing::Invalid)?;
-    Ok(Os {
-        id,
-        version: values.remove("VERSION_ID").unwrap_or_default(),
-        like: values.remove("ID_LIKE").unwrap_or_default(),
-    })
-}
-
-fn backend(os: &Os) -> Option<PackageBackend> {
+fn backend(os: &OsRelease) -> Option<PackageBackend> {
     match (os.id.as_str(), os.version.as_str()) {
         ("debian", "13") | ("ubuntu", "24.04" | "26.04") => Some(PackageBackend::Dpkg),
         ("fedora", "43" | "44") => Some(PackageBackend::Rpm),
@@ -372,24 +326,20 @@ fn gpu(sources: &impl Sources, fields: &mut Vec<Value>) {
     fields.push(note("acceleration", "Actual acceleration", "package presence and a bound driver do not prove rendering or video decoding is accelerated; check vainfo and the application's playback diagnostics manually"));
 }
 
-pub(super) fn collect(sources: &impl Sources) -> Value {
+pub(super) fn collect(sources: &impl Sources, os: &Result<OsRelease, Missing>) -> Value {
     let mut fields = vec![note(
         "scope",
         "Package advice scope",
         "Optional desktop/media recommendations, not controller-service prerequisites. No package or desktop changes are performed.",
     )];
     gpu(sources, &mut fields);
-    let os = sources
-        .read("/etc/os-release")
-        .or_else(|_| sources.read("/usr/lib/os-release"))
-        .and_then(|s| parse_os(&s));
     let os = match os {
         Ok(os) => os,
         Err(error) => {
             fields.push(field(
                 "package_profile",
                 "Graphics package profile",
-                Err(error),
+                Err(*error),
             ));
             return section("graphics", "Optional Intel graphics setup", fields);
         }
@@ -405,7 +355,7 @@ pub(super) fn collect(sources: &impl Sources) -> Value {
         }
     );
     fields.push(field("distribution", "Package distribution", Ok(identity)));
-    let Some(backend) = backend(&os) else {
+    let Some(backend) = backend(os) else {
         fields.push(note("package_profile", "Graphics package profile", "no version-specific recipe for this distribution; check its current package documentation manually. ID_LIKE alone is not proof of package compatibility"));
         return section("graphics", "Optional Intel graphics setup", fields);
     };
@@ -525,6 +475,10 @@ pub(super) fn collect(sources: &impl Sources) -> Value {
 mod tests {
     use super::*;
 
+    fn collect(sources: &impl Sources) -> Value {
+        super::collect(sources, &super::super::os_release(sources))
+    }
+
     struct Fake {
         os: &'static str,
         inventory: Result<Inventory, String>,
@@ -572,7 +526,7 @@ mod tests {
             "ID=\"$(touch /tmp/no)\"",
             "ID=ubuntu\nVERSION_ID=\"26.04",
         ] {
-            assert_eq!(parse_os(value).unwrap_err(), Missing::Invalid);
+            assert_eq!(OsRelease::parse(value).unwrap_err(), Missing::Invalid);
         }
         for os in [
             "ID=ubuntu\nVERSION_ID=22.04",

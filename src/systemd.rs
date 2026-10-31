@@ -211,6 +211,14 @@ fn notify_socket(name: &OsStr) -> io::Result<UnixDatagram> {
         .map_err(|e| context("connect systemd NOTIFY_SOCKET", e))?;
     Ok(socket)
 }
+/// poll(2) must round up fractional milliseconds and cap its signed timeout.
+pub(crate) fn poll_timeout(remaining: Duration) -> i32 {
+    remaining
+        .as_nanos()
+        .div_ceil(1_000_000)
+        .min(i32::MAX as u128) as i32
+}
+
 pub fn policy_heartbeat_interval() -> Duration {
     // The worker reports liveness over bounded IPC; only the broker notifies
     // systemd. WATCHDOG_PID therefore remains the broker's PID throughout.
@@ -228,7 +236,7 @@ fn watchdog_interval(usec: Option<&str>) -> Option<Duration> {
 /// Thread-local blocked signals are consumed by signalfd, never a signal handler.
 pub struct Signals {
     fd: OwnedFd,
-    old_mask: libc::sigset_t,
+    old_mask: Option<libc::sigset_t>,
     // The saved pthread mask must be restored on the original thread.
     _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
@@ -264,9 +272,17 @@ impl Signals {
         // SAFETY: signalfd returned this new, valid, uniquely owned descriptor.
         Ok(Self {
             fd: unsafe { OwnedFd::from_raw_fd(fd) },
-            old_mask,
+            old_mask: Some(old_mask),
             _thread: std::marker::PhantomData,
         })
+    }
+    /// For the single-threaded policy child, which ends with _exit. Keep stop
+    /// signals blocked while its destructors run; a second TERM must not kill
+    /// an otherwise clean exit when the signalfd is closed.
+    pub(crate) fn for_process() -> io::Result<Self> {
+        let mut signals = Self::new()?;
+        signals.old_mask = None;
+        Ok(signals)
     }
     pub fn fd(&self) -> RawFd {
         self.fd.as_raw_fd()
@@ -306,8 +322,10 @@ impl Signals {
 impl Drop for Signals {
     fn drop(&mut self) {
         // SAFETY: restores the exact mask captured on this same thread.
-        unsafe {
-            libc::pthread_sigmask(libc::SIG_SETMASK, &self.old_mask, std::ptr::null_mut());
+        if let Some(mask) = &self.old_mask {
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, mask, std::ptr::null_mut());
+            }
         }
     }
 }
@@ -412,6 +430,7 @@ fn config_events(mut bytes: &[u8], name: &[u8]) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
     #[test]
     fn abstract_notify_socket_sends_exact_payload() {
         let name = format!("minibookx-ctl-test-{}", std::process::id());
@@ -468,6 +487,44 @@ mod tests {
         assert!(signals.drain().unwrap().is_empty());
     }
     #[test]
+    fn process_signal_mask_outlives_the_fd_but_scoped_sources_restore_it() {
+        for process_lifetime in [false, true] {
+            std::thread::spawn(move || {
+                let mut original = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+                // SAFETY: query only this test thread's current signal mask.
+                assert_eq!(
+                    unsafe {
+                        libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut original)
+                    },
+                    0
+                );
+                let signals = if process_lifetime {
+                    Signals::for_process()
+                } else {
+                    Signals::new()
+                }
+                .unwrap();
+                drop(signals);
+                let mut after = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+                // SAFETY: restore this thread after capturing the mask at drop.
+                assert_eq!(
+                    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &original, &mut after) },
+                    0
+                );
+                for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+                    let expected = if process_lifetime {
+                        1
+                    } else {
+                        unsafe { libc::sigismember(&original, signal) }
+                    };
+                    assert_eq!(unsafe { libc::sigismember(&after, signal) }, expected);
+                }
+            })
+            .join()
+            .unwrap();
+        }
+    }
+    #[test]
     fn config_directory_watch_survives_atomic_replacement() {
         let directory =
             std::env::temp_dir().join(format!("minibookx-watch-{}", std::process::id()));
@@ -484,7 +541,23 @@ mod tests {
         std::fs::write(&path, "three").unwrap();
         assert!(watch.drain().unwrap());
         std::fs::remove_dir_all(directory).unwrap();
-        assert!(watch.drain().is_err());
+        // File deletion and terminal watch-removal events can arrive in
+        // separate batches. Wait for the terminal event without a fixed sleep.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "watch removal was not delivered");
+            let mut fd = libc::pollfd {
+                fd: watch.fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one live inotify descriptor and a bounded timeout.
+            assert!(unsafe { libc::poll(&mut fd, 1, poll_timeout(remaining)) } > 0);
+            if watch.drain().is_err() {
+                break;
+            }
+        }
     }
     #[test]
     fn sleep_events_require_exact_sender_path_and_type() {

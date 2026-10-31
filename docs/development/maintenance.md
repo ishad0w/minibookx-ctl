@@ -26,6 +26,11 @@ and verifies the pinned libdbus source, then builds its client library locally.
 It uses a bundled source archive when building from the corresponding source
 release.
 
+Normal builds omit policy experiments. Enable the `dev-tools` feature for the
+read-only [development commands](../reference/diagnostics.md#development-only-policy-tools).
+`make check` tests both the production CLI and the optional tools; release
+executables are built without development features.
+
 `rust-docs` supplies the compiler's runtime license notices embedded in every
 build; it is required even when you do not use Rust's local documentation.
 
@@ -214,9 +219,17 @@ The systemd VM runs alongside the seven container suites after the checked
 artifacts are ready. The [distribution matrix](#distribution-matrix) lists the
 container versions and scope.
 
-To publish, bump the patch version, commit the release and push it to `main`.
-Then run **Check, build and release** on `main` with its **publish** checkbox
-enabled, or use:
+The `Required CI checks` ruleset protects `main`. It requires the build, systemd
+VM and seven distribution jobs on the commit being pushed, without bypasses.
+Push a review branch and open a pull request to start the required CI. Manual
+workflow runs are useful for additional checks but do not satisfy this ruleset.
+Merge only after all nine checks pass. Keep the ruleset's required job names in
+sync with the matrix.
+
+To publish, bump the patch version in the release PR and squash it with commit
+title `Release (vX.Y.Z)`. Squashing changes the commit hash; the final assets must
+be built from the resulting main commit. Run **Check, build and release** on
+`main` with its **publish** checkbox enabled, or use:
 
 ```sh
 gh workflow run ci.yml --ref main -f publish=true
@@ -232,10 +245,12 @@ retrying the exact same build can verify and resume it, but a different commit
 cannot reuse its tag or replace its assets. A new release must use a new version.
 The bootstrap URL pins a reviewed commit; update it only after reviewing a
 changed bootstrap. This is separate from selecting the latest released binary.
-GitHub's platform-enforced release immutability requires repository settings;
-it is not enabled by a workflow file. CI-skip markers can prevent GitHub from
-starting a workflow at all, so a check inside that workflow cannot prohibit them.
-Required branch checks/rules must enforce that policy on GitHub.
+GitHub release immutability is enabled for new releases starting with v0.1.5.
+The publisher checks that GitHub locked the published release. Older releases
+are not retroactively locked. The repository setting is managed separately;
+CI does not receive an administration token. CI-skip markers can prevent GitHub
+from starting a workflow, so the required branch checks enforce the policy
+rather than a step inside that workflow.
 
 ```mermaid
 flowchart LR
@@ -270,7 +285,7 @@ Keep a working boot entry. Before relying on unattended control:
 If detection fails, leave the service stopped and compare the device with the
 [supported hardware](../hardware/README.md). Do not bypass a revision check to make
 the service start. The same unit runs recovery after a stop or failure and
-before a restart; there is no separate recovery service.
+before a restart.
 
 Display modifications are maintained separately:
 

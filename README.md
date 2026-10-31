@@ -28,7 +28,7 @@ Check the [requirements and packages](docs/guide/install.md#requirements), then
 run as your ordinary user:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ishad0w/minibookx-ctl/2ba14f40b8d353527adca3e94e8e226b5d79b16e/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ishad0w/minibookx-ctl/a3e6c07d64128a3add1b9490c17518b4b73b3d0d/install.sh | sh
 ```
 
 This reviewed bootstrap downloads the latest release. The installer asks for

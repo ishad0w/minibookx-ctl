@@ -99,4 +99,5 @@ of maintained documentation.
 | [docs/hardware/](docs/hardware/) | Tested revision, EC, BIOS catalogue, charging and hardware evidence |
 | [docs/development/](docs/development/) | Architecture, builds, tests and releases |
 | [contrib/vbt/build_vbt.py](contrib/vbt/build_vbt.py) | Offline, identity-checked timing builder; does not install firmware |
+| [contrib/bios/setup-options.csv](contrib/bios/setup-options.csv) | Static Setup catalogue; shipped with source, excluded from the runtime bundle |
 | [contrib/i915/](contrib/i915/) | Unbuilt developer RFC and its validation requirements; separate from the controller |

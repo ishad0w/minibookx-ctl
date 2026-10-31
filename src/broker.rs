@@ -10,10 +10,7 @@ use crate::{
     power::Manager,
     sensor::CpuSensor,
     service,
-    tablet::{
-        Estimate, EstimateReason, EstimatorConfig, HingeEstimator, SAMPLE_INTERVAL, Sensors,
-        VirtualSwitch,
-    },
+    tablet::{Estimate, EstimateReason, HingeEstimator, SAMPLE_INTERVAL, Sensors, VirtualSwitch},
 };
 use std::{
     ffi::CString,
@@ -172,11 +169,7 @@ impl Schedule {
 }
 
 fn timeout_ms(deadline: Duration, now: Duration) -> i32 {
-    deadline
-        .saturating_sub(now)
-        .as_nanos()
-        .div_ceil(1_000_000)
-        .min(i32::MAX as u128) as i32
+    crate::systemd::poll_timeout(deadline.saturating_sub(now))
 }
 
 /// Both policy requests and the independent guard use this accounting. Record
@@ -494,6 +487,9 @@ impl Child {
         }
     }
     fn stop(&mut self) -> io::Result<i32> {
+        self.stop_while(|| {})
+    }
+    fn stop_while(&mut self, mut pending: impl FnMut()) -> io::Result<i32> {
         if let Some(status) = self.exited()? {
             return Ok(status);
         }
@@ -505,6 +501,7 @@ impl Child {
             if let Some(status) = self.exited()? {
                 return Ok(status);
             }
+            pending();
             std::thread::sleep(Duration::from_millis(25));
         }
         // SAFETY: reap only this child after the bounded graceful wait.
@@ -522,6 +519,25 @@ impl Child {
                 return Err(error);
             }
         }
+    }
+}
+
+/// Hardware has already been released. Let a terminating policy finish its
+/// outstanding Restore call without performing another hardware transaction.
+fn acknowledge_shutdown(socket: &UnixDatagram, released: bool) {
+    let mut bytes = [0; REQUEST_BYTES + 1];
+    // The broker endpoint stays nonblocking, including during teardown.
+    if let Ok(count) = socket.recv(&mut bytes)
+        && let Ok((request, sequence)) = Request::decode(&bytes[..count])
+    {
+        let _ = socket.send(
+            &Reply {
+                sequence,
+                rejected: request != Request::Restore || !released,
+                ..Reply::default()
+            }
+            .encode(),
+        );
     }
 }
 impl Drop for Child {
@@ -847,7 +863,7 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
     } else {
         None
     };
-    let mut estimator = HingeEstimator::new(EstimatorConfig::default())?;
+    let mut estimator = HingeEstimator::default();
     let (parent, worker) = UnixDatagram::pair()?;
     parent.set_nonblocking(true)?;
     let mut child = spawn_policy(worker, path, uid, gid)?;
@@ -1279,6 +1295,16 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
             "tablet OFF unconfirmed; sensor ownership retained for recovery",
         ))
     };
+    let released = fan_result.is_ok()
+        && power_result.is_ok()
+        && sensor_result.is_ok()
+        && tablet_error.is_none();
+    match child.stop_while(|| acknowledge_shutdown(&parent, released)) {
+        Ok(status) if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 => {
+            eprintln!("policy worker exited cleanly");
+        }
+        result => eprintln!("policy worker shutdown: {result:?}"),
+    }
     drop(child);
     drop(guardian);
     snapshots.flush_final(epoch.elapsed(), write_snapshot);
@@ -1315,6 +1341,37 @@ mod tests {
     use super::*;
     use crate::policy::{Config, Controller};
     use std::{cell::RefCell, rc::Rc};
+
+    #[test]
+    fn shutdown_acknowledges_only_restore_after_successful_release() {
+        let (broker, worker) = UnixDatagram::pair().unwrap();
+        broker.set_nonblocking(true).unwrap();
+        worker
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        for (sequence, (request, released, accepted)) in [
+            (Request::Restore, true, true),
+            (Request::Restore, false, false),
+            (Request::Duty(ec::MIN_RAW), true, false),
+            (Request::Activate, true, false),
+            (Request::Heartbeat, true, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sequence = sequence as u32;
+            worker.send(&request.encode(sequence)).unwrap();
+            acknowledge_shutdown(&broker, released);
+            let mut reply = [0; crate::ipc::REPLY_BYTES + 1];
+            let count = worker.recv(&mut reply).unwrap();
+            assert_eq!(Reply::decode(&reply[..count], sequence).is_ok(), accepted);
+        }
+        worker.send(&[0; REQUEST_BYTES + 1]).unwrap();
+        acknowledge_shutdown(&broker, true);
+        assert!(worker.recv(&mut [0; crate::ipc::REPLY_BYTES]).is_err());
+        // With no queued request, teardown must not block awaiting the worker.
+        acknowledge_shutdown(&broker, true);
+    }
 
     fn estimate(tablet: bool, reason: EstimateReason) -> Estimate {
         Estimate {

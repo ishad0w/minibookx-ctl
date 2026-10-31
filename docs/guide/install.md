@@ -56,7 +56,7 @@ For immutable Fedora variants, use their own package-layering procedure.
 Leave the laptop in its ordinary working position. Run as your ordinary user:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ishad0w/minibookx-ctl/2ba14f40b8d353527adca3e94e8e226b5d79b16e/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ishad0w/minibookx-ctl/a3e6c07d64128a3add1b9490c17518b4b73b3d0d/install.sh | sh
 ```
 
 The bootstrap URL pins a reviewed source commit. It downloads the latest
@@ -64,7 +64,7 @@ release and checks its checksum, then asks for
 sudo to install and start it. If you prefer to read the script first:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ishad0w/minibookx-ctl/2ba14f40b8d353527adca3e94e8e226b5d79b16e/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/ishad0w/minibookx-ctl/a3e6c07d64128a3add1b9490c17518b4b73b3d0d/install.sh -o install.sh
 less install.sh
 sh install.sh
 ```
@@ -126,7 +126,7 @@ the latest example is saved at `/usr/local/share/doc/minibookx-ctl/presets.conf`
 To select a published version with the downloaded script:
 
 ```sh
-sh install.sh --release v0.1.4
+sh install.sh --release v0.1.5
 ```
 
 To remove the binary and service:

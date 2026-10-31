@@ -227,7 +227,8 @@ impl Controller {
         {
             return Err("invalid initial fan sample".into());
         }
-        let pwm = ((u16::from(raw) * 100 + 46) / 92).min(80) as u8;
+        let pwm = ((u16::from(raw) * 100 + crate::ec::PWM_COUNTS / 2) / crate::ec::PWM_COUNTS)
+            .min(80) as u8;
         self.takeover_pwm = (raw != 0).then_some(pwm);
         let heat_level = self
             .config
@@ -437,7 +438,7 @@ impl Controller {
                 .max(self.takeover_pwm.unwrap_or(0))
         };
         // CTR=91, interior duty only. A value of255 would not mean full speed.
-        let raw_duty = ((u16::from(pwm_percent) * 92 + 50) / 100) as u8;
+        let raw_duty = ((u16::from(pwm_percent) * crate::ec::PWM_COUNTS + 50) / 100) as u8;
         let changed = self.last_emitted != Some(pwm_percent);
         self.last_emitted = Some(pwm_percent);
         Ok(Decision {

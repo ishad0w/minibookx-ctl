@@ -1,16 +1,16 @@
+use minibookx_ctl::{broker, build_info, doctor, hardware, install, paths, presets, service};
+#[cfg(feature = "dev-tools")]
 use minibookx_ctl::{
-    broker, build_info, doctor, hardware, install, paths,
     policy::{Config, Controller},
     power::PowerConfig,
-    presets::{self, Loaded},
+    presets::Loaded,
     sensor::CpuSensor,
-    service, thermal,
+    thermal,
 };
+use std::{env, path::PathBuf, process::ExitCode};
+#[cfg(feature = "dev-tools")]
 use std::{
-    env,
     io::{self, BufRead},
-    path::PathBuf,
-    process::ExitCode,
     time::{Duration, Instant},
 };
 
@@ -23,17 +23,20 @@ Usage:
   minibookx-ctl --doctor [--json]  (also: minibookx-ctl doctor)
   minibookx-ctl --debug [--json]   (also: minibookx-ctl debug)
   minibookx-ctl --check-config PATH
-  minibookx-ctl --inspect
-  minibookx-ctl --monitor [--config PATH] [--samples N]
-  minibookx-ctl --simulate [--config PATH] < trace.csv
-  minibookx-ctl --capabilities
   minibookx-ctl --version
   minibookx-ctl --build-info
 
 Use the installed systemd unit for --daemon. Profiles are selected in the config.
 Power limits are enabled only by power_control=true in the configuration.
 Systemd lifecycle: --prepare, --recover. Recovery may be retried with the service stopped.
-Diagnostic and simulation commands perform no hardware writes.";
+Reports perform no hardware writes.";
+
+#[cfg(feature = "dev-tools")]
+const DEV_HELP: &str = "Development tools (unprivileged, read-only):
+  minibookx-ctl --inspect
+  minibookx-ctl --monitor [--config PATH] [--samples N]
+  minibookx-ctl --simulate [--config PATH] < trace.csv
+  minibookx-ctl --capabilities";
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     run_args(env::args().skip(1))
@@ -80,6 +83,8 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::e
     reject_extra_operands(&command, &mut args)?;
     if command == "--help" || command == "-h" {
         println!("{HELP}");
+        #[cfg(feature = "dev-tools")]
+        println!("{DEV_HELP}");
         return Ok(());
     }
     if command == "--version" {
@@ -91,23 +96,25 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::e
         return Ok(());
     }
     match command.as_str() {
-        "--install" => return install::run(true, args),
-        "--uninstall" => return install::run(false, args),
+        "--install" => install::run(true, args),
+        "--uninstall" => install::run(false, args),
         "--doctor" | "doctor" | "--debug" | "debug" => {
             let json_output = diagnostic_json(args)?;
             if command == "--debug" || command == "debug" {
-                return doctor::print_debug(json_output).map_err(Into::into);
+                doctor::print_debug(json_output).map_err(Into::into)
+            } else {
+                doctor::print(json_output).map_err(Into::into)
             }
-            return doctor::print(json_output).map_err(Into::into);
         }
-        "--prepare" => return hardware::prepare().map_err(Into::into),
-        "--recover" => return hardware::recover().map_err(Into::into),
-        "--status" => return service::print_status().map_err(Into::into),
+        "--prepare" => hardware::prepare().map_err(Into::into),
+        "--recover" => hardware::recover().map_err(Into::into),
+        "--status" => service::print_status().map_err(Into::into),
         "--check-config" => {
             let path = PathBuf::from(args.next().ok_or("--check-config requires a file")?);
             if args.next().is_some() {
                 return Err("unexpected argument".into());
             }
+            require_unprivileged_config()?;
             let loaded = presets::load(&path)?;
             loaded.config.validate_for_hardware()?;
             loaded.power.validate()?;
@@ -117,29 +124,63 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::e
                 loaded.fan_control,
                 loaded.power.enabled
             );
-            return Ok(());
+            Ok(())
         }
         // Installer-only snapshot validation. The installer attaches sealed
         // bytes as stdin and drops to the service account before exec.
-        "--check-config-stdin" => return install::check_config_stdin(),
-        "--capabilities" => {
-            return thermal::print_package_capabilities(std::path::Path::new("/sys/class/thermal"))
-                .map_err(Into::into);
+        "--check-config-stdin" => install::check_config_stdin(),
+        "--daemon" => run_daemon(args),
+        #[cfg(feature = "dev-tools")]
+        "--inspect" | "--monitor" | "--simulate" | "--capabilities" => {
+            run_policy_tool(&command, args)
         }
-        _ => (),
+        _ => Err("unknown command; use --help".into()),
     }
-    if !["--daemon", "--inspect", "--monitor", "--simulate"].contains(&command.as_str()) {
-        return Err("unknown command; use --help".into());
+}
+
+fn require_unprivileged_config() -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: geteuid has no arguments or side effects.
+    if unsafe { libc::geteuid() } == 0 {
+        return Err("read user configuration as an ordinary user or the service account".into());
     }
+    Ok(())
+}
+
+fn run_daemon(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut path = None;
     let mut tablet = true;
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--config" if path.is_none() => {
+                path = Some(PathBuf::from(args.next().ok_or("--config needs a path")?));
+            }
+            "--no-tablet" => tablet = false,
+            _ => return Err(format!("unsupported option {flag}").into()),
+        }
+    }
+    // The policy child opens config only after closing raw descriptors and
+    // dropping its uid, gid and capabilities.
+    broker::run(path.unwrap_or_else(|| paths::CONFIG.into()), tablet)?;
+    Ok(())
+}
+
+#[cfg(feature = "dev-tools")]
+fn run_policy_tool(
+    command: &str,
+    mut args: impl Iterator<Item = String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    require_unprivileged_config()?;
+    if command == "--capabilities" {
+        return thermal::print_package_capabilities(std::path::Path::new("/sys/class/thermal"))
+            .map_err(Into::into);
+    }
+    let mut path = None;
     let mut samples = None;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--config" if path.is_none() => {
                 path = Some(PathBuf::from(args.next().ok_or("--config needs a path")?))
             }
-            "--no-tablet" if command == "--daemon" => tablet = false,
             "--samples" if command == "--monitor" && samples.is_none() => {
                 let value = args
                     .next()
@@ -152,12 +193,6 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::e
             }
             _ => return Err(format!("unsupported option {flag}").into()),
         }
-    }
-    if command == "--daemon" {
-        // Deliberately no root-side config parsing. The policy child opens it
-        // only after raw descriptors are closed and uid/gid have been dropped.
-        broker::run(path.unwrap_or_else(|| paths::CONFIG.into()), tablet)?;
-        return Ok(());
     }
     let loaded = match path {
         Some(p) => presets::load(&p)?,
@@ -252,6 +287,14 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(feature = "dev-tools"))]
+    #[test]
+    fn release_cli_rejects_development_tools_before_opening_any_config() {
+        for command in ["--inspect", "--monitor", "--simulate", "--capabilities"] {
+            assert!(run_args([command.to_owned()].into_iter()).is_err());
+        }
+    }
 
     #[test]
     fn no_operand_commands_reject_arguments_before_any_lifecycle_or_diagnostic_action() {

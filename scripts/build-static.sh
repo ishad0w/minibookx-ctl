@@ -45,5 +45,5 @@ else
 fi
 python3 "$script_dir/release_format.py" elf "target/$target/release/$task_binary"
 if [ "$task_mode" = --test ]; then
-    cargo test --locked --target "$target" --features systemd-test-fixture
+    cargo test --locked --target "$target" --features systemd-test-fixture,dev-tools
 fi

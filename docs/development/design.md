@@ -143,6 +143,15 @@ journals and required access for another attempt. The same unit invokes `--recov
 `Restart=on-failure` provides bounded retries under the unit's start-rate limit;
 persistent recovery failure leaves the service failed and its records intact.
 
+During shutdown, the broker releases hardware before waiting for the policy
+worker. It then acknowledges a pending Restore request only if every release
+succeeded; other requests are rejected. This lets the worker exit normally
+without repeating hardware transactions. The worker's proxy requests release
+on error, including for power-only sessions. Broker cleanup and `ExecStopPost`
+remain independent of that best-effort request.
+The single-threaded worker keeps its stop signals blocked until `_exit`, so
+a second termination signal cannot interrupt its final destructors.
+
 After a verified return to automatic fan control, the session retires its
 `manual.owner` marker, including before suspend. It creates a new marker before
 reactivating manual control. The module lease remains until final cleanup;

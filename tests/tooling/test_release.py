@@ -14,6 +14,29 @@ import publish_release as publish
 
 
 class ProvenanceTests(unittest.TestCase):
+    def test_runtime_copy_omits_bios_catalogue_but_keeps_user_guides_and_display_tools(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "source"
+            destination = Path(temp) / "runtime"
+            files = [
+                "packaging/unit",
+                "config/presets",
+                "docs/guide",
+                "contrib/vbt/tool",
+                "contrib/i915/rfc",
+            ]
+            for name in files + ["contrib/bios/setup-options.csv"]:
+                path = source / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(name)
+            package.copy_runtime_tree(source, destination)
+            for name in files:
+                self.assertEqual((destination / name).read_text(), name)
+            self.assertFalse((destination / "contrib/bios").exists())
+            self.assertTrue((source / "contrib/bios/setup-options.csv").is_file())
+
     def test_source_copy_keeps_the_developer_commands_and_relocated_tests(self):
         with tempfile.TemporaryDirectory() as temp:
             destination = Path(temp)
@@ -163,7 +186,7 @@ class PublicationTests(unittest.TestCase):
             self.assertEqual(publish.api("")["default_branch"], "main")
         self.assertEqual(run.call_args.args[0], ["gh", "api", "repos/" + publish.REPO])
 
-    def run_publish(self, head=None, tag=None, release=None):
+    def run_publish(self, head=None, tag=None, release=None, immutable=True):
         reads = 0
 
         def api(endpoint, data=None, missing=False):
@@ -185,7 +208,9 @@ class PublicationTests(unittest.TestCase):
             return (
                 release
                 if release is not None
-                else (None if reads == 1 else {"draft": True})
+                else (
+                    None if reads == 1 else {"draft": reads < 4, "immutable": immutable}
+                )
             )
 
         with (
@@ -205,6 +230,15 @@ class PublicationTests(unittest.TestCase):
     def test_new_commit_cannot_reuse_a_published_semantic_version(self):
         with self.assertRaisesRegex(ValueError, "never repoint"):
             self.run_publish(tag={"object": {"type": "commit", "sha": "b" * 40}})
+
+    def test_publication_checks_platform_immutability_without_admin_token_permissions(
+        self,
+    ):
+        with self.assertRaisesRegex(ValueError, "release is not immutable"):
+            self.run_publish(immutable=False)
+        self.assertFalse(
+            any(endpoint == "immutable-releases" for endpoint, _ in self.calls)
+        )
 
     def test_existing_published_release_only_verifies(self):
         calls, checked = self.run_publish(

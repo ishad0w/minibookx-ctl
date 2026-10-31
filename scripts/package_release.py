@@ -51,6 +51,7 @@ SOURCE_DIRS = [
     ".github",
     "third-party",
 ]
+RUNTIME_DIRS = ["packaging", "config", "docs", "contrib/vbt", "contrib/i915"]
 DENY_SUFFIXES = {".bin", ".cpio", ".rom", ".fd", ".aml", ".log", ".pyc"}
 
 
@@ -136,6 +137,12 @@ def archive(path, source, epoch):
         tarfile.open(fileobj=compressed, mode="w", format=tarfile.GNU_FORMAT) as stream,
     ):
         stream.add(source, arcname=source.name, filter=normalized)
+
+
+def copy_runtime_tree(source, destination):
+    """Keep the static BIOS catalogue in source downloads, outside runtime assets."""
+    for name in RUNTIME_DIRS:
+        copy_public_tree(source / name, destination / name)
 
 
 def main():
@@ -251,8 +258,7 @@ def main():
             "BUILD-TOOLCHAIN.txt",
         ):
             shutil.copy2(source / name, binary / name)
-        for name in ("packaging", "config", "docs", "contrib"):
-            shutil.copytree(source / name, binary / name)
+        copy_runtime_tree(source, binary)
         (binary / "third-party").mkdir()
         shutil.copy2(
             source / "third-party/libdbus.json", binary / "third-party/libdbus.json"

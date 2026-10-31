@@ -130,13 +130,16 @@ The selected mode is in brackets. A selected `deep` mode alone does not prove
 that a suspend happened; use the kernel journal's suspend/resume entries when
 comparing with the recorded S3 tests.
 
-## Policy inspection without control
+## Development-only policy tools
+
+Release executables provide `--doctor`, `--debug` and `--status`. Temperature
+inspection and policy experiments are optional source-build tools. They perform
+no hardware writes and must run without root privileges:
 
 ```sh
-minibookx-ctl --inspect
-minibookx-ctl --capabilities
-sudo -u minibookx-ctl /usr/local/bin/minibookx-ctl --monitor \
-  --config /etc/minibookx-ctl/config.conf --samples 10
+cargo run --features dev-tools -- --inspect
+cargo run --features dev-tools -- --capabilities
+cargo run --features dev-tools -- --monitor --config config/presets.conf --samples 10
 ```
 
 Monitor prints CSV decisions without applying duty. From a source checkout,
@@ -144,5 +147,5 @@ an offline simulation can use supplied temperatures:
 
 ```sh
 printf 'seconds,celsius\n0,68\n1,82\n13,82\n14,82\n' |
-  minibookx-ctl --simulate --config config/presets.conf
+  cargo run --features dev-tools -- --simulate --config config/presets.conf
 ```

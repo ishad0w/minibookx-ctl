@@ -18,8 +18,9 @@ The broker remains UID 0 and narrows its capabilities to `CAP_KILL` after setup;
 that does not make it unprivileged. Worker and guardian use the dedicated
 service UID with empty capability sets, no supplementary groups and no ptrace
 access. Only the guardian and broker retain the original uinput descriptor;
-the worker receives no hardware descriptors. The broker can send OFF on that
-same device after a killed guardian has been reaped.
+the worker receives no hardware descriptors. Because the worker shares the
+guardian's UID, it could signal the guardian; the broker still sends OFF through
+its retained descriptor after reaping a killed guardian.
 
 The unit uses no ambient capabilities. Its device allow-list is intentionally
 broader than the code's fixed identities: `char-input r` permits all input
@@ -27,6 +28,9 @@ devices and `char-i2c rw` all I2C adapters. Root-side identity checks narrow the
 actual opens; the device filter alone does not enforce those identities.
 `OOMScoreAdjust=-250` favors broker/guardian recovery; the worker resets its
 score to zero before dropping UID. This is not immunity from OOM termination.
+All three processes run with a `@system-service @module` system-call filter, a
+private network namespace with only `AF_UNIX` sockets, hidden foreign
+processes, no `/dev/shm` and at most 16 tasks.
 Only the broker sends systemd readiness
 and watchdog messages; the worker reports readiness and liveness over bounded
 IPC. These restrictions supplement the process boundary, not replace it.
@@ -42,8 +46,9 @@ See the [service design](docs/development/design.md) for details.
 
 ## Installer trust
 
-Run an installer you trust. The documented bootstrap URL pins reviewed source
-instead of following `main`. The script downloads a published release as your
+Run an installer you trust. The documented bootstrap URL follows `main`, which
+changes only through pull requests that pass the required checks. The script
+downloads a published release as your
 ordinary user and checks its executable against that release's SHA-256 manifest.
 Only then does it request sudo. `--binary` uses the executable you supply.
 
@@ -53,7 +58,9 @@ The installer uses those exact validated bytes; it does not parse config as root
 Unsafe destinations, links and permissions are refused. Staging with `--destdir`
 does not change live services, accounts or hardware.
 
-An update requires recovery before replacing the executable. If copying or
+An update requires recovery before replacing the executable. If that recovery
+is refused, no file is replaced and a previously running controller is started
+again. If copying or
 startup fails, rollback attempts to restore the old files and service state,
 including when a failed start is waiting to restart. Catchable termination
 signals are deferred through recovery/rollback and final reporting. Synchronous
@@ -68,10 +75,14 @@ privileged reports run those queries with privileges dropped. It never applies
 the suggested changes.
 
 Checksums detect inconsistent downloads; they are not independent signatures
-and do not protect against a compromised publisher. The publishing tool refuses
+and do not protect against a compromised publisher. Release files from v0.2.0
+onward also have a signed SLSA build provenance attestation. It ties each file
+to this repository's workflow run and source commit; it does not prove that the
+source itself is safe. The publishing tool refuses
 to replace existing public assets and requires an immutable published release,
-including on retries. Version tags cannot be moved or deleted through normal
-repository access. Source and checksum
+including on retries. GitHub release immutability covers v0.1.5 and later;
+earlier release assets are mutable, so prefer a current release. Version tags
+cannot be moved or deleted through normal repository access. Source and checksum
 files are included with each release.
 
 ## Recovery limits

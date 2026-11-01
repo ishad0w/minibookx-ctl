@@ -68,11 +68,37 @@ def started():
         return False
 
 
-def events():
+def event_records():
     try:
-        return (ROOT / "switch-events").read_text().splitlines()
+        lines = (ROOT / "switch-events").read_text().splitlines()
     except FileNotFoundError:
         return []
+    return [line.split() for line in lines]
+
+
+def events():
+    return [record[0] for record in event_records()]
+
+
+def off_writers(since):
+    return {int(pid) for state, pid in event_records()[since:] if state == "0"}
+
+
+def invocation_id():
+    return command("systemctl", "show", UNIT, "-p", "InvocationID", "--value").strip()
+
+
+def invocation_journal(invocation):
+    # ExecStopPost belongs to the stopped invocation; a time window could also
+    # include the previous test's stop.
+    return command(
+        "journalctl",
+        "-b",
+        "_SYSTEMD_INVOCATION_ID=" + invocation,
+        "--no-pager",
+        "-o",
+        "cat",
+    )
 
 
 def stopped():
@@ -118,7 +144,8 @@ def lid_checks(main):
     # The broker opens the source after both forks; neither child receives it.
     inode = next(
         line.split()[6]
-        for line in Path("/proc/net/unix").read_text().splitlines()
+        # The service has a private network namespace; read its own table.
+        for line in Path(f"/proc/{main}/net/unix").read_text().splitlines()
         if line.endswith(str(ROOT / "lid-events"))
     )
     link = f"socket:[{inode}]"
@@ -541,6 +568,7 @@ def production_watchdog_timeout():
         start()
         main = props()["MainPID"]
         since = str(int(time.time()))
+        invocation = invocation_id()
         assert "WatchdogUSec=20s" in command(
             "systemctl", "show", UNIT, "-p", "WatchdogUSec"
         )
@@ -564,6 +592,8 @@ def production_watchdog_timeout():
             "cat",
         )
         assert "watchdog timeout" in journal.lower(), journal
+        stopped_post = invocation_journal(invocation)
+        assert "VM_EXECSTOPPOST recovery completed" in stopped_post, stopped_post
     finally:
         command("systemctl", "stop", UNIT)
         dropin.unlink()
@@ -845,7 +875,7 @@ def guardian_backup_and_privileges():
         ),
         "original switch backup unused",
     )
-    assert "0" in events()[old:]
+    assert main in off_writers(old), event_records()[old:]
     wait_for(
         lambda: (
             props()["MainPID"] not in ("0", str(main))
@@ -1079,7 +1109,11 @@ def fail_and_restart(label, target, sig):
     before = props()
     main = int(before["MainPID"])
     old_events = len(events())
-    pid = worker(main) if target == "worker" else main
+    invocation = invocation_id()
+    policy = worker(main)
+    children = Path(f"/proc/{main}/task/{main}/children").read_text().split()
+    guard = next((int(pid) for pid in children if int(pid) != policy), None)
+    pid = policy if target == "worker" else main
     os.kill(pid, sig)
     wait_for(
         lambda: (
@@ -1091,7 +1125,14 @@ def fail_and_restart(label, target, sig):
     )
     wait_for(started, f"{label}: policy did not restart")
     assert props()["MainPID"] != str(main)
-    assert "0" in events()[old_events:], f"{label}: missing tablet OFF"
+    if guard is not None:
+        # The restarted instance also writes OFF during setup; only the old
+        # guardian's own OFF proves the failed instance released input.
+        assert guard in off_writers(old_events), (
+            f"{label}: {event_records()[old_events:]}"
+        )
+    journal = invocation_journal(invocation)
+    assert "VM_EXECSTOPPOST recovery completed" in journal, f"{label}: {journal}"
     print(f"VM_ASSERT PASS {label}", flush=True)
     command("systemctl", "stop", UNIT)
     stopped()

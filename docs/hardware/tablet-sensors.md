@@ -27,16 +27,22 @@ flowchart LR
 | Estimated angle ≥185° | Enter tablet mode after 500 ms stable classification |
 | Estimated angle ≤175° | Exit tablet mode after stable classification |
 | Between thresholds | Retain the prior mode |
-| Fresh, plausible movement | Retain the last mode and restart confirmation of a new transition |
+| Fresh, plausible movement | Retain the last mode while motion continues for up to 10 s after the last stationary reading, then clear it after the 1.5 s invalid-data timeout; restart confirmation of a new transition |
 | Hinge exactly vertical | Angle is unobservable; retain prior mode, defaulting to laptop at startup |
 | Nearly closed with Hall still open | Can resemble the fully folded boundary |
-| Closed lid | Clear tablet mode immediately |
+| Closed lid | Clear tablet mode immediately; skip sensor reads while closed |
 | Invalid/missing gravity | Clear after 1.5 seconds |
-| Transient I/O timeout/read failure | Treat as a missing sample, with the same 1.5 s budget |
-| Identity, ownership or lid error | Confirm OFF and suspend detection; keep cooling active and retry |
+| Transient I/O timeout/read failure | Treat as a missing sample for up to six consecutive reads (1.5 s), then handle as an error |
+| Identity, ownership or lid error | Confirm OFF and suspend detection; keep cooling active and retry after 30 s, doubling to at most 5 min until detection has stayed healthy for 5 min |
 
-Sampling is normally every 250 ms. A gap longer than 750 ms resets pending
-confirmation and motion history. These are gravity estimates, not measurements
+Sampling runs every 250 ms while a transition, motion or missing data may be in
+progress. After 2 s of settled posture it slows to every 2 s and returns to
+250 ms as soon as a new reading changes the angle by 10° or more, starts a
+transition, moves or fails; an opened or closed lid is evaluated at once. A
+folding or unfolding is therefore noticed within 2 s and confirmed after the
+usual 500 ms. At the slow rate, missing data still releases input 1.25 s after
+the expected sample. A gap longer than 750 ms resets pending confirmation and
+motion history. These are gravity estimates, not measurements
 from a calibrated hinge encoder. A physical 180° position may fall on either
 side of the threshold gap.
 

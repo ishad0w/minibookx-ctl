@@ -207,8 +207,12 @@ pub(crate) fn parse(text: String) -> io::Result<Loaded> {
                 policy.push('\n');
             }
         }
+        let config = Config::from_text(&policy).map_err(io::Error::other)?;
+        // Every loaded file controls live hardware; only unit tests construct
+        // simulation-only low-duty policies directly through Config::from_text.
+        config.validate_for_hardware().map_err(io::Error::other)?;
         (
-            Config::from_text(&policy).map_err(io::Error::other)?,
+            config,
             None,
             PowerConfig::default(),
             fan_control.unwrap_or(true),
@@ -307,6 +311,16 @@ mod tests {
         fs::write(&path, "# accidentally emptied during editing\n").unwrap();
         assert!(load(&path).is_err());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn flat_files_receive_the_same_live_hardware_bounds_as_presets() {
+        // The daemon, reload, installer preflight and --check-config all use
+        // this loader; a simulation-only curve must never reach the broker.
+        for flat in ["curve = 60:20\n", "curve = 90:35\nemergency_c = 100\n"] {
+            assert!(parse(flat.into()).is_err(), "{flat}");
+        }
+        assert!(parse("curve = 60:35\n".into()).is_ok());
     }
 
     #[test]

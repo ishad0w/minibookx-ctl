@@ -116,8 +116,6 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::e
             }
             require_unprivileged_config()?;
             let loaded = presets::load(&path)?;
-            loaded.config.validate_for_hardware()?;
-            loaded.power.validate()?;
             println!(
                 "configuration valid; profile={} fan_control={} power_control={}",
                 loaded.preset.map_or("custom".into(), |p| p.to_string()),

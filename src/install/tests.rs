@@ -2,6 +2,7 @@ use super::*;
 use std::{
     os::unix::fs::symlink,
     sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
 };
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -91,6 +92,8 @@ struct FakeHost {
     interrupt_during_rollback: bool,
     corrupt_on_failed_start: Option<PathBuf>,
     exit_after_observations: Option<u32>,
+    /// Like systemctl, refuse enable/disable once the unit file is gone.
+    unit_file: Option<PathBuf>,
 }
 impl FakeHost {
     fn running() -> Self {
@@ -113,6 +116,7 @@ impl FakeHost {
             interrupt_during_rollback: false,
             corrupt_on_failed_start: None,
             exit_after_observations: None,
+            unit_file: None,
         }
     }
 }
@@ -162,6 +166,11 @@ impl Host for FakeHost {
             }
             return Err(refuse("injected command failure"));
         }
+        if matches!(args[0], "enable" | "disable")
+            && self.unit_file.as_ref().is_some_and(|path| !path.exists())
+        {
+            return Err(refuse("Unit file minibookx-ctl.service does not exist."));
+        }
         match args[0] {
             "stop" if args[1] == RECOVERY_UNIT => self.recovery.active = false,
             "stop" => {
@@ -175,8 +184,9 @@ impl Host for FakeHost {
         }
         if args[0] == "start" && self.interrupt_on_start {
             self.interrupt_on_start = false;
-            // The isolated helper below targets only its own blocked thread.
             assert_eq!(
+                // SAFETY: the isolated helper below targets only its own
+                // thread, where the installer has blocked this signal.
                 unsafe {
                     libc::pthread_kill(
                         libc::pthread_self(),
@@ -196,6 +206,7 @@ impl Host for FakeHost {
         self.recoveries += 1;
         if self.recoveries == 2 && self.interrupt_during_rollback {
             assert_eq!(
+                // SAFETY: as above, for the rollback interruption.
                 unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGUSR2) },
                 0
             );
@@ -406,7 +417,7 @@ fn installer_options_reject_ambiguous_or_live_staging_combinations() {
 }
 
 #[test]
-fn old_recovery_or_stop_failure_prevents_binary_replacement_and_restart() {
+fn old_recovery_or_stop_failure_prevents_binary_replacement_and_restores_service() {
     for failure in ["stop", "recovery", "module.lease", "sensor.lease"] {
         let mut fixture = Fixture::new();
         fixture.install();
@@ -435,9 +446,55 @@ fn old_recovery_or_stop_failure_prevents_binary_replacement_and_restart() {
             fixture.target.parents(&path, true).unwrap();
             host.leave_lease = Some(path);
         }
+        let error = apply(
+            true,
+            &Options::default(),
+            &fixture.target,
+            &fixture.source,
+            &mut host,
+        )
+        .unwrap_err();
+        assert_eq!(fixture.bytes(BINARY).unwrap(), b"\x7fELFold-image");
+        assert_eq!(
+            fs::metadata(config_directory).unwrap().mode() & 0o777,
+            0o755
+        );
+        // Nothing was replaced. A controller this update stopped is started
+        // again; its own --prepare decides whether pending ownership allows
+        // it. A failed stop leaves the still-running service untouched.
+        let restarted = host
+            .events
+            .iter()
+            .any(|event| event == "start minibookx-ctl.service");
+        assert_eq!(restarted, failure != "stop", "{failure}: {:?}", host.events);
+        assert_eq!(
+            error.to_string().contains("previous service"),
+            failure != "stop",
+            "{error}"
+        );
+        if let Some(path) = &host.leave_lease {
+            assert!(
+                path.exists(),
+                "pending ownership must survive a refused update"
+            );
+        }
+    }
+}
+
+#[test]
+fn refused_removal_and_unusable_recovery_binary_never_restart_the_service() {
+    for case in ["removal", "non-elf"] {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        if case == "non-elf" {
+            fixture.write(BINARY, b"not an ELF image", 0o755);
+        }
+        fixture.target.live = true;
+        let mut host = FakeHost::running();
+        host.fail_recovery = case == "removal";
         assert!(
             apply(
-                true,
+                case != "removal",
                 &Options::default(),
                 &fixture.target,
                 &fixture.source,
@@ -445,16 +502,16 @@ fn old_recovery_or_stop_failure_prevents_binary_replacement_and_restart() {
             )
             .is_err()
         );
-        assert_eq!(fixture.bytes(BINARY).unwrap(), b"\x7fELFold-image");
-        assert_eq!(
-            fs::metadata(config_directory).unwrap().mode() & 0o777,
-            0o755
+        assert!(
+            !host.events.iter().any(|event| event.starts_with("start ")),
+            "{case}: {:?}",
+            host.events
         );
-        assert!(!host.events.iter().any(|event| event.starts_with("start ")));
-        if let Some(path) = &host.leave_lease {
+        if case == "non-elf" {
             assert!(
-                path.exists(),
-                "pending ownership must survive a refused update"
+                !host.events.iter().any(|event| event.starts_with("stop ")),
+                "an unusable recovery binary must be refused before stopping: {:?}",
+                host.events
             );
         }
     }
@@ -564,6 +621,7 @@ fn a_new_failed_install_stops_auto_restart_and_removes_enabled_unit() {
     let mut host = FakeHost::running();
     host.state = State::default();
     host.fail = Some("start minibookx-ctl.service");
+    host.unit_file = Some(fixture.target.path(UNIT_FILE).unwrap());
     let error = apply(
         true,
         &Options {

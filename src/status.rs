@@ -238,6 +238,7 @@ mod tests {
         ));
         fs::create_dir(&dir).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        // SAFETY: geteuid has no arguments and cannot fail.
         let owner = unsafe { libc::geteuid() };
         let root = File::open(&dir).unwrap();
         check_directory(&root, owner).unwrap();

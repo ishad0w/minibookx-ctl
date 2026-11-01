@@ -18,6 +18,19 @@ assert not any(
     for line in main_unit.splitlines()
 )
 assert "DevicePolicy=closed" in main_unit.splitlines()
+for line in (
+    "PrivateNetwork=yes",
+    "RestrictAddressFamilies=AF_UNIX",
+    "SystemCallFilter=@system-service @module",
+    "SystemCallErrorNumber=EPERM",
+    "ProtectProc=invisible",
+):
+    assert line in main_unit.splitlines(), line
+# /proc/cpuinfo is part of the hardware identity check; modules load at runtime.
+assert not any(
+    line.startswith(("ProcSubset=", "ProtectKernelModules="))
+    for line in main_unit.splitlines()
+)
 assert "ExecStopPost=/usr/local/bin/minibookx-ctl --recover" in main_unit.splitlines()
 assert "OnFailure=" not in main_unit
 assert not (REPO / "packaging/minibookx-ctl-recover.service").exists()

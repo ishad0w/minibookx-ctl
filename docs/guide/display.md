@@ -1,7 +1,8 @@
 # 60 Hz and startup display corruption
 
-The original panel mode is 50 Hz, so it cannot show every frame of 60 fps video.
-On the tested U300, a 60 Hz timing also removed the corruption seen after startup.
+The firmware's panel mode is 50 Hz, so it cannot show every frame of 60 fps video.
+In limited testing on one U300, a 60 Hz timing also prevented the corruption
+seen after startup; the [panel reference](../hardware/panel.md) has the evidence.
 This setup uses the distribution's existing i915 driver; no module build is needed.
 
 > [!WARNING]
@@ -33,9 +34,8 @@ Keep a working kernel and its boot image separate from the files you will
 regenerate. An already working LTS entry can serve this purpose; a second entry
 pointing to the same images cannot. Keep the menu accessible during testing.
 
-If startup corruption makes the current display unusable, sleep and wake
-temporarily restored it on the tested unit. Use recovery media if that does
-not help.
+If startup corruption makes the current display unusable, a sleep and wake
+cycle may restore it temporarily. Use recovery media if that does not help.
 
 ## 1. Prepare the timing file
 
@@ -46,11 +46,15 @@ Use a fresh directory name if `~/minibookx-panel` already exists.
 ```sh
 mkdir -m 0700 ~/minibookx-panel
 cd ~/minibookx-panel
-umask 077
-sudo cat /sys/kernel/debug/dri/0000:00:02.0/i915_vbt > local-u300.vbt
-python3 /path/to/minibookx-ctl/contrib/vbt/build_vbt.py \
-  --input local-u300.vbt --output generated-vbt
+(
+  umask 077
+  sudo cat /sys/kernel/debug/dri/0000:00:02.0/i915_vbt > local-u300.vbt
+  python3 /path/to/minibookx-ctl/contrib/vbt/build_vbt.py \
+    --input local-u300.vbt --output generated-vbt
+)
 ```
+
+The parentheses keep the private file mode for these commands only.
 
 If the debugfs directory is missing, check [the debugfs mount](../reference/kernel-support.md#debugfs).
 Some kernels use a different directory name under `/sys/kernel/debug/dri/`.
@@ -77,6 +81,15 @@ The display driver can load before the normal filesystem, so the file must also
 be in the **initramfs**, Linux's early boot image. Use the tool your installation
 already uses. Configure inclusion below, but wait until step 3 to regenerate it.
 
+On Debian and Ubuntu, check which package provides `update-initramfs`:
+
+```sh
+dpkg -S /usr/sbin/update-initramfs
+```
+
+If it names `initramfs-tools`, use the initramfs-tools section. If it names
+dracut, as on Ubuntu 26.04 desktop installations, use the dracut section.
+
 ### mkinitcpio — Arch and CachyOS
 
 Create `/etc/mkinitcpio.conf.d/60-minibookx-panel.conf` containing:
@@ -88,7 +101,7 @@ FILES+=(/usr/lib/firmware/i915/chuwi-u300-60.bin)
 On an older mkinitcpio without drop-in support, add the path to the existing
 `FILES` array in `/etc/mkinitcpio.conf` instead.
 
-### dracut — Fedora and other dracut systems
+### dracut — Fedora, dracut-based Ubuntu and other dracut systems
 
 Create `/etc/dracut.conf.d/60-minibookx-vbt.conf` containing:
 
@@ -134,17 +147,19 @@ for another setup, use [its argument location](boot.md#adding-kernel-arguments).
 <summary>CachyOS Limine: main kernel at 60 Hz, existing LTS fallback at 50 Hz</summary>
 
 This assumes `linux-cachyos` and an independently bootable `linux-cachyos-lts`
-are already installed. In `/etc/default/limine`, give the main kernel the new
-argument and give LTS its own full command line without it:
+are already installed. In `/etc/default/limine`, leave `KERNEL_CMDLINE[default]`
+unchanged and add one line for the main kernel only:
 
 ```text
-KERNEL_CMDLINE[default]="<your existing arguments> i915.vbt_firmware=i915/chuwi-u300-60.bin"
-KERNEL_CMDLINE[linux-cachyos-lts]="<your existing arguments>"
+KERNEL_CMDLINE[linux-cachyos]="<existing default arguments> i915.vbt_firmware=i915/chuwi-u300-60.bin"
 ```
 
-Replace both placeholders before saving. A kernel-specific value **replaces**
-the default, so retain root, encryption, subvolume and any orientation settings
-in both values. Quiet-boot options are optional.
+Replace the placeholder with the complete current `KERNEL_CMDLINE[default]`
+value before saving. A kernel-specific value **replaces** the default, so it
+must retain root, encryption, subvolume and any orientation settings.
+Quiet-boot options are optional. If a `KERNEL_CMDLINE[linux-cachyos]` line
+already exists, add the argument to it instead. The LTS kernel keeps the
+default line.
 
 Check the resolved arguments:
 
@@ -159,7 +174,17 @@ that kernel alone, leaving the recovery images unchanged for the first trial.
 </details>
 
 Other configurations that apply arguments to every kernel also need a separate
-recovery command line without the override.
+recovery command line without the override:
+
+- **Debian / Ubuntu GRUB:** put the argument in `GRUB_CMDLINE_LINUX_DEFAULT`.
+  The "(recovery mode)" entries omit that variable but include
+  `GRUB_CMDLINE_LINUX`, so they stay at 50 Hz.
+- **Arch GRUB:** recovery entries are disabled by default. Try the argument for
+  one boot in the boot menu's entry editor before saving it, and keep a second
+  installed kernel; the editor can also remove the argument from its entry.
+- **Fedora:** change one kernel with
+  `sudo grubby --update-kernel=<test kernel path> --args=i915.vbt_firmware=i915/chuwi-u300-60.bin`;
+  use `--remove-args` with the same value to undo it.
 
 Then regenerate the **test kernel's** boot image using your normal tools:
 
@@ -169,6 +194,7 @@ Then regenerate the **test kernel's** boot image using your normal tools:
 | Arch with mkinitcpio | `sudo mkinitcpio -p linux` | `lsinitcpio /boot/initramfs-linux.img` |
 | Conventional Fedora with dracut | `sudo dracut --force --kver "$(uname -r)"` | `lsinitrd "/boot/initramfs-$(uname -r).img"` |
 | Debian / Ubuntu with initramfs-tools | `sudo update-initramfs -u -k "$(uname -r)"` | `lsinitramfs "/boot/initrd.img-$(uname -r)"` |
+| Debian / Ubuntu with dracut | `sudo update-initramfs -u -k "$(uname -r)"` | `lsinitrd "/boot/initrd.img-$(uname -r)"` |
 
 Use your installed kernel's name and actual image path. If adding the arguments
 already regenerated the test image through the same tool, inspect that image
@@ -193,8 +219,22 @@ If the picture is corrupted, boot the recovery entry. To return to the original
 50 Hz timing, remove only the `i915.vbt_firmware` argument from the selected
 entry. You can do this temporarily in the boot menu's entry editor, then remove
 it from the persistent configuration once booted. The unused timing file may
-stay on disk. To remove it entirely, also remove its inclusion configuration
-and regenerate the affected images.
+stay on disk.
+
+To remove the setup entirely, work in this order:
+
+1. Remove `i915.vbt_firmware=i915/chuwi-u300-60.bin` from every persistent
+   command line and apply the change as in step 3.
+2. Delete the inclusion file you created in step 2:
+   `/etc/mkinitcpio.conf.d/60-minibookx-panel.conf`,
+   `/etc/dracut.conf.d/60-minibookx-vbt.conf` or
+   `/etc/initramfs-tools/hooks/minibookx-vbt`.
+3. Delete `/usr/lib/firmware/i915/chuwi-u300-60.bin`.
+4. Regenerate the boot image of each kernel that included the file, using the
+   commands from step 3.
+
+Keep this order: the initramfs-tools hook fails when the timing file is
+missing, so deleting the file first would make later kernel updates fail.
 
 50 Hz can bring back the original startup problem. If 60 Hz is unusable or
 does not fix it, collect the kernel log; the [i915 reference](../../contrib/i915/README.md)
@@ -213,6 +253,9 @@ VBT override if you want it to retain 50 Hz.
 - Resolution and panel color depth remain unchanged. The setup uses RGB888.
 - Kernel updates should carry the inclusion setting forward through your normal
   image generator. Check the selected argument and image if the rate reverts.
+- **Before a BIOS update**, remove `i915.vbt_firmware=` from the boot
+  configuration. Afterwards, dump the new panel table and rerun the builder as
+  in step 1. If it refuses the new table, stay at 50 Hz.
 - Rotation is separate; use [panel orientation](boot.md#panel-orientation) if
   the image returns sideways after unfolding.
 

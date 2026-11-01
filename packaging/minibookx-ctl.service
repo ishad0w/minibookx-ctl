@@ -36,7 +36,13 @@ DevicePolicy=closed
 DeviceAllow=char-input r
 DeviceAllow=char-i2c rw
 DeviceAllow=/dev/uinput rw
-InaccessiblePaths=/tmp /var/tmp
+InaccessiblePaths=/tmp /var/tmp -/dev/shm -/dev/mqueue
+# Only path AF_UNIX sockets are needed: system D-Bus for the worker and the
+# notify socket for the broker. No host network or abstract socket namespace.
+PrivateNetwork=yes
+ProtectProc=invisible
+NoExecPaths=/run/minibookx-ctl
+TasksMax=16
 ProtectHome=yes
 ProtectSystem=strict
 ProtectKernelTunables=yes
@@ -48,13 +54,15 @@ ReadWritePaths=/run/minibookx-ctl
 # Keep /sys protected while allowing a late EC leaf in a root-only alias.
 BindPaths=-/sys/kernel/debug:/run/minibookx-ctl/hardware/debugfs
 ReadWritePaths=-/sys/module/ec_sys/parameters/write_support
-# Only the bounded broker can use these files. Configuration keeps power
-# control disabled by default; enabling it requires no additional unit files.
+# Only the bounded broker can use these files; power control is off by default
+# in the configuration.
 ReadWritePaths=-/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw
 ReadWritePaths=-/sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw
 # RAPL indices are discovered by long_term/short_term names, not their numbers.
 ReadWritePaths=-/sys/class/powercap/intel-rapl:0/constraint_2_power_limit_uw
-RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictAddressFamilies=AF_UNIX
+SystemCallFilter=@system-service @module
+SystemCallErrorNumber=EPERM
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

@@ -29,9 +29,8 @@ A driver can be a loadable module or built into the kernel. If `modinfo` fails,
 check the kernel configuration and exposed device interfaces before concluding
 that it is absent. EC access requires `CONFIG_ACPI_EC_DEBUGFS`.
 
-The standard unit prepares `uinput` and `i2c-dev` at activation, including when
-`--no-tablet` disables detection. Stock systemd module-load units run before its
-device filter is created so the allow-listed devices can be recognized.
+Stock systemd module-load units run before the unit's device filter is created
+so the allow-listed devices can be recognized.
 
 ## Distribution kernels
 

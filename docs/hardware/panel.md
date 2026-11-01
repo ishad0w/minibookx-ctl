@@ -26,7 +26,7 @@ the physical output quality.
 
 ### Fixed mode and readiness
 
-On Linux 7.2.11, this DSI path exposes one fixed VBT mode when i915 initializes.
+In the Linux 7.2.11 i915 driver, this DSI path exposes one fixed VBT mode when it initializes.
 A 60 Hz override replaces the selected 50 Hz timing rather than adding another
 GNOME choice. Other VBT panel slots describe alternative panels, not extra
 refresh modes. Live switching would need driver changes and correct clock

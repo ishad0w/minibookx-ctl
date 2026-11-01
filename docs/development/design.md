@@ -10,7 +10,7 @@ systemd service:
 |---|---|---|
 | Hardware broker | Read temperatures/posture sensors, apply bounded fan and optional power requests | Fixed hardware interfaces; root |
 | Policy worker | Parse config, choose fan targets, handle reloads and sleep events | Dedicated service user; no raw hardware descriptors |
-| Tablet guardian | Keep the virtual tablet switch alive and send OFF during recovery | Its uinput descriptor; dedicated service user |
+| Tablet guardian | Keep the virtual tablet switch alive and send OFF during recovery | Shared uinput descriptor; same service user as the worker, no capabilities |
 
 ```mermaid
 flowchart LR
@@ -30,12 +30,8 @@ capabilities before becoming the policy worker, parsing config or connecting to
 D-Bus. Configuration
 can choose bounded settings, but cannot name commands, registers, device paths
 or privileged hooks. systemd further restricts capabilities and writable paths.
-See the [security model](../../SECURITY.md) for the trust boundary.
-
-The unit starts as the system manager's default UID 0 without ambient
-capabilities. Both children drop UID/GID, supplementary groups and all capability
-sets; the VM checks this boundary. The broker then retains only `CAP_KILL` for
-child supervision, while still being a root process.
+The [service permissions](../../SECURITY.md#service-permissions) describe each
+process's UID and capabilities.
 
 The broker sends systemd READY only after the worker completes startup. A fixed
 worker heartbeat request, sent while awake and paused, permits the broker to
@@ -91,16 +87,18 @@ Hot takeover bypasses the ordinary start/up holds; reducing inherited cooling
 still requires the cooling hold. Later starts and speed increases share the
 [accumulated-heat rules](../reference/configuration.md#fan-settings).
 
-The broker waits for IPC, lid notifications or the nearest active monotonic
-deadline. Posture samples and guardian heartbeats have separate deadlines;
-early events do not resample sensors or send extra heartbeats. Missed posture
-slots are skipped rather than replayed. Posture sampling and confirmation follow
-the [sensor timing rules](../hardware/tablet-sensors.md#detection).
+The broker waits for IPC, lid notifications, signals or the nearest active
+monotonic deadline. One 1-second tick carries the guardian heartbeat, the
+independent CPU-temperature check during manual control and a child-exit
+recheck; it runs only while one of those is needed. Child exits otherwise arrive
+as SIGCHLD through the same signal descriptor. Posture sampling follows the
+estimator's cadence, and a slow settled sample lands on a tick; early events do
+not resample sensors or send extra heartbeats. Posture sampling and confirmation
+follow the [sensor timing rules](../hardware/tablet-sensors.md#detection).
 
-During manual control, a successful fresh CPU-temperature read schedules the
-next independent check one second after its completion. A Duty request uses the
-same accounting, avoiding a second read in that iteration. A failed read cannot
-defer protection. EC health retains its five-second cache and deadline.
+A Duty request also reads the CPU temperature; a failed read stops the broker
+and returns the fan to firmware. EC health is refreshed at most every five
+seconds, on a wakeup that already occurs.
 The worker and broker have independent high-temperature guards.
 The broker alone evaluates tachometer health and reports the result to the
 worker; the worker cannot suppress that check while managed fan control is
@@ -111,10 +109,10 @@ to track fan starts and latch its own emergency policy. A broker-only heat pulse
 therefore cannot bypass the policy's minimum run time; its timer starts
 conservatively when the worker first observes the start.
 Unchanged fan commands are not rewritten; sampling does not launch subprocesses.
-With tablet detection disabled, inactive sensor/guardian deadlines are excluded.
-Child exit checks run at most one second apart; guardian socket disconnection
-wakes the broker immediately. Paused operation excludes sensor, thermal and
-guardian-heartbeat deadlines; the guardian's timeout is disarmed until resume.
+With tablet detection disabled and firmware fan control, the broker has no
+periodic wakeup. Guardian socket disconnection wakes it immediately. Paused
+operation excludes sensor, thermal and guardian-heartbeat deadlines; the
+guardian's timeout is disarmed until resume.
 
 Only a changed tablet boolean sends a guardian command. The first estimate
 always sends an explicit command, including OFF/ACK, to arm guardian supervision.
@@ -182,20 +180,21 @@ own fan algorithm; it does not establish an independent thermal safeguard.
 
 ### Tablet-switch recovery
 
-The guardian owns the same virtual switch descriptor throughout operation.
-When its broker connection closes or its awake heartbeat expires, it establishes
-tablet OFF before removing the device, writing an event unless already known
-OFF. This matters because device removal alone may leave input inhibited in
-libinput.
+The guardian and broker hold the same virtual switch descriptor throughout
+operation. When its broker connection closes or its awake heartbeat expires, the
+guardian establishes tablet OFF, writing an event unless already known OFF, and
+exits. Neither process destroys the device explicitly: it disappears only after
+the broker also closes its copy. This matters because device removal alone may
+leave input inhibited in libinput.
 
 An acknowledgement confirms that the switch is known OFF through that live
 descriptor, not that the desktop consumed an event. An incomplete OFF exchange
 invalidates further OFF requests on that connection: a late reply cannot confirm
 a later request. Cleanup instead reaps the guardian and uses its exit status or
-the broker's original descriptor. The broker retains a copy
-of that original descriptor. After reaping a failed guardian it forces OFF,
-keeps the device alive for event delivery, then closes its copy. Closing just
-one fork's reference must not destroy the shared device. An input-subsystem
+the broker's copy of the original descriptor. After reaping a failed guardian,
+the broker forces OFF through that copy, keeps the device alive for event
+delivery, then closes it. Closing just one fork's reference must not destroy
+the shared device. An input-subsystem
 failure or loss of both processes remains outside this guarantee. The service and watchdog
 use graceful SIGTERM before systemd's forced-kill deadline so ordinary shutdown
 can send OFF.

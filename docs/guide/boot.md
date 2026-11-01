@@ -123,9 +123,9 @@ or unified kernel images, use that installation's normal tools.
 
 After reboot, `cat /proc/cmdline` shows the arguments actually passed to Linux.
 
-In CachyOS Limine, a kernel-specific `KERNEL_CMDLINE[...]` value replaces the
-default rather than extending it. Keep the complete working arguments in each
-value. The native generator maintains images and hashes on updates. See the
+For how a kernel-specific CachyOS Limine `KERNEL_CMDLINE[...]` value combines
+with the default, see the [CachyOS Limine example](display.md#3-select-60-hz-and-regenerate).
+The native generator maintains images and hashes on updates. See the
 [CachyOS boot-manager documentation](https://wiki.cachyos.org/configuration/boot_manager_configuration/).
 
 The [60 Hz procedure](display.md) also needs early firmware inclusion and has

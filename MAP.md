@@ -25,6 +25,7 @@ verification commands live in [AGENTS.md](AGENTS.md); user setup starts in the
 | [src/sensor.rs](src/sensor.rs), [src/thermal.rs](src/thermal.rs) | CPU temperature readings and read-only thermal-capability inventory |
 | [src/platform.rs](src/platform.rs) | Shared hardware-profile rules and fixed system-tool discovery |
 | [src/paths.rs](src/paths.rs) | Shared installation, runtime and RAPL locations |
+| [src/process.rs](src/process.rs) | Deadline- and size-bounded output of short installer and doctor commands |
 | [src/status.rs](src/status.rs) | Bounded status-file validation and root/worker snapshot aggregation |
 | [src/doctor.rs](src/doctor.rs), [src/doctor_graphics.rs](src/doctor_graphics.rs) | Read-only reports and version-specific graphics-package advice |
 | [src/build_info.rs](src/build_info.rs) | Expose embedded build identity |
@@ -45,7 +46,7 @@ runtime trust boundaries. Keep the required boundaries in
 | [config/presets.conf](config/presets.conf) | Shipped user-config template and named profiles |
 | [packaging/minibookx-ctl.service](packaging/minibookx-ctl.service) | The single production unit, sandbox and recovery lifecycle |
 | [packaging/licenses/](packaging/licenses/), [THIRD_PARTY.md](THIRD_PARTY.md) | Dependency notices and source information |
-| [build.rs](build.rs), [Cargo.toml](Cargo.toml), [Cargo.lock](Cargo.lock) | Embedded notices/provenance, build features and locked Rust dependencies |
+| [build.rs](build.rs), [Cargo.toml](Cargo.toml), [Cargo.lock](Cargo.lock) | Embedded notices/provenance, build features, lint policy and locked Rust dependencies |
 | [third-party/libdbus.json](third-party/libdbus.json) | Pinned C dependency identity |
 
 ## Developer tools and tests
@@ -61,7 +62,10 @@ targets. Detailed build/release instructions are in
 | [scripts/package_release.py](scripts/package_release.py) | Package a clean commit, matching binary, notices and corresponding sources |
 | [scripts/release_format.py](scripts/release_format.py) | Read-only ELF, archive, checksum and metadata validation |
 | [scripts/publish_release.py](scripts/publish_release.py) | Guarded GitHub publication from the main-branch workflow |
-| [.github/workflows/ci.yml](.github/workflows/ci.yml) | Checks, static artifacts, distribution matrix, systemd VM and explicit manual publication |
+| [.github/workflows/ci.yml](.github/workflows/ci.yml) | Checks, static artifacts, distribution matrix, systemd VM, build provenance and explicit manual publication |
+| [rustfmt.toml](rustfmt.toml), [clippy.toml](clippy.toml) | Rust formatting style and Clippy lint thresholds |
+| [ruff.toml](ruff.toml) | Python lint rules, target version and excluded build output |
+| [requirements-dev.txt](requirements-dev.txt) | Pinned Python development tools used by `make check` |
 | [src/install/tests.rs](src/install/tests.rs) | Installer failure, ownership and rollback fixtures; other Rust tests are beside their modules |
 | [tests/tooling/](tests/tooling/) | Python regression tests plus offline Markdown/unit checks |
 | [tests/containers/](tests/containers/) | Distribution prerequisites, package advice and staged/mocked-service installer checks |

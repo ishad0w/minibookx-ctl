@@ -1,12 +1,13 @@
 //! Optional graphics package advice; no renderer or raw-device probes.
 use super::{Missing, OsRelease, Sources, clean, field, note, section, text, warning};
+use crate::process::Failure;
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
-    io::{self, Read},
-    os::{fd::AsRawFd, unix::process::CommandExt},
-    process::{Child, Command, Stdio},
-    time::{Duration, Instant},
+    io,
+    os::unix::process::CommandExt,
+    process::{Command, Stdio},
+    time::Duration,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,71 +196,20 @@ fn query_output(
             Ok(())
         });
     }
-    let mut child = command
+    let child = command
         .spawn()
         .map_err(|_| "could not start the unprivileged package query")?;
-    let mut stdout = child.stdout.take().expect("piped stdout");
-    // SAFETY: fcntl operates on this owned pipe and changes only O_NONBLOCK.
-    let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0
-        || unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-    {
-        stop_query(&mut child);
-        return Err("could not bound package-query output".into());
+    let output =
+        crate::process::collect(child, timeout, maximum).map_err(|failure| match failure {
+            Failure::Io(_) => "could not read package-query output",
+            Failure::Timeout => "package query exceeded its deadline",
+            Failure::Oversized => "package query exceeded its output limit",
+        })?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err("package database query failed; installed state is unknown".into())
     }
-    let deadline = Instant::now() + timeout;
-    let mut bytes = Vec::new();
-    let mut eof = false;
-    loop {
-        let mut chunk = [0; 8192];
-        loop {
-            if Instant::now() >= deadline {
-                stop_query(&mut child);
-                return Err("package query exceeded its deadline".into());
-            }
-            match stdout.read(&mut chunk) {
-                Ok(0) => {
-                    eof = true;
-                    break;
-                }
-                Ok(n) if bytes.len() + n <= maximum => bytes.extend_from_slice(&chunk[..n]),
-                Ok(_) => {
-                    stop_query(&mut child);
-                    return Err("package query exceeded its output limit".into());
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => {
-                    stop_query(&mut child);
-                    return Err("could not read package-query output".into());
-                }
-            }
-        }
-        match child.try_wait() {
-            Ok(Some(status)) if eof => {
-                return if status.success() {
-                    Ok(bytes)
-                } else {
-                    Err("package database query failed; installed state is unknown".into())
-                };
-            }
-            Ok(_) => (),
-            Err(_) => {
-                stop_query(&mut child);
-                return Err("could not wait for package query".into());
-            }
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-fn stop_query(child: &mut Child) {
-    // SAFETY: the child starts its own process group. Include descendants that
-    // could otherwise keep stdout open after their parent has exited.
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
-    }
-    let _ = child.wait();
 }
 
 fn package_row(key: &str, label: &str, names: &[&str], inventory: &Inventory) -> Value {
@@ -436,6 +386,8 @@ pub(super) fn collect(sources: &impl Sources, os: &Result<OsRelease, Missing>) -
             &["libva-utils"],
         ],
     };
+    // Count only package rows; the recipe-profile warning is not a package.
+    let package_rows = fields.len();
     for ((key, label), names) in [
         ("mesa_gl", "Mesa OpenGL"),
         ("mesa_vulkan", "Mesa Vulkan"),
@@ -448,7 +400,7 @@ pub(super) fn collect(sources: &impl Sources, os: &Result<OsRelease, Missing>) -
     {
         fields.push(package_row(key, label, names, &inventory));
     }
-    let missing = fields
+    let missing = fields[package_rows..]
         .iter()
         .filter(|row| row["state"] == "warning")
         .count();
@@ -510,6 +462,7 @@ pub(super) fn collect(sources: &impl Sources, os: &Result<OsRelease, Missing>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     fn collect(sources: &impl Sources) -> Value {
         super::collect(sources, &super::super::os_release(sources))
@@ -607,6 +560,26 @@ mod tests {
             );
             assert_eq!(row(&report, "mesa_gl")["state"], "warning");
         }
+    }
+
+    #[test]
+    fn unverified_recipe_warning_is_not_counted_as_a_missing_package() {
+        let inventory = [
+            "mesa-dri-drivers",
+            "mesa-vulkan-drivers",
+            "libva-intel-media-driver",
+            "intel-gpu-firmware",
+            "libva-utils",
+        ]
+        .map(|name| (format!("{name}:x86_64"), "1".to_owned()))
+        .into_iter()
+        .collect();
+        let report = collect(&Fake {
+            os: "ID=fedora\nVERSION_ID=45",
+            inventory: Ok(inventory),
+        });
+        assert_eq!(row(&report, "package_profile")["state"], "warning");
+        assert_eq!(row(&report, "package_status")["state"], "ok");
     }
 
     #[test]
@@ -749,6 +722,7 @@ mod tests {
     fn a_root_query_child_has_no_root_identity_groups_or_capabilities() {
         // Ordinary CI checks the unprivileged path; a disposable root container
         // can run this same assertion without changing the host's accounts.
+        // SAFETY: geteuid has no arguments and cannot fail.
         if unsafe { libc::geteuid() } != 0 {
             return;
         }

@@ -209,13 +209,31 @@ impl Lease {
     }
 }
 fn create_private(path: &Path, text: &str) -> io::Result<()> {
+    create_private_with(path, text, |file, bytes| file.write_all(bytes))
+}
+/// Ownership records precede hardware writes. A failed write (for example a
+/// full /run) must not leave a partial record that blocks every later start.
+fn create_private_with(
+    path: &Path,
+    text: &str,
+    write: impl FnOnce(&mut File, &[u8]) -> io::Result<()>,
+) -> io::Result<()> {
     let mut f = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
-    f.write_all(text.as_bytes())
+    if let Err(error) = write(&mut f, text.as_bytes()) {
+        return Err(match fs::remove_file(path) {
+            Ok(()) => error,
+            Err(cleanup) => io::Error::new(
+                error.kind(),
+                format!("{error}; partial record cleanup failed: {cleanup}"),
+            ),
+        });
+    }
+    Ok(())
 }
 fn modprobe(remove: bool) -> io::Result<()> {
     let mut c = Command::new(platform::system_tool("modprobe")?);
@@ -237,7 +255,7 @@ pub fn prepare() -> io::Result<()> {
     prepare_private_alias(&directory()?)?;
     // systemd retries this same unit after a failed start or runtime fault.
     // Restore any attributable orphaned state before creating a new lease.
-    cleanup_owned(None, true)?;
+    cleanup_owned(true)?;
     for module in ["uinput", "i2c-dev"] {
         if !Command::new(platform::system_tool("modprobe")?)
             .arg(module)
@@ -379,9 +397,9 @@ impl<T: EcIo> Drop for Session<T> {
 /// Root-only orphan recovery. The exclusive lock proves no cooperating runtime
 /// is alive; persistent root-owned lease/marker identify this controller's state.
 pub fn recover() -> io::Result<()> {
-    cleanup_owned(None, false)
+    cleanup_owned(false)
 }
-fn cleanup_owned(expected_id: Option<String>, startup: bool) -> io::Result<()> {
+fn cleanup_owned(startup: bool) -> io::Result<()> {
     root()?;
     let dir = match directory() {
         Ok(p) => p,
@@ -391,9 +409,9 @@ fn cleanup_owned(expected_id: Option<String>, startup: bool) -> io::Result<()> {
     let _lock = Lock::take(&dir)?;
     // This journal may precede module.lease, including when sensor wake or EC
     // setup failed. It is an independent domain even if another lease is bad.
-    let fan = cleanup_module(&dir, expected_id.as_deref());
+    let fan = cleanup_module(&dir);
     let power = crate::power::restore_journal();
-    let sensor = crate::tablet::recover_sensor(&dir, expected_id.as_deref());
+    let sensor = crate::tablet::recover_sensor(&dir);
     recovery_result(startup, fan, power, sensor)
 }
 
@@ -432,7 +450,7 @@ fn recover_independently(
     }
 }
 
-fn cleanup_module(dir: &Path, expected_id: Option<&str>) -> io::Result<()> {
+fn cleanup_module(dir: &Path) -> io::Result<()> {
     let lease = match Lease::read(&dir.join("module.lease")) {
         Ok(v) => v,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -441,10 +459,6 @@ fn cleanup_module(dir: &Path, expected_id: Option<&str>) -> io::Result<()> {
         }
         Err(e) => return Err(e),
     };
-    if expected_id.is_some_and(|id| lease.id != id) {
-        eprintln!("foreign lease: cleanup performs no writes");
-        return Ok(());
-    }
     restore_then_release(
         || {
             if lease.fan_control {
@@ -464,8 +478,7 @@ fn cleanup_module(dir: &Path, expected_id: Option<&str>) -> io::Result<()> {
                     eprintln!("auto restored; leaving busy ec_sys loaded: {e}");
                 }
             }
-            fs::remove_file(dir.join("module.lease"))?;
-            write_status("{\"active\":false,\"manual\":false}\n")
+            fs::remove_file(dir.join("module.lease"))
         },
     )
 }
@@ -520,13 +533,6 @@ fn restore_owned_fan(dir: &Path, id: &str) -> io::Result<()> {
         eprintln!("independent cleanup verified EC4F manual=0");
     }
     Ok(())
-}
-pub fn write_status(text: &str) -> io::Result<()> {
-    let dir = directory()?;
-    let temp = dir.join("status.tmp");
-    fs::write(&temp, text)?;
-    fs::set_permissions(&temp, fs::Permissions::from_mode(0o644))?;
-    fs::rename(temp, dir.join("status.json"))
 }
 #[cfg(test)]
 mod tests {
@@ -643,6 +649,21 @@ mod tests {
     }
 
     #[test]
+    fn failed_record_write_leaves_no_partial_ownership_record() {
+        let fixture = FanFixture::new();
+        let marker = fixture.marker();
+        let error = create_private_with(&marker, "owner\n", |file, bytes| {
+            file.write_all(&bytes[..2])?;
+            Err(io::Error::from_raw_os_error(libc::ENOSPC))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        assert!(!marker.exists());
+        create_private(&marker, "owner\n").unwrap();
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "owner\n");
+    }
+
+    #[test]
     fn shared_control_keeps_exclusive_ownership_until_the_last_sensor_guard_drops() {
         let fixture = FanFixture::new();
         let control = fixture.control();
@@ -688,6 +709,7 @@ mod tests {
         fs::create_dir(&private).unwrap();
         fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(&source).unwrap();
+        // SAFETY: geteuid has no arguments and cannot fail.
         let owner = unsafe { libc::geteuid() };
         let canonical = source.join("ec/ec0/io");
         assert_eq!(ec_path_at(&private, &source, owner).unwrap(), canonical);

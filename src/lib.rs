@@ -1,3 +1,15 @@
+/// Documentation for the running release; links are version-pinned.
+macro_rules! doc_url {
+    ($path:literal) => {
+        concat!(
+            "https://github.com/ishad0w/minibookx-ctl/blob/v",
+            env!("CARGO_PKG_VERSION"),
+            "/docs/",
+            $path
+        )
+    };
+}
+
 pub mod broker;
 pub mod build_info;
 pub mod doctor;
@@ -11,6 +23,7 @@ pub(crate) mod platform;
 pub mod policy;
 pub mod power;
 pub mod presets;
+pub(crate) mod process;
 pub(crate) mod rapl;
 pub mod runtime;
 pub mod sensor;

@@ -23,7 +23,16 @@ sha256sum --check --ignore-missing SHA256SUMS
 ```
 
 The Linux archive must report `OK`; stop on failure or if no file was checked.
-Checksums detect inconsistent downloads, not a compromised publisher.
+With the GitHub CLI, you can also confirm that this repository's release
+workflow built the archive:
+
+```sh
+gh attestation verify minibookx-ctl-*-x86_64-unknown-linux-musl.tar.gz \
+  --repo ishad0w/minibookx-ctl
+```
+
+See [installer trust](../../SECURITY.md#installer-trust) for what checksums and
+attestations prove.
 
 Extract it and enter the resulting directory. These patterns assume you
 downloaded exactly one Linux archive:

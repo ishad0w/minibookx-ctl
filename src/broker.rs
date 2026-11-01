@@ -10,7 +10,9 @@ use crate::{
     power::Manager,
     sensor::CpuSensor,
     service,
-    tablet::{Estimate, EstimateReason, HingeEstimator, SAMPLE_INTERVAL, Sensors, VirtualSwitch},
+    tablet::{
+        Estimate, EstimateReason, HingeEstimator, SAMPLE_INTERVAL, Sample, Sensors, VirtualSwitch,
+    },
 };
 use std::{
     ffi::CString,
@@ -24,11 +26,12 @@ use std::{
         },
     },
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 static STOP: AtomicBool = AtomicBool::new(false);
 static RELOAD: AtomicBool = AtomicBool::new(false);
+static TRANSIENT_ERRORS: AtomicU64 = AtomicU64::new(0);
 
 /// Independent of configurable policy. Keep a short pulse observable by the
 /// worker and require continuous cooling before releasing this safety override.
@@ -40,31 +43,127 @@ struct EmergencyGuard {
 
 const FAN_HEALTH_INTERVAL: Duration = Duration::from_secs(5);
 const TACH_GRACE: Duration = Duration::from_secs(10);
-const CPU_INTERVAL: Duration = Duration::from_secs(1);
-const CHILD_INTERVAL: Duration = Duration::from_secs(1);
 const DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(5);
 const POLICY_TIMEOUT: Duration = Duration::from_secs(12);
+/// One shared wakeup for the guardian heartbeat, the independent CPU guard
+/// and child checks. The guardian drops tablet mode after three missed ticks.
+const TICK: Duration = Duration::from_secs(1);
+const GUARDIAN_TIMEOUT: Duration = Duration::from_secs(3);
+/// Only sustained health restarts tablet retries at the shortest delay.
+const TABLET_HEALTHY_RESET: Duration = Duration::from_secs(300);
+/// Consecutive transient sensor errors tolerated as missing samples
+/// (the estimator's 1.5 s invalid-data window at 250 ms sampling).
+const TRANSIENT_SAMPLE_LIMIT: u32 = 6;
 
 #[derive(Default)]
 struct TabletRetry {
     next: Option<Duration>,
     failures: u32,
+    recovered_at: Option<Duration>,
 }
 impl TabletRetry {
     fn failed(&mut self, now: Duration) {
+        // A fault soon after recovery keeps growing the delay, so a flapping
+        // sensor cannot wake and power-cycle every 30 s indefinitely.
+        if self
+            .recovered_at
+            .take()
+            .is_some_and(|at| now.saturating_sub(at) >= TABLET_HEALTHY_RESET)
+        {
+            self.failures = 0;
+        }
         self.next = Some(now + Duration::from_secs((30_u64 << self.failures.min(4)).min(300)));
         self.failures = self.failures.saturating_add(1);
+    }
+    fn recovered(&mut self, now: Duration) {
+        self.next = None;
+        self.recovered_at = Some(now);
+    }
+    fn unavailable(&self) -> bool {
+        self.next.is_some()
     }
     fn due(&self, now: Duration) -> bool {
         self.next.is_some_and(|next| now >= next)
     }
 }
 
-fn transient_sample_error(error: &io::Error) -> bool {
-    matches!(
-        error.raw_os_error(),
-        Some(libc::EIO | libc::EREMOTEIO | libc::ETIMEDOUT | libc::EAGAIN | libc::EINTR)
-    )
+/// Transient I2C/IIO errors count as missing samples, so the estimator fails
+/// open after its invalid-data timeout. A persistent streak becomes an error
+/// and takes the bounded retry/backoff path instead of retrying the bus forever.
+fn classify_sample(result: io::Result<Sample>, streak: &mut u32) -> io::Result<Option<Sample>> {
+    match result {
+        Ok(sample) => {
+            *streak = 0;
+            Ok(Some(sample))
+        }
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EIO | libc::EREMOTEIO | libc::ETIMEDOUT | libc::EAGAIN | libc::EINTR)
+            ) && *streak < TRANSIENT_SAMPLE_LIMIT =>
+        {
+            // A flaky bus can alternate errors and good reads indefinitely. Log
+            // the 1st, 2nd, 4th, 8th... error so the journal stays bounded.
+            let total = TRANSIENT_ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
+            if total.is_power_of_two() {
+                eprintln!("transient tablet sensor error ({total} in this run): {error}");
+            }
+            *streak += 1;
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// A closed lid decides the posture: skip the I2C/IIO reads, and do not carry
+/// an earlier transient streak across the closed period.
+fn posture_sample(
+    lid_closed: Option<bool>,
+    read: Option<impl FnOnce() -> io::Result<Sample>>,
+    streak: &mut u32,
+) -> io::Result<Option<Sample>> {
+    match read.filter(|_| lid_closed != Some(true)) {
+        Some(read) => classify_sample(read(), streak),
+        None => {
+            *streak = 0;
+            Ok(None)
+        }
+    }
+}
+
+fn status_line(fan_control: bool, tablet_available: bool) -> String {
+    let fan = if fan_control {
+        "managed fan control"
+    } else {
+        "firmware fan control"
+    };
+    if tablet_available {
+        format!("STATUS=Controller active; {fan}")
+    } else {
+        format!("STATUS=Controller active; {fan}; tablet detection unavailable, retry scheduled")
+    }
+}
+
+/// Signals are blocked and read through signalfd; record them before any
+/// child-exit check so a normal stop is never reported as a child failure.
+/// Returns whether a child changed state.
+fn take_signals(signals: &crate::systemd::Signals) -> io::Result<bool> {
+    let mut children = false;
+    for signal in signals.drain()? {
+        match signal {
+            libc::SIGHUP => RELOAD.store(true, Ordering::Relaxed),
+            libc::SIGCHLD => children = true,
+            _ => STOP.store(true, Ordering::Relaxed),
+        }
+    }
+    Ok(children)
+}
+
+/// STATUS= is informational; a failed send must not stop cooling.
+fn announce(notify: &crate::systemd::Notifier, fan_control: bool, tablet_available: bool) {
+    if let Err(error) = notify.send(&status_line(fan_control, tablet_available)) {
+        eprintln!("systemd status update failed: {error}");
+    }
 }
 
 fn setup_tablet(
@@ -80,7 +179,7 @@ fn setup_tablet(
         g.send(b'P')?;
     }
     restore_sensors(sensors)?;
-    crate::tablet::recover_sensor(control.directory(), None)?;
+    crate::tablet::recover_sensor(control.directory())?;
     *lid = Some(Lid::discover()?);
     *sensors = Some(Sensors::discover(control)?);
     Ok(())
@@ -175,55 +274,47 @@ impl Periodic {
         self.next = now + self.interval - Duration::from_nanos(late as u64);
         true
     }
-    fn restart(&mut self, now: Duration) {
-        self.next = now + self.interval;
-    }
 }
 
 struct Schedule {
-    children: Periodic,
+    tick: Periodic,
     posture: Periodic,
-    heartbeat: Periodic,
-    cpu: Periodic,
 }
 impl Schedule {
     fn new(now: Duration) -> Self {
         Self {
-            children: Periodic::new(now, CHILD_INTERVAL),
+            tick: Periodic::new(now, TICK),
             posture: Periodic {
                 next: now,
                 interval: SAMPLE_INTERVAL,
             },
-            heartbeat: Periodic::new(now, SAMPLE_INTERVAL),
-            cpu: Periodic::new(now, CPU_INTERVAL),
         }
     }
-    fn deadline(&self, tablet_active: bool, fan_active: bool, health: &FanHealth) -> Duration {
-        let mut next = self.children.next;
+    /// The tick runs while the guardian needs heartbeats or the fan is
+    /// manual; nothing else wakes the broker periodically.
+    fn deadline(&self, tablet_active: bool, tick_active: bool) -> Duration {
+        let mut next = Duration::MAX;
         if tablet_active {
-            next = next.min(self.posture.next).min(self.heartbeat.next);
+            next = next.min(self.posture.next);
         }
-        if fan_active {
-            next = next.min(self.cpu.next).min(health.deadline());
+        if tick_active {
+            next = next.min(self.tick.next);
         }
         next
+    }
+    /// Follow the estimator's cadence; a slow sample lands on a tick that
+    /// already wakes the broker.
+    fn after_posture(&mut self, now: Duration, interval: Duration) {
+        self.posture.next = if interval > TICK {
+            self.tick.next.max(now) + interval - TICK
+        } else {
+            now + interval
+        };
     }
 }
 
 fn timeout_ms(deadline: Duration, now: Duration) -> i32 {
     crate::systemd::poll_timeout(deadline.saturating_sub(now))
-}
-
-/// Both policy requests and the independent guard use this accounting. Record
-/// completion only after a successful fresh read, never on an attempted read.
-fn sample_cpu(
-    read: impl FnOnce() -> io::Result<i32>,
-    deadline: &mut Periodic,
-    clock: impl FnOnce() -> Duration,
-) -> io::Result<i32> {
-    let temperature = read()?;
-    deadline.restart(clock());
-    Ok(temperature)
 }
 
 #[derive(Default)]
@@ -269,10 +360,6 @@ struct FanHealth {
     state: TachState,
 }
 impl FanHealth {
-    fn deadline(&self) -> Duration {
-        self.last_check
-            .map_or(Duration::ZERO, |last| last + FAN_HEALTH_INTERVAL)
-    }
     fn duty(&mut self, now: Duration, raw: u8) {
         if raw == 0 {
             self.spin_started = None;
@@ -352,15 +439,16 @@ extern "C" fn reload_signal(_: libc::c_int) {
     RELOAD.store(true, Ordering::Relaxed)
 }
 fn install_signals() -> io::Result<()> {
-    // SAFETY: these handlers only store to lock-free atomic booleans.
     for (signal, handler) in [
         (libc::SIGTERM, stop_signal as *const ()),
         (libc::SIGINT, stop_signal as *const ()),
         (libc::SIGHUP, reload_signal as *const ()),
     ] {
+        // SAFETY: an all-zero sigaction is a valid empty action and mask.
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
         action.sa_sigaction = handler as libc::sighandler_t;
         // No SA_RESTART: TERM must interrupt the guardian's disarmed read.
+        // SAFETY: the handlers only store to lock-free atomic booleans.
         if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -418,6 +506,7 @@ fn user() -> io::Result<(libc::uid_t, libc::gid_t)> {
             "dedicated minibookx-ctl account is missing; run installer",
         ));
     }
+    // SAFETY: p is non-null, and no other passwd lookup has run since.
     let (uid, gid) = unsafe { ((*p).pw_uid, (*p).pw_gid) };
     if uid == 0 || gid == 0 {
         return Err(io::Error::other("service account must be unprivileged"));
@@ -460,9 +549,12 @@ fn isolate_fds(fds: &[RawFd]) -> io::Result<Vec<RawFd>> {
         if copy < 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: fcntl has just returned this descriptor; nothing else owns it.
         copies.push(unsafe { OwnedFd::from_raw_fd(copy) });
     }
     for (index, fd) in copies.iter().enumerate() {
+        // SAFETY: every source already has a copy above the target slots, so
+        // dup2 cannot replace a descriptor that a later iteration still reads.
         if unsafe { libc::dup2(fd.as_raw_fd(), 3 + index as i32) } < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -477,6 +569,8 @@ fn isolate_fds(fds: &[RawFd]) -> io::Result<Vec<RawFd>> {
             .filter(|n| *n >= first_closed as i32)
             .collect();
         for n in fds {
+            // SAFETY: this post-fork child never uses or drops the inherited
+            // Rust handles; it leaves through _exit.
             unsafe {
                 libc::close(n);
             }
@@ -498,12 +592,14 @@ fn drop_user(uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
             io::Error::last_os_error()
         )));
     }
+    // SAFETY: plain integer IDs; the process is still single-threaded.
     if unsafe { libc::setresgid(gid, gid, gid) } != 0 {
         return Err(io::Error::other(format!(
             "drop gid: {}",
             io::Error::last_os_error()
         )));
     }
+    // SAFETY: as above; the group change has already succeeded.
     if unsafe { libc::setresuid(uid, uid, uid) } != 0 {
         let error = io::Error::last_os_error();
         let after = fs::read_to_string("/proc/self/status")
@@ -569,6 +665,7 @@ impl Child {
         }
         let mut status = 0;
         loop {
+            // SAFETY: status is a live integer and pid names this unreaped child.
             if unsafe { libc::waitpid(self.pid, &mut status, 0) } >= 0 {
                 self.status = Some(status);
                 return Ok(status);
@@ -644,8 +741,11 @@ impl Guardian {
             let result = (|| {
                 let fds =
                     isolate_fds(&[child_socket.into_raw_fd(), switch.into_fd().into_raw_fd()])?;
+                // SAFETY: isolate_fds moved each descriptor to its slot; one owner each.
                 let socket = unsafe { UnixStream::from_raw_fd(fds[0]) };
+                // SAFETY: as above, for the switch descriptor.
                 let switch = VirtualSwitch::from_fd(unsafe { OwnedFd::from_raw_fd(fds[1]) });
+                // SAFETY: PR_SET_NAME reads a static NUL-terminated name.
                 if unsafe { libc::prctl(libc::PR_SET_NAME, c"minibookx-guard".as_ptr(), 0, 0, 0) }
                     != 0
                 {
@@ -657,6 +757,7 @@ impl Guardian {
             if let Err(e) = &result {
                 eprintln!("tablet guardian: {e}")
             }
+            // SAFETY: leave the forked child without running inherited destructors.
             unsafe {
                 libc::_exit(i32::from(result.is_err()));
             }
@@ -703,18 +804,20 @@ impl Guardian {
         let acknowledgement = self.off();
         let _ = self.socket.shutdown(std::net::Shutdown::Both);
         let exited = self.child.stop();
-        // Reap the other writer before the final OFF; it can no longer race us
-        // with an old queued ON command. The original device stays alive here.
-        let backup_off = self.backup.as_mut().map(VirtualSwitch::force_off);
-        if backup_off.as_ref().is_some_and(Result::is_ok) {
-            std::thread::sleep(Duration::from_millis(250));
-        }
         // systemd sends TERM to the whole cgroup. The guardian may therefore
         // finish OFF/settle and close before our separate OFF request is read.
         // Only its preserved successful exit status proves that path completed.
         let clean_exit = exited
             .as_ref()
             .is_ok_and(|status| libc::WIFEXITED(*status) && libc::WEXITSTATUS(*status) == 0);
+        // Without that proof, write OFF through the original device after the
+        // other writer is reaped; it can no longer race an old queued ON.
+        let backup_off = (acknowledgement.is_err() && !clean_exit)
+            .then(|| self.backup.as_mut().map(VirtualSwitch::force_off))
+            .flatten();
+        if backup_off.as_ref().is_some_and(Result::is_ok) {
+            std::thread::sleep(Duration::from_millis(250));
+        }
         let confirmation = if acknowledgement.is_ok() {
             Some(OffConfirmation::Acknowledged)
         } else if clean_exit {
@@ -759,11 +862,11 @@ fn guardian_loop(mut socket: UnixStream, mut switch: VirtualSwitch) -> io::Resul
                 Ok(0) => break,
                 Ok(_) => match b[0] {
                     b'1' => {
-                        socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+                        socket.set_read_timeout(Some(GUARDIAN_TIMEOUT))?;
                         switch.send(true)?;
                     }
                     b'0' => {
-                        socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+                        socket.set_read_timeout(Some(GUARDIAN_TIMEOUT))?;
                         switch.send(false)?;
                         socket.write_all(b"0")?;
                     }
@@ -808,8 +911,10 @@ fn spawn_policy(
     if pid == 0 {
         let result = (|| {
             let fd = isolate_fd(socket.into_raw_fd())?;
+            // SAFETY: isolate_fd moved the socket to this slot; it has one owner.
             let socket = unsafe { UnixDatagram::from_raw_fd(fd) };
             fs::write("/proc/self/oom_score_adj", b"0\n")?;
+            // SAFETY: PR_SET_NAME reads a static NUL-terminated name.
             if unsafe { libc::prctl(libc::PR_SET_NAME, c"minibookx-work".as_ptr(), 0, 0, 0) } != 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -828,6 +933,7 @@ fn spawn_policy(
         if let Err(e) = &result {
             eprintln!("unprivileged policy: {e}")
         }
+        // SAFETY: leave the forked child without running inherited destructors.
         unsafe {
             libc::_exit(i32::from(result.is_err()));
         }
@@ -949,6 +1055,7 @@ fn await_startup(socket: &UnixDatagram, child: &mut Child) -> io::Result<(bool, 
 }
 pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
     hardware::check_profile()?;
+    // SAFETY: geteuid has no arguments and cannot fail.
     if unsafe { libc::geteuid() } != 0 {
         return Err(io::Error::other("--daemon requires the root system unit"));
     }
@@ -966,7 +1073,7 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
     let notify = crate::systemd::Notifier::from_environment()?;
     STOP.store(false, Ordering::Relaxed);
     RELOAD.store(false, Ordering::Relaxed);
-    let signals = crate::systemd::Signals::for_process()?;
+    let signals = crate::systemd::Signals::for_broker()?;
     let (fan_control, sequence) = await_startup(&parent, &mut child)?;
     // Fork both children before opening any hardware/ownership descriptor.
     let mut lid = None;
@@ -974,8 +1081,8 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
     // A shared guard serializes sensor wake and all later EC/RAPL operations.
     let control = hardware::Control::open()?;
     let mut sensors = None;
-    let mut tablet_failed = false;
     let mut tablet_retry = TabletRetry::default();
+    let mut transient_samples = 0_u32;
     if tablet_enabled {
         let setup = setup_tablet(&control, &mut guardian, &mut sensors, &mut lid);
         if let Err(error) = setup {
@@ -986,7 +1093,6 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                 &mut snapshots.tablet,
                 error,
             )?;
-            tablet_failed = true;
             tablet_retry.failed(Duration::ZERO);
         }
     }
@@ -1025,47 +1131,28 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
     let mut requests = 0_u32;
     let mut fan_report = None;
     let mut ready = false;
+    // A child may have exited before its SIGCHLD could reach the signalfd.
+    let mut children_event = true;
     let result = (|| {
         while !STOP.load(Ordering::Relaxed) {
-            for signal in signals.drain()? {
-                if signal == libc::SIGHUP {
-                    RELOAD.store(true, Ordering::Relaxed);
-                } else {
-                    STOP.store(true, Ordering::Relaxed);
-                }
-            }
+            children_event |= take_signals(&signals)?;
             if STOP.load(Ordering::Relaxed) {
                 break;
             }
             if RELOAD.swap(false, Ordering::Relaxed) {
+                // SAFETY: only Child::exited reaps the worker, and that ends this
+                // loop, so the PID still names the worker or its zombie.
                 unsafe {
                     libc::kill(child.pid, libc::SIGHUP);
                 }
             }
-            if schedule.children.take(epoch.elapsed()) {
-                if let Some(status) = child.exited()? {
-                    return Err(io::Error::other(format!(
-                        "policy process exited unexpectedly: {status}"
-                    )));
-                }
-                if let Some(g) = &mut guardian
-                    && g.child.exited()?.is_some()
-                {
-                    return Err(io::Error::other("tablet guardian exited"));
-                }
-            }
             let manual = session.fan.as_ref().is_some_and(|fan| fan.may_be_manual());
-            if !paused && manual && epoch.elapsed().saturating_sub(last_duty) >= POLICY_TIMEOUT {
-                return Err(io::Error::other("policy duty updates expired"));
+            let tablet_active = guardian.is_some() && !paused && !tablet_retry.unavailable();
+            let tick_active = !paused && (tablet_active || manual);
+            let mut deadline = schedule.deadline(tablet_active, tick_active);
+            if children_event {
+                deadline = epoch.elapsed();
             }
-            if !paused && last_request.elapsed() >= POLICY_TIMEOUT {
-                return Err(io::Error::other("policy heartbeat expired"));
-            }
-            let mut deadline = schedule.deadline(
-                guardian.is_some() && !paused && !tablet_failed,
-                !paused && session.fan.as_ref().is_some_and(|fan| fan.may_be_manual()),
-                &health,
-            );
             if let Some(next) = snapshots.deadline() {
                 deadline = deadline.min(next);
             }
@@ -1117,15 +1204,24 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
             if sources[3].revents != 0 {
                 // Drain before processing hardware IPC. A signal queued just
                 // before poll is readable, so there is no check/poll race.
-                for signal in signals.drain()? {
-                    if signal == libc::SIGHUP {
-                        RELOAD.store(true, Ordering::Relaxed);
-                    } else {
-                        STOP.store(true, Ordering::Relaxed);
-                    }
-                }
+                children_event |= take_signals(&signals)?;
                 if STOP.load(Ordering::Relaxed) {
                     break;
+                }
+            }
+            let tick = tick_active && schedule.tick.take(epoch.elapsed());
+            // SIGCHLD reports child exits; the tick rechecks them while active.
+            if children_event || tick {
+                children_event = false;
+                if let Some(status) = child.exited()? {
+                    return Err(io::Error::other(format!(
+                        "policy process exited unexpectedly: {status}"
+                    )));
+                }
+                if let Some(g) = &mut guardian
+                    && g.child.exited()?.is_some()
+                {
+                    return Err(io::Error::other("tablet guardian exited"));
                 }
             }
             for index in [0, 2] {
@@ -1134,7 +1230,15 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                 }
             }
             let lid_error = if sources[1].revents != 0 {
-                lid.as_mut().unwrap().drain(sources[1].revents).err()
+                let lid = lid.as_mut().unwrap();
+                let before = lid.closed();
+                let result = lid.drain(sources[1].revents).err();
+                // A real open/close is evaluated now, not at the next slow
+                // sample; repeated unchanged notifications cost no extra reads.
+                if lid.closed() != before {
+                    schedule.posture.next = schedule.posture.next.min(epoch.elapsed());
+                }
+                result
             } else {
                 None
             };
@@ -1162,27 +1266,15 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                         "startup mode is already fixed; restart required",
                     )),
                     Request::Ready if !ready => {
-                        notify.send(if fan_control {
-                            "READY=1\nWATCHDOG=1\nSTATUS=Controller active; managed fan control"
-                        } else {
-                            "READY=1\nWATCHDOG=1\nSTATUS=Controller active; firmware fan control"
-                        })?;
+                        let status = status_line(fan_control, !tablet_retry.unavailable());
+                        notify.send(&format!("READY=1\nWATCHDOG=1\n{status}"))?;
                         ready = true;
-                        if tablet_failed {
-                            notify.send("STATUS=Cooling active; tablet detection unavailable, retry scheduled")?;
-                        }
                         Ok(())
                     }
                     Request::Ready => {
                         Err(io::Error::other("policy readiness already acknowledged"))
                     }
                     Request::Heartbeat => {
-                        if !paused
-                            && session.fan.as_ref().is_some_and(|fan| fan.may_be_manual())
-                            && epoch.elapsed().saturating_sub(last_duty) >= POLICY_TIMEOUT
-                        {
-                            return Err(io::Error::other("policy duty updates expired"));
-                        }
                         if ready {
                             notify.send("WATCHDOG=1")?;
                         }
@@ -1202,16 +1294,15 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                                         &mut snapshots.tablet,
                                         error,
                                     )?;
-                                    tablet_failed = true;
                                     tablet_retry.failed(epoch.elapsed());
                                 } else {
-                                    tablet_failed = false;
-                                    tablet_retry = TabletRetry::default();
+                                    tablet_retry.recovered(epoch.elapsed());
                                 }
+                                transient_samples = 0;
+                                announce(&notify, fan_control, !tablet_retry.unavailable());
                             }
                             schedule.posture.next = epoch.elapsed();
-                            schedule.heartbeat.restart(epoch.elapsed());
-                            schedule.cpu.next = epoch.elapsed();
+                            schedule.tick.next = epoch.elapsed();
                         }
                         paused = false;
                         last_duty = epoch.elapsed();
@@ -1225,8 +1316,7 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                         let sensor = cpu
                             .as_ref()
                             .ok_or_else(|| io::Error::other("fan CPU sensor is unavailable"))?;
-                        let temperature =
-                            sample_cpu(|| sensor.read_mc(), &mut schedule.cpu, || epoch.elapsed())?;
+                        let temperature = sensor.read_mc()?;
                         let target = if emergency.observe(epoch.elapsed(), temperature) {
                             ec::MAX_RAW
                         } else {
@@ -1272,10 +1362,10 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                         snapshots.tablet.set(tablet_status_text(
                             Some(false),
                             None,
-                            !tablet_failed && !sensor_pending,
+                            !tablet_retry.unavailable() && !sensor_pending,
                             if sensor_pending {
                                 "RecoveryPending"
-                            } else if tablet_failed {
+                            } else if tablet_retry.unavailable() {
                                 "Unavailable"
                             } else {
                                 "Paused"
@@ -1316,14 +1406,23 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                     return Err(io::Error::other("hardware operation failed"));
                 }
             }
-            if !paused
-                && session.fan.as_ref().is_some_and(|fan| fan.may_be_manual())
-                && epoch.elapsed() >= schedule.cpu.next
-            {
+            // Evaluated after a queued request is consumed: a Duty that was
+            // already waiting must not be reported as an expired policy.
+            if !paused {
+                if session.fan.as_ref().is_some_and(|fan| fan.may_be_manual())
+                    && epoch.elapsed().saturating_sub(last_duty) >= POLICY_TIMEOUT
+                {
+                    return Err(io::Error::other("policy duty updates expired"));
+                }
+                if last_request.elapsed() >= POLICY_TIMEOUT {
+                    return Err(io::Error::other("policy heartbeat expired"));
+                }
+            }
+            if !paused && session.fan.as_ref().is_some_and(|fan| fan.may_be_manual()) && tick {
                 let sensor = cpu
                     .as_ref()
                     .ok_or_else(|| io::Error::other("fan CPU sensor is unavailable"))?;
-                let temp = sample_cpu(|| sensor.read_mc(), &mut schedule.cpu, || epoch.elapsed())?;
+                let temp = sensor.read_mc()?;
                 if emergency.observe(epoch.elapsed(), temp) {
                     session.fan.as_mut().unwrap().apply(ec::MAX_RAW)?;
                     health.duty(epoch.elapsed(), ec::MAX_RAW);
@@ -1338,29 +1437,28 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
             let tablet_result = (|| {
                 if !paused && tablet_retry.due(epoch.elapsed()) {
                     setup_tablet(&control, &mut guardian, &mut sensors, &mut lid)?;
-                    tablet_failed = false;
-                    tablet_retry = TabletRetry::default();
+                    tablet_retry.recovered(epoch.elapsed());
                     estimator.reset();
                     tablet_report = TabletReport::default();
                     schedule.posture.next = epoch.elapsed();
-                    schedule.heartbeat.restart(epoch.elapsed());
-                    notify.send("STATUS=Controller active; tablet detection recovered")?;
+                    announce(&notify, fan_control, true);
                 }
                 if let Some(error) = lid_error {
                     return Err(error);
                 }
                 if let Some(g) = &mut guardian {
-                    if !paused && !tablet_failed && schedule.posture.take(epoch.elapsed()) {
-                        let sample = match sensors.as_ref().map(Sensors::sample).transpose() {
-                            Ok(sample) => sample,
-                            Err(error) if transient_sample_error(&error) => None,
-                            Err(error) => return Err(error),
-                        };
-                        let estimate = estimator.update(
-                            sample,
-                            lid.as_ref().and_then(Lid::closed),
-                            epoch.elapsed(),
-                        );
+                    if !paused
+                        && !tablet_retry.unavailable()
+                        && schedule.posture.take(epoch.elapsed())
+                    {
+                        let lid_closed = lid.as_ref().and_then(Lid::closed);
+                        let sample = posture_sample(
+                            lid_closed,
+                            sensors.as_ref().map(|sensors| || sensors.sample()),
+                            &mut transient_samples,
+                        )?;
+                        let estimate = estimator.update(sample, lid_closed, epoch.elapsed());
+                        schedule.after_posture(epoch.elapsed(), estimator.next_interval());
                         let (snapshot, log) =
                             tablet_report.update(estimate, epoch.elapsed(), |tablet| {
                                 if tablet { g.send(b'1') } else { g.off() }
@@ -1383,7 +1481,7 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                             ));
                         }
                     }
-                    if !paused && !tablet_failed && schedule.heartbeat.take(epoch.elapsed()) {
+                    if tick && !paused && !tablet_retry.unavailable() {
                         g.send(b'.')?;
                     }
                 }
@@ -1397,10 +1495,9 @@ pub fn run(path: PathBuf, tablet_enabled: bool) -> io::Result<()> {
                     &mut snapshots.tablet,
                     error,
                 )?;
-                tablet_failed = true;
                 tablet_retry.failed(epoch.elapsed());
-                notify
-                    .send("STATUS=Cooling active; tablet detection unavailable, retry scheduled")?;
+                transient_samples = 0;
+                announce(&notify, fan_control, false);
                 estimator.reset();
             }
             let state = (
@@ -1521,16 +1618,79 @@ mod tests {
             assert!(retry.due(next));
             now = next;
         }
-        assert!(transient_sample_error(&io::Error::from_raw_os_error(
-            libc::EREMOTEIO
-        )));
-        assert!(!transient_sample_error(&io::Error::new(
-            io::ErrorKind::InvalidData,
-            "foreign CONTROL"
-        )));
-        assert!(!transient_sample_error(&io::Error::from_raw_os_error(
-            libc::ENODEV
-        )));
+        let mut streak = 0;
+        assert!(
+            classify_sample(
+                Err(io::Error::from_raw_os_error(libc::EREMOTEIO)),
+                &mut streak
+            )
+            .unwrap()
+            .is_none()
+        );
+        for error in [
+            io::Error::new(io::ErrorKind::InvalidData, "foreign CONTROL"),
+            io::Error::from_raw_os_error(libc::ENODEV),
+        ] {
+            assert!(classify_sample(Err(error), &mut 0).is_err());
+        }
+    }
+
+    #[test]
+    fn persistent_transient_errors_escalate_and_a_good_sample_resets_the_streak() {
+        let sample = || Sample {
+            primary: [0.0, 0.0, -1000.0],
+            secondary: [0.0, 0.0, -1000.0],
+        };
+        let eio = || Err(io::Error::from_raw_os_error(libc::EIO));
+        let mut streak = 0;
+        for _ in 0..TRANSIENT_SAMPLE_LIMIT {
+            assert!(classify_sample(eio(), &mut streak).unwrap().is_none());
+        }
+        assert!(classify_sample(eio(), &mut streak).is_err());
+        let mut streak = TRANSIENT_SAMPLE_LIMIT - 1;
+        assert!(
+            classify_sample(Ok(sample()), &mut streak)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(streak, 0);
+    }
+
+    #[test]
+    fn closed_lid_skips_sensor_reads_and_clears_the_transient_streak() {
+        let eio = || Err(io::Error::from_raw_os_error(libc::EIO));
+        let mut streak = TRANSIENT_SAMPLE_LIMIT - 1;
+        let unread = || -> io::Result<Sample> { panic!("closed lid read the sensors") };
+        assert!(
+            posture_sample(Some(true), Some(unread), &mut streak)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(streak, 0);
+        // After reopening, the limit counts only errors seen while open.
+        for _ in 0..TRANSIENT_SAMPLE_LIMIT {
+            assert!(
+                posture_sample(Some(false), Some(eio), &mut streak)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(posture_sample(None, Some(eio), &mut streak).is_err());
+    }
+
+    #[test]
+    fn only_sustained_health_restarts_tablet_retries_at_the_shortest_delay() {
+        let mut retry = TabletRetry::default();
+        retry.failed(Duration::ZERO);
+        retry.recovered(Duration::from_secs(30));
+        retry.failed(Duration::from_secs(31));
+        assert!(!retry.due(Duration::from_secs(90)));
+        assert!(retry.due(Duration::from_secs(91)));
+        retry.recovered(Duration::from_secs(100));
+        assert!(!retry.unavailable());
+        retry.failed(Duration::from_secs(400));
+        assert!(!retry.due(Duration::from_secs(429)));
+        assert!(retry.due(Duration::from_secs(430)));
     }
 
     #[test]
@@ -1779,35 +1939,22 @@ mod tests {
     }
 
     #[test]
-    fn early_wakes_do_not_multiply_posture_cpu_or_heartbeat_work() {
+    fn early_wakes_do_not_multiply_posture_or_tick_work() {
         let mut schedule = Schedule::new(Duration::ZERO);
-        let mut counts = [0; 4];
+        let (mut posture, mut ticks) = (0, 0);
         // Fake hardware sees 60,001 wakes (e.g. IPC/lid), but only due sources
         // may run. No wall clock sleeps or physical sensor reads are involved.
         for milliseconds in 0..=60_000 {
             let now = Duration::from_millis(milliseconds);
             if schedule.posture.take(now) {
-                counts[0] += 1;
+                posture += 1;
             }
-            if now >= schedule.cpu.next {
-                sample_cpu(
-                    || {
-                        counts[1] += 1;
-                        Ok(45_000)
-                    },
-                    &mut schedule.cpu,
-                    || now,
-                )
-                .unwrap();
-            }
-            if schedule.heartbeat.take(now) {
-                counts[2] += 1;
-            }
-            if schedule.children.take(now) {
-                counts[3] += 1;
+            if schedule.tick.take(now) {
+                ticks += 1;
             }
         }
-        assert_eq!(counts, [241, 60, 240, 60]);
+        // Heartbeat, CPU guard and child checks share one 1 Hz tick.
+        assert_eq!((posture, ticks), (241, 60));
     }
 
     #[test]
@@ -1826,57 +1973,31 @@ mod tests {
     }
 
     #[test]
-    fn inactive_sources_cannot_force_busy_polling() {
-        let mut schedule = Schedule::new(Duration::ZERO);
-        let health = FanHealth::default();
-        // --no-tablet with fan_control=false, and all paused modes: the stale
-        // zero posture/health deadlines are excluded. Only supervision remains.
-        for seconds in 0..60 {
-            let now = Duration::from_secs(seconds);
-            schedule.children.take(now);
-            assert_eq!(
-                timeout_ms(schedule.deadline(false, false, &health), now),
-                1000
-            );
-        }
-        assert_eq!(schedule.posture.next, Duration::ZERO);
-        assert_eq!(schedule.cpu.next, CPU_INTERVAL);
+    fn inactive_sources_cannot_force_periodic_wakeups() {
+        let schedule = Schedule::new(Duration::ZERO);
+        // --no-tablet with fan_control=false, and all paused modes: child exits
+        // arrive as SIGCHLD, so no periodic deadline remains.
+        assert_eq!(schedule.deadline(false, false), Duration::MAX);
+        assert_eq!(
+            timeout_ms(schedule.deadline(false, false), Duration::ZERO),
+            i32::MAX
+        );
+        assert_eq!(schedule.deadline(false, true), TICK);
+        assert_eq!(schedule.deadline(true, true), Duration::ZERO);
     }
 
     #[test]
-    fn fresh_duty_sample_defers_only_one_second_and_failed_reads_never_defer_guard() {
-        use std::cell::Cell;
-        let mut next = Periodic::new(Duration::ZERO, CPU_INTERVAL);
-        let reads = Cell::new(0);
-        let temperature = Cell::new(45_000);
-        let read = || {
-            reads.set(reads.get() + 1);
-            Ok(temperature.get())
-        };
-        // Duty arrives just before the independent deadline. Even with no more
-        // worker messages, the broker must read again one second later.
-        sample_cpu(read, &mut next, || Duration::from_millis(999)).unwrap();
-        assert_eq!(next.next, Duration::from_millis(1999));
-        assert!(Duration::from_secs(1) < next.next);
-        temperature.set(95_000);
-        let mut guard = EmergencyGuard::default();
-        let now = next.next;
-        let temp = sample_cpu(read, &mut next, || now).unwrap();
-        assert!(guard.observe(now, temp));
-        assert_eq!(reads.get(), 2);
-        let before_failure = next.next;
-        assert!(
-            sample_cpu(
-                || Err(io::Error::other("sensor failed")),
-                &mut next,
-                || Duration::from_secs(10)
-            )
-            .is_err()
-        );
-        assert_eq!(next.next, before_failure);
-        // Completion, rather than read start, anchors the fresh-sample bound.
-        sample_cpu(read, &mut next, || Duration::from_secs(11)).unwrap();
-        assert_eq!(next.next, Duration::from_secs(12));
+    fn settled_posture_samples_land_on_the_shared_tick() {
+        let mut schedule = Schedule::new(Duration::ZERO);
+        let now = Duration::from_millis(300);
+        assert!(!schedule.tick.take(now));
+        // Fast cadence follows the estimator exactly.
+        schedule.after_posture(now, SAMPLE_INTERVAL);
+        assert_eq!(schedule.posture.next, now + SAMPLE_INTERVAL);
+        // The slow 2 s cadence waits for the tick that already wakes the broker.
+        schedule.after_posture(now, Duration::from_secs(2));
+        assert_eq!(schedule.posture.next, TICK + Duration::from_secs(1));
+        assert!(schedule.posture.next - now <= Duration::from_secs(2));
     }
 
     #[test]
@@ -1919,6 +2040,7 @@ mod tests {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "{}", io::Error::last_os_error());
         if pid == 0 {
+            // SAFETY: see the fork above; every path ends in _exit.
             unsafe {
                 libc::close(parent_fd);
                 libc::signal(libc::SIGTERM, libc::SIG_IGN);
@@ -2126,9 +2248,12 @@ mod tests {
         assert!(guard.observe(time(31), 40_000));
         assert!(!guard.observe(time(32), 40_000));
         assert_eq!(policy.sample(time(32), 40_000).unwrap().pwm_percent, 80);
-        assert_eq!(policy.sample(time(36), 40_000).unwrap().pwm_percent, 35);
-        assert_eq!(policy.sample(time(49), 40_000).unwrap().pwm_percent, 35);
-        assert_eq!(policy.sample(time(50), 40_000).unwrap().pwm_percent, 0);
+        // Release returns to the top curve step; the ordinary cooling hold
+        // then starts at the first normal sample and still honours min_on.
+        assert_eq!(policy.sample(time(36), 40_000).unwrap().pwm_percent, 70);
+        assert_eq!(policy.sample(time(49), 40_000).unwrap().pwm_percent, 70);
+        assert_eq!(policy.sample(time(78), 40_000).unwrap().pwm_percent, 70);
+        assert_eq!(policy.sample(time(79), 40_000).unwrap().pwm_percent, 0);
     }
 
     #[test]

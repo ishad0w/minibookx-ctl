@@ -70,8 +70,8 @@ is an electrical duty cycle, not a percentage of maximum RPM.
 | 70% | 64 | 69.57% | Accepted running duty |
 | 80% | 74 | 80.43% | Highest accepted duty, including emergency requests |
 
-The live backend accepts only 0 or raw 32–74. A 25% start has not been tested.
-Takeover raises a nonzero firmware duty below 32 to that validated minimum,
+The live backend accepts only 0 or raw 32–74. Firmware duties below raw 32 are
+not validated. Takeover raises a nonzero firmware duty below 32 to that validated minimum,
 with readback. A duty above 74 is refused rather than reduced or interpreted
 as a safe maximum; its electrical behavior is not qualified.
 Values above the PWM period can have different electrical semantics: **raw 255

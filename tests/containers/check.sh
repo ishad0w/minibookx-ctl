@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Disposable-container checks only. Never start the daemon or expose host devices.
 set -eu
+# This script installs packages and edits package-manager settings.
+test -f /.dockerenv || { echo 'Run only in the disposable Docker fixture.' >&2; exit 1; }
 case "$1" in
     debian|ubuntu|ubuntu24)
         printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d

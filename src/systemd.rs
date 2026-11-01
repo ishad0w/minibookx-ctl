@@ -242,10 +242,10 @@ pub struct Signals {
 }
 impl Signals {
     pub fn new() -> io::Result<Self> {
-        Self::with_mask(false)
+        Self::with_mask(false, false)
     }
     pub(crate) fn installer() -> io::Result<Self> {
-        Self::with_mask(true)
+        Self::with_mask(true, false)
     }
     pub(crate) fn installer_process() -> io::Result<Self> {
         let mut signals = Self::installer()?;
@@ -253,10 +253,12 @@ impl Signals {
         signals.old_mask = None;
         Ok(signals)
     }
-    fn with_mask(installer: bool) -> io::Result<Self> {
-        // SAFETY: sigset_t is an integer struct; pointers refer to live objects.
+    fn with_mask(installer: bool, children: bool) -> io::Result<Self> {
+        // SAFETY: sigset_t is a plain integer array; all-zero is a valid value.
         let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        // SAFETY: as above.
         let mut old_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        // SAFETY: these calls only update the live local set.
         unsafe {
             if installer {
                 libc::sigfillset(&mut mask);
@@ -284,6 +286,9 @@ impl Signals {
                 for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
                     libc::sigaddset(&mut mask, signal);
                 }
+                if children {
+                    libc::sigaddset(&mut mask, libc::SIGCHLD);
+                }
             }
         }
         // SAFETY: blocks only the supplied signals on the calling thread.
@@ -304,8 +309,8 @@ impl Signals {
             }
             return Err(context("signalfd", error));
         }
-        // SAFETY: signalfd returned this new, valid, uniquely owned descriptor.
         Ok(Self {
+            // SAFETY: signalfd returned this new, valid, uniquely owned descriptor.
             fd: unsafe { OwnedFd::from_raw_fd(fd) },
             old_mask: Some(old_mask),
             _thread: std::marker::PhantomData,
@@ -316,6 +321,13 @@ impl Signals {
     /// an otherwise clean exit when the signalfd is closed.
     pub(crate) fn for_process() -> io::Result<Self> {
         let mut signals = Self::new()?;
+        signals.old_mask = None;
+        Ok(signals)
+    }
+    /// The broker also reads child exits from the same descriptor, so it
+    /// needs no periodic waitpid wakeup.
+    pub(crate) fn for_broker() -> io::Result<Self> {
+        let mut signals = Self::with_mask(false, true)?;
         signals.old_mask = None;
         Ok(signals)
     }
@@ -356,8 +368,8 @@ impl Signals {
 }
 impl Drop for Signals {
     fn drop(&mut self) {
-        // SAFETY: restores the exact mask captured on this same thread.
         if let Some(mask) = &self.old_mask {
+            // SAFETY: restores the exact mask captured on this same thread.
             unsafe {
                 libc::pthread_sigmask(libc::SIG_SETMASK, mask, std::ptr::null_mut());
             }
@@ -513,8 +525,8 @@ mod tests {
     #[test]
     fn blocked_signal_is_read_through_signalfd() {
         let signals = Signals::new().unwrap();
-        // SAFETY: send SIGHUP only to this thread, where Signals has blocked it.
         assert_eq!(
+            // SAFETY: send SIGHUP only to this thread, where Signals has blocked it.
             unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGHUP) },
             0
         );
@@ -525,9 +537,10 @@ mod tests {
     fn process_signal_mask_outlives_the_fd_but_scoped_sources_restore_it() {
         for process_lifetime in [false, true] {
             std::thread::spawn(move || {
+                // SAFETY: all-zero is a valid sigset_t.
                 let mut original = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-                // SAFETY: query only this test thread's current signal mask.
                 assert_eq!(
+                    // SAFETY: query only this test thread's current signal mask.
                     unsafe {
                         libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut original)
                     },
@@ -540,9 +553,10 @@ mod tests {
                 }
                 .unwrap();
                 drop(signals);
+                // SAFETY: all-zero is a valid sigset_t.
                 let mut after = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-                // SAFETY: restore this thread after capturing the mask at drop.
                 assert_eq!(
+                    // SAFETY: restore this thread after capturing the mask at drop.
                     unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &original, &mut after) },
                     0
                 );
@@ -550,8 +564,10 @@ mod tests {
                     let expected = if process_lifetime {
                         1
                     } else {
+                        // SAFETY: reads an initialized local set.
                         unsafe { libc::sigismember(&original, signal) }
                     };
+                    // SAFETY: as above.
                     assert_eq!(unsafe { libc::sigismember(&after, signal) }, expected);
                 }
             })

@@ -65,7 +65,7 @@ The default is `power_control = false`. Even with the Performance profile,
 CPU power limits stay as the firmware or other system software set them.
 
 If you deliberately want overrides, review `pl1_w` and `pl2_w` in **each**
-profile before enabling `power_control = true`:
+profile, including inactive profiles, before enabling `power_control = true`:
 
 | Setting | Meaning |
 |---|---|
@@ -73,9 +73,7 @@ profile before enabling `power_control = true`:
 | `pl2_w` | Short-term CPU package power limit, in watts |
 | `firmware` | Restore the value captured before this service's first override |
 
-All shipped profiles leave both limits at `firmware`. Updates preserve the
-configuration, including numeric limits in inactive profiles. Review **every
-profile's** `pl1_w` and `pl2_w` before opting in. See
+All shipped profiles leave both limits at `firmware`. See
 [power-limit bounds and restoration](../reference/configuration.md#power-limits)
 and avoid running competing power-limit controllers.
 

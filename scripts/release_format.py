@@ -24,6 +24,9 @@ MAX_FILE = 16 * 1024 * 1024
 MAX_ARCHIVE = 32 * 1024 * 1024
 MAX_EXPANDED = 64 * 1024 * 1024
 MAX_MEMBERS = 2048
+# The source archive carries vendored crates and the pinned libdbus tarball.
+MAX_SOURCE_EXPANDED = 128 * 1024 * 1024
+MAX_SOURCE_MEMBERS = 16384
 TAG_RE = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z")
 HASH_RE = re.compile(r"[0-9a-f]{64}\Z")
 COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
@@ -160,19 +163,21 @@ def validate_metadata(data, tag):
     return metadata
 
 
-def unpack_archive(data, top):
-    """Validate the entire runtime archive before returning its file bytes."""
+def unpack_archive(data, top, max_expanded=None, max_members=None):
+    """Validate an entire release archive before returning its file bytes."""
+    max_expanded = MAX_EXPANDED if max_expanded is None else max_expanded
+    max_members = MAX_MEMBERS if max_members is None else max_members
     if len(data) > MAX_ARCHIVE:
         fail("release archive exceeds the size limit")
     try:
         with gzip.GzipFile(fileobj=io.BytesIO(data)) as compressed:
-            expanded = compressed.read(MAX_EXPANDED + 1)
-        if len(expanded) > MAX_EXPANDED:
+            expanded = compressed.read(max_expanded + 1)
+        if len(expanded) > max_expanded:
             fail("expanded release archive exceeds the size limit")
         result, seen = {}, set()
         with tarfile.open(fileobj=io.BytesIO(expanded), mode="r:") as archive:
             for number, member in enumerate(archive):
-                if number >= MAX_MEMBERS:
+                if number >= max_members:
                     fail("too many release archive members")
                 name = (
                     member.name[:-1]
@@ -299,7 +304,36 @@ def checked_assets(folder, expected_commit):
         fail("runtime archive lacks configuration, service or license files")
     if "packaging/minibookx-ctl-recover.service" in files:
         fail("runtime archive contains a removed auxiliary service")
+    check_sources(assets[metadata["source_archive"]], metadata, raw)
     return metadata, sorted(names | {"SHA256SUMS"})
+
+
+def check_sources(data, metadata, raw_metadata):
+    """The corresponding source must identify the same build and carry its inputs."""
+    top = metadata["source_archive"].removesuffix(".tar.gz")
+    files = unpack_archive(data, top, MAX_SOURCE_EXPANDED, MAX_SOURCE_MEMBERS)
+    if files.get("BUILD-COMMIT") != (metadata["commit"] + "\n").encode():
+        fail("source archive does not identify the published commit")
+    if files.get("build-metadata.json") != raw_metadata:
+        fail("source archive metadata differs from the published metadata")
+    required = {
+        "Cargo.toml",
+        "Cargo.lock",
+        ".cargo/config.toml",
+        "third-party/libdbus.json",
+    }
+    if not required.issubset(files) or not any(p.startswith("vendor/") for p in files):
+        fail("source archive lacks locked or vendored Rust dependencies")
+    pin = parse_json(files["third-party/libdbus.json"], "libdbus pin")
+    archive = pin.get("archive") if isinstance(pin, dict) else None
+    if (
+        not isinstance(archive, str)
+        or "/" in archive
+        or digest(files.get("third-party/sources/" + archive, b"")) != pin.get("sha256")
+        or not isinstance(metadata.get("libdbus"), dict)
+        or metadata["libdbus"].get("source_sha256") != pin.get("sha256")
+    ):
+        fail("source archive lacks the pinned libdbus source")
 
 
 def main():

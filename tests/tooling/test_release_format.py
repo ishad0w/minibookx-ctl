@@ -80,6 +80,9 @@ class ReleaseFormatTests(unittest.TestCase):
             + "-sources.tar.gz",
             "binary_sha256": hashlib.sha256(elf()).hexdigest(),
             "rustc": "rustc fixture",
+            "libdbus": {
+                "source_sha256": hashlib.sha256(b"pinned dbus source").hexdigest()
+            },
         }
         self.files = {
             release.NAME: elf(),
@@ -95,10 +98,28 @@ class ReleaseFormatTests(unittest.TestCase):
             self.files["build-metadata.json"]
         )
         (self.folder / release.FLAT_BINARY).write_bytes(elf())
-        (self.folder / self.meta["source_archive"]).write_bytes(
-            b"source archive fixture"
-        )
+        dbus = b"pinned dbus source"
+        self.sources = {
+            "BUILD-COMMIT": (self.commit + "\n").encode(),
+            "build-metadata.json": self.files["build-metadata.json"],
+            "Cargo.toml": b"[package]",
+            "Cargo.lock": b"version = 4",
+            ".cargo/config.toml": b"[source]",
+            "vendor/libc/Cargo.toml": b"[package]",
+            "third-party/libdbus.json": json.dumps(
+                {"archive": "dbus.tar.xz", "sha256": hashlib.sha256(dbus).hexdigest()}
+            ).encode(),
+            "third-party/sources/dbus.tar.xz": dbus,
+        }
+        self.save_sources()
         self.save_archive()
+
+    def save_sources(self):
+        top = self.meta["source_archive"].removesuffix(".tar.gz")
+        (self.folder / self.meta["source_archive"]).write_bytes(
+            archive(self.sources, top)
+        )
+        self.checksums()
 
     def save_archive(self):
         (self.folder / self.meta["binary_archive"]).write_bytes(
@@ -214,6 +235,29 @@ class ReleaseFormatTests(unittest.TestCase):
         self.addCleanup(lambda: target.unlink(missing_ok=True))
         source.symlink_to(target)
         with self.assertRaises(OSError):
+            release.checked_assets(self.folder, self.commit)
+
+    def test_source_archive_must_identify_the_build_and_carry_its_inputs(self):
+        release.checked_assets(self.folder, self.commit)
+        for name, value, message in [
+            ("BUILD-COMMIT", b"b" * 40 + b"\n", "published commit"),
+            ("build-metadata.json", b"{}", "metadata differs"),
+            ("Cargo.lock", None, "vendored Rust"),
+            ("vendor/libc/Cargo.toml", None, "vendored Rust"),
+            ("third-party/sources/dbus.tar.xz", b"other source", "libdbus"),
+        ]:
+            original = dict(self.sources)
+            if value is None:
+                del self.sources[name]
+            else:
+                self.sources[name] = value
+            self.save_sources()
+            with self.assertRaisesRegex(ValueError, message):
+                release.checked_assets(self.folder, self.commit)
+            self.sources = original
+        (self.folder / self.meta["source_archive"]).write_bytes(b"not a tarball")
+        self.checksums()
+        with self.assertRaisesRegex(ValueError, "compressed release archive"):
             release.checked_assets(self.folder, self.commit)
 
     def test_removed_auxiliary_service_and_missing_notices_refuse_publication(self):

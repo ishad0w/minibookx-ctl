@@ -31,6 +31,11 @@ pub use crate::platform::KNOWN_BIOS;
 pub const SWITCH_NAME: &str = "MiniBook X U300 tablet mode";
 /// Expected broker cadence. Scheduling tolerance is a separate estimator bound.
 pub const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+/// A posture that has stayed settled this long is sampled at the slow rate.
+const SETTLE_BEFORE_SLOW: Duration = Duration::from_secs(2);
+const STABLE_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
+/// A settled angle that moves this far returns to the fast rate.
+const ACTIVITY_DEG: f64 = 10.0;
 const SENSOR_ADDRESS: u16 = 0x15;
 const SENSOR_ID: u8 = 0x02;
 const I2C_RDWR: libc::c_ulong = 0x0707;
@@ -240,8 +245,8 @@ pub(crate) fn sensor_recovery_pending(dir: &Path) -> bool {
 
 /// Must be called while the runtime control lock is held, independently of
 /// whether EC/module setup was ever reached by the previous invocation.
-pub(crate) fn recover_sensor(dir: &Path, expected_id: Option<&str>) -> io::Result<()> {
-    let Some(lease) = power::Lease::read(dir, expected_id, 0)? else {
+pub(crate) fn recover_sensor(dir: &Path) -> io::Result<()> {
+    let Some(lease) = power::Lease::read(dir, None, 0)? else {
         return Ok(());
     };
     check_hardware_profile()?;
@@ -410,6 +415,9 @@ struct EstimatorConfig {
     max_sample_gap: Duration,
     settle: Duration,
     invalid_timeout: Duration,
+    /// Fresh motion keeps a confirmed posture only this long after the last
+    /// stationary reading; a sensor emitting random vectors must fail open.
+    max_motion_hold: Duration,
 }
 
 impl Default for EstimatorConfig {
@@ -423,6 +431,7 @@ impl Default for EstimatorConfig {
             max_sample_gap: Duration::from_millis(750),
             settle: Duration::from_millis(500),
             invalid_timeout: Duration::from_millis(1500),
+            max_motion_hold: Duration::from_secs(10),
         }
     }
 }
@@ -493,24 +502,63 @@ pub struct HingeEstimator {
     tablet: bool,
     pending: Option<(bool, Duration)>,
     last_good: Option<Duration>,
+    last_stationary: Option<Duration>,
     last_now: Option<Duration>,
     last_vectors: Option<([f64; 3], [f64; 3], Duration)>,
+    /// Expected silence after the last good sample when the slow settled
+    /// cadence was requested; fail-open time is extended by the same amount.
+    good_allowance: Duration,
+    cadence: Cadence,
+}
+
+#[derive(Default)]
+struct Cadence {
+    settled_since: Option<Duration>,
+    settled_angle: Option<f64>,
+    slow: bool,
 }
 
 impl HingeEstimator {
     pub fn reset(&mut self) {
+        self.clear();
+        self.cadence = Cadence::default();
+    }
+
+    fn clear(&mut self) {
         self.tablet = false;
         self.pending = None;
         self.last_good = None;
+        self.last_stationary = None;
         self.last_now = None;
         self.last_vectors = None;
+        self.good_allowance = Duration::ZERO;
+    }
+
+    /// When the caller should take the next posture sample: fast while a
+    /// transition, motion or missing data may be in progress, slow once the
+    /// posture has stayed settled.
+    pub fn next_interval(&self) -> Duration {
+        if self.cadence.slow {
+            STABLE_SAMPLE_INTERVAL
+        } else {
+            SAMPLE_INTERVAL
+        }
+    }
+
+    /// A deliberately slow cadence is expected silence, not missing data.
+    fn silent_too_long(&self, now: Duration) -> bool {
+        self.last_good.is_none_or(|last| {
+            now.saturating_sub(last) >= self.config.invalid_timeout + self.good_allowance
+        })
+    }
+
+    fn good(&mut self, now: Duration) {
+        self.last_good = Some(now);
     }
 
     fn invalid(&mut self, now: Duration, reason: EstimateReason) -> Estimate {
         self.pending = None;
-        let stale = self
-            .last_good
-            .is_none_or(|last| now.saturating_sub(last) >= self.config.invalid_timeout);
+        let stale = self.silent_too_long(now);
         if stale {
             self.tablet = false;
         }
@@ -531,7 +579,50 @@ impl HingeEstimator {
     /// A closed Hall lid always clears tablet mode immediately. With an open
     /// Hall lid the small wrap region is treated as fully folded, accepting
     /// the documented ambiguity at a genuinely tiny laptop opening angle.
+    /// Sample again after `next_interval()`.
     pub fn update(
+        &mut self,
+        sample: Option<Sample>,
+        lid_closed: Option<bool>,
+        now: Duration,
+    ) -> Estimate {
+        let estimate = self.observe(sample, lid_closed, now);
+        let settled = self.pending.is_none()
+            && matches!(
+                estimate.reason,
+                EstimateReason::Valid
+                    | EstimateReason::HingeVertical
+                    | EstimateReason::NearZeroHallOpen
+                    | EstimateReason::NearZeroHistory
+                    | EstimateReason::LidClosed
+            );
+        let moved = match (estimate.angle_deg, self.cadence.settled_angle) {
+            (Some(angle), Some(reference)) => {
+                let delta = (angle - reference).rem_euclid(360.0);
+                delta.min(360.0 - delta) >= ACTIVITY_DEG
+            }
+            _ => false,
+        };
+        if !settled || moved {
+            self.cadence = Cadence::default();
+        }
+        if settled {
+            self.cadence.settled_since.get_or_insert(now);
+            if self.cadence.settled_angle.is_none() {
+                self.cadence.settled_angle = estimate.angle_deg;
+            }
+        }
+        self.cadence.slow = self
+            .cadence
+            .settled_since
+            .is_some_and(|since| now.saturating_sub(since) >= SETTLE_BEFORE_SLOW);
+        if self.last_good == Some(now) {
+            self.good_allowance = self.next_interval().saturating_sub(SAMPLE_INTERVAL);
+        }
+        estimate
+    }
+
+    fn observe(
         &mut self,
         sample: Option<Sample>,
         lid_closed: Option<bool>,
@@ -551,16 +642,14 @@ impl HingeEstimator {
         }
         // A fresh sample cannot retroactively validate a silent interval. After
         // the fail-open deadline, even known tablet posture needs fresh dwell.
-        if self
-            .last_good
-            .is_some_and(|last| now.saturating_sub(last) >= self.config.invalid_timeout)
-        {
+        // The slow settled cadence requested by next_interval() is not silence.
+        if self.last_good.is_some() && self.silent_too_long(now) {
             self.tablet = false;
             self.pending = None;
         }
         self.last_now = Some(now);
         if lid_closed == Some(true) {
-            self.reset();
+            self.clear();
             self.last_now = Some(now);
             return Estimate {
                 tablet: false,
@@ -596,7 +685,12 @@ impl HingeEstimator {
                 // Fresh, plausible vectors during motion are not missing
                 // data. Keep the last posture while preventing a new latch.
                 self.pending = None;
-                self.last_good = Some(now);
+                if self
+                    .last_stationary
+                    .is_some_and(|last| now.saturating_sub(last) < self.config.max_motion_hold)
+                {
+                    self.good(now);
+                }
                 return Estimate {
                     tablet: self.tablet,
                     angle_deg: None,
@@ -616,7 +710,8 @@ impl HingeEstimator {
                 // Unfolding in this exact orientation requires a slight tilt
                 // before the sensors can observe the new angle.
                 self.pending = None;
-                self.last_good = Some(now);
+                self.good(now);
+                self.last_stationary = Some(now);
                 return Estimate {
                     tablet: self.tablet,
                     angle_deg: None,
@@ -640,7 +735,8 @@ impl HingeEstimator {
         } else {
             EstimateReason::Valid
         };
-        self.last_good = Some(now);
+        self.good(now);
+        self.last_stationary = Some(now);
         let target = if threshold_angle >= self.config.tablet_enter_deg {
             true
         } else if threshold_angle <= self.config.tablet_exit_deg {
@@ -923,6 +1019,97 @@ mod tests {
     }
 
     #[test]
+    fn endless_fresh_motion_releases_physical_input_after_the_motion_hold() {
+        // A failing sensor can emit plausible but random vectors forever.
+        let mut estimator = estimator();
+        for t in [0, 250, 500] {
+            estimator.update(Some(TENT), Some(false), at(t));
+        }
+        let mut released = None;
+        for i in 1..=60 {
+            let sample = if i % 2 == 0 { TENT } else { LAPTOP };
+            let estimate = estimator.update(Some(sample), Some(false), at(500 + i * 250));
+            assert_eq!(estimate.reason, EstimateReason::Moving);
+            if !estimate.tablet && released.is_none() {
+                released = Some(500 + i * 250);
+            }
+        }
+        // Last stationary sample at 0.5 s; motion refreshes posture until
+        // 10.25 s (under the 10 s hold), then the 1.5 s invalid timeout runs.
+        assert_eq!(released, Some(11_750));
+    }
+
+    #[test]
+    fn settled_posture_slows_sampling_and_any_change_returns_to_the_fast_rate() {
+        let mut estimator = estimator();
+        let mut t = 0;
+        while t < 2_000 {
+            estimator.update(Some(LAPTOP), Some(false), at(t));
+            assert_eq!(estimator.next_interval(), SAMPLE_INTERVAL, "{t}");
+            t += 250;
+        }
+        estimator.update(Some(LAPTOP), Some(false), at(t));
+        assert_eq!(estimator.next_interval(), STABLE_SAMPLE_INTERVAL);
+        for _ in 0..5 {
+            t += 2_000;
+            assert!(!estimator.update(Some(LAPTOP), Some(false), at(t)).tablet);
+            assert_eq!(estimator.next_interval(), STABLE_SAMPLE_INTERVAL);
+        }
+        // Folding is observed at the next slow sample and confirmed at 4 Hz.
+        t += 2_000;
+        assert!(!estimator.update(Some(TENT), Some(false), at(t)).tablet);
+        assert_eq!(estimator.next_interval(), SAMPLE_INTERVAL);
+        assert!(
+            !estimator
+                .update(Some(TENT), Some(false), at(t + 250))
+                .tablet
+        );
+        assert!(
+            estimator
+                .update(Some(TENT), Some(false), at(t + 500))
+                .tablet
+        );
+        // A large angle change without a mode change also restarts fast sampling.
+        let mut estimator = self::estimator();
+        for t in (0..=2_000).step_by(250) {
+            estimator.update(Some(synthetic(100.0)), Some(false), at(t));
+        }
+        assert_eq!(estimator.next_interval(), STABLE_SAMPLE_INTERVAL);
+        estimator.update(Some(synthetic(150.0)), Some(false), at(4_000));
+        assert_eq!(estimator.next_interval(), SAMPLE_INTERVAL);
+    }
+
+    #[test]
+    fn slow_cadence_keeps_tablet_mode_and_missing_data_still_fails_open() {
+        let mut estimator = estimator();
+        let mut t = 0;
+        while t <= 2_500 {
+            estimator.update(Some(TENT), Some(false), at(t));
+            t += 250;
+        }
+        assert_eq!(estimator.next_interval(), STABLE_SAMPLE_INTERVAL);
+        let mut last_good = t - 250;
+        for _ in 0..10 {
+            t = last_good + 2_000;
+            assert!(estimator.update(Some(TENT), Some(false), at(t)).tablet);
+            assert_eq!(estimator.next_interval(), STABLE_SAMPLE_INTERVAL);
+            last_good = t;
+        }
+        // The first missing sample arrives when the slow cadence expected it;
+        // the ordinary 1.25 s that follows a missed fast sample still applies.
+        let first_miss = last_good + 2_000;
+        assert!(estimator.update(None, Some(false), at(first_miss)).tablet);
+        assert_eq!(estimator.next_interval(), SAMPLE_INTERVAL);
+        let mut released = None;
+        for t in (first_miss + 250..=first_miss + 2_000).step_by(250) {
+            if !estimator.update(None, Some(false), at(t)).tablet && released.is_none() {
+                released = Some(t);
+            }
+        }
+        assert_eq!(released, Some(first_miss + 1_250));
+    }
+
+    #[test]
     fn hall_open_wrap_is_reported_as_an_assumption_not_a_fake_360_reading() {
         let mut estimator = estimator();
         let first = estimator.update(Some(FOLDED), Some(false), at(0));
@@ -969,8 +1156,12 @@ mod tests {
         let portrait = estimator.update(Some(vertical), Some(false), at(60_000));
         assert!(portrait.tablet && !portrait.reliable);
         assert_eq!(portrait.reason, EstimateReason::HingeVertical);
-        assert!(estimator.update(None, Some(false), at(61_000)).tablet);
-        let stale = estimator.update(None, Some(false), at(61_500));
+        // The settled portrait requested the slow 2 s cadence, so a failure
+        // releases input 1.25 s after the expected sample at 62 s.
+        assert_eq!(estimator.next_interval(), STABLE_SAMPLE_INTERVAL);
+        assert!(estimator.update(None, Some(false), at(62_000)).tablet);
+        assert!(estimator.update(None, Some(false), at(63_000)).tablet);
+        let stale = estimator.update(None, Some(false), at(63_250));
         assert!(!stale.tablet && !stale.reliable);
         assert_eq!(stale.reason, EstimateReason::Stale);
 

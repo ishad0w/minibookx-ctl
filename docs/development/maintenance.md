@@ -50,7 +50,7 @@ CC_x86_64_unknown_linux_musl=/absolute/path/to/compiler-wrapper \
 | Command | Purpose |
 |---|---|
 | `make format` | Format Rust source |
-| `make check` | Formatting, Clippy, Rust/Python tests including the VM fixture, unit checks, documentation links and ShellCheck |
+| `make check` | Ruff, Rust formatting, Clippy, Rust/Python tests including the VM fixture, unit checks, documentation links and ShellCheck |
 | `make static-test` | Build and verify the static executable; run Rust tests including the fixture under musl |
 | `make systemd-fixture` | Build and verify the separate static VM executable |
 | `make distros` | Check prerequisites, package advice and staged/mocked-service installation in seven images across five distributions |
@@ -123,11 +123,11 @@ profile reload and reject a changed startup flag. A guest-only fake debugfs
 source checks late EC-file creation through the unit's real private bind.
 It does not validate physical PWM, real sensor orientation, RAPL writes,
 production fan/module lease guards, libinput consumption, panel output or
-suspend hardware. Those checks remain separate from the VM. Sensor ownership
-does use production lease code. A logind sleep cycle uses a guest-only
-three-second sleep service, not physical S3. The suite uses the production
-twenty-second watchdog; only the repeated-forgery scenario shortens it to six
-seconds to distinguish manager rejection from the broker's policy timeout.
+suspend hardware. Those checks remain separate from the VM. A logind sleep
+cycle uses a guest-only three-second sleep service, not physical S3. The suite
+uses the production twenty-second watchdog; only the repeated-forgery scenario
+shortens it to six seconds to distinguish manager rejection from the broker's
+policy timeout.
 
 The suite also checks lid-event integration and descriptor
 isolation, bounded sampling under early wakes, diagnostic command suppression,
@@ -145,7 +145,7 @@ after relevant changes; it does not qualify a new build on the physical laptop.
 |---|---|
 | Rust tests with fake backends | Policy, parsing, bounds, errors and recovery decisions |
 | Distribution containers | Prerequisite installation, reports, account/config validation, mocked installer sequencing and GPU package metadata/solver checks |
-| QEMU with systemd PID 1 | Real process supervision, sandbox/logind and lifecycle against a file-only hardware session/recovery model |
+| QEMU with systemd PID 1 | Real process supervision, sandbox/logind and lifecycle against a file-only fan/module session and recovery model; production sensor-lease code on a file-backed CONTROL byte |
 | Documented U300 observations | Physical behavior of the recorded software/device combination only |
 
 Physical support and its limits are summarized in the
@@ -157,9 +157,8 @@ Signature checks and the remaining package sandbox stay enabled. This test-only
 setting is never installed on a user's system.
 
 Re-run the relevant checks after material changes. A VM pass does not qualify a
-new binary on the laptop, and older physical results do not become tests of the
-current checkout. Live RAPL writes and physical operation under a new unit
-remain separate qualifications.
+new binary on the laptop. Physical results apply only to the tested build; live
+RAPL writes need their own qualification.
 
 ### Distribution matrix
 
@@ -190,7 +189,7 @@ minibookx-ctl --build-info
 ```
 
 The release version comes from `Cargo.toml`. Each published release increments
-its patch version, with the matching change in `Cargo.lock`. Version `X.Y.Z`
+its version, with the matching change in `Cargo.lock`. Version `X.Y.Z`
 uses commit title **`Release (vX.Y.Z)`**, tag **`vX.Y.Z`** and GitHub release title
 **`Release (vX.Y.Z)`**. Tags use a `v` prefix and no hash suffix.
 
@@ -205,7 +204,7 @@ Each release contains five assets:
 | Asset | Contents |
 |---|---|
 | `minibookx-ctl-x86_64-linux` | Static executable used by the bootstrap |
-| `minibookx-ctl-X.Y.Z-<commit>-x86_64-unknown-linux-musl.tar.gz` | Executable, configuration template, service, documentation and notices |
+| `minibookx-ctl-X.Y.Z-<commit>-x86_64-unknown-linux-musl.tar.gz` | Executable, bootstrap script, configuration template, service, documentation, panel tools and notices |
 | `minibookx-ctl-X.Y.Z-<commit>-sources.tar.gz` | Corresponding source, locked Cargo dependencies and pinned libdbus source |
 | `build-metadata.json` | Build and source identity |
 | `SHA256SUMS` | Checksums of the other four assets |
@@ -231,6 +230,14 @@ The systemd VM runs alongside the seven container suites after the checked
 artifacts are ready. The [distribution matrix](#distribution-matrix) lists the
 container versions and scope.
 
+Every run keeps its evidence for 14 days. `linux-x86_64-musl` holds the tested
+static executable with its archives, metadata and checksums; it is uploaded only
+after the native checks, the RustSec advisory check, musl tests, VM fixture
+build and packaging pass. `systemd-fixture` holds the separate VM executable.
+`logs-check-and-build` and `logs-distro-<name>` hold the command output of each
+job, including failed runs, and `systemd-vm-results` holds the VM's assertions
+and serial log.
+
 The `Required CI checks` ruleset protects `main`. It requires a pull request,
 the build, systemd VM and seven distribution jobs, without bypasses. Direct
 updates, force-pushes and deletion are prohibited. Push a review branch and
@@ -239,29 +246,32 @@ available for additional checks; they do not replace the required PR.
 Merge only after all nine checks pass. Keep the ruleset's required job names in
 sync with the matrix.
 
-To publish, bump the patch version in the release PR and squash it with commit
+To publish, bump the version in the release PR and squash it with commit
 title `Release (vX.Y.Z)`. Squashing changes the commit hash; the final assets must
-be built from the resulting main commit. Run **Check, build and release** on
-`main` with its **publish** checkbox enabled, or use:
+be built from the resulting main commit. A release that changes fan policy or
+takeover first needs the supervised sustained-load, hot-start and hot-resume
+checks in [AGENTS.md](../../AGENTS.md#documentation-and-releases).
+Run **Check, build and release** on `main` with its **publish** checkbox
+enabled, or use:
 
 ```sh
 gh workflow run ci.yml --ref main -f publish=true
 ```
 
-That run repeats all checks and publishes only if native checks, static tests,
-artifact validation, the VM and all container suites pass. Ordinary commits do
+That run repeats all checks and publishes only if native checks, the RustSec
+advisory check, static tests, artifact validation, the VM and all container
+suites pass. Before publication,
+a separate job without repository write access signs SLSA build provenance for
+the checked files; publication does not start if signing fails. Ordinary commits do
 not require a version bump; `main` may contain unreleased changes. The public
 installer downloads the latest published release and preserves existing config.
 
 Published versions are append-only by project policy:
 retrying the exact same build can verify and resume it, but a different commit
 cannot reuse its tag or replace its assets. A new release must use a new version.
-The bootstrap URL pins a reviewed commit; update it only after reviewing a
-changed bootstrap. This is separate from selecting the latest released binary.
-When changing `install.sh`, first commit the script, then update the README pin
-to that commit. Merge that bootstrap PR with a merge commit, preserving the pin
-in main's ancestry; squashing or rebasing it would invalidate the ancestry check.
-Release PRs still use the canonical squash title above.
+The README runs `install.sh` from `main`, and the script selects the latest
+published release. Keep `install.sh` on `main` able to install that release's
+assets; publish a release before merging a bootstrap change that depends on it.
 The publisher checks that GitHub locked the published release, including on
 retries. Version tags cannot be updated or deleted; fresh tags can be created.
 The repository setting is managed separately;
@@ -271,7 +281,7 @@ rather than a step inside that workflow.
 
 ```mermaid
 flowchart LR
-    C[Push, PR or manual run] --> T[Native checks including fixture]
+    C[Push, PR or manual run] --> T[Native checks, fixture and RustSec audit]
     T --> B[Static executable and tests]
     B --> P[Five validated release assets]
     B --> F[Separate VM fixture]
@@ -280,7 +290,8 @@ flowchart LR
     D --> G[All checks passed]
     V --> G
     G --> M{Explicit publish on main?}
-    M -->|Yes| R[Versioned release for this commit]
+    M -->|Yes| A[Signed build provenance]
+    A --> R[Versioned release for this commit]
 ```
 
 The source archive records its compiler in `BUILD-TOOLCHAIN.txt`. Future stable
@@ -298,6 +309,8 @@ Keep a working boot entry. Before relying on unattended control:
 4. Fold and unfold the laptop; check keyboard, touchpad and screen orientation.
 5. Close and open the lid; check the expected sleep/wake behavior.
 6. Suspend and resume; check input and fan control again.
+7. With the 60 Hz setup, follow its
+   [BIOS-update step](../guide/display.md#what-to-expect-afterwards).
 
 If detection fails, leave the service stopped and compare the device with the
 [supported hardware](../hardware/README.md). Do not bypass a revision check to make

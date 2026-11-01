@@ -258,8 +258,13 @@ fn write_journal(
     before: [u64; 2],
     target: [u64; 2],
 ) -> io::Result<()> {
-    use std::{io::Write, os::unix::fs::OpenOptionsExt};
-    let temp = journal.with_extension("tmp");
+    use std::{
+        io::Write,
+        os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    };
+    // power.tmp belongs to the broker's power.json snapshot. A distinct temp
+    // name and an explicit 0600 keep a stale snapshot from loosening the lease.
+    let temp = journal.with_extension("lease.tmp");
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -267,6 +272,7 @@ fn write_journal(
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&temp)?;
+    f.set_permissions(fs::Permissions::from_mode(0o600))?;
     let text = format!(
         "v1\n{} {} {} {} {} {}\n",
         original[0], original[1], before[0], before[1], target[0], target[1]
@@ -351,6 +357,7 @@ mod tests {
         .unwrap();
         let paths = constraint_paths(&fixture.0).unwrap();
         fs::write(&paths[0], "13000000").unwrap();
+        // SAFETY: geteuid has no arguments and cannot fail.
         assert!(restore_at(&fixture.0, &journal, unsafe { libc::geteuid() }).is_err());
         assert!(journal.exists());
         assert!(
@@ -399,6 +406,7 @@ mod tests {
             manager.journal = self.0.join("power.lease");
             // Production always requires root ownership. Only these private
             // filesystem fixtures substitute the ordinary test user's UID.
+            // SAFETY: geteuid has no arguments and cannot fail.
             manager.journal_owner = unsafe { libc::geteuid() };
             manager
         }
@@ -674,6 +682,33 @@ mod tests {
         assert_eq!(fixture.limits(), [7_000_000, 10_000_000]);
         assert!(manager.journal.exists());
         manager.owns_journal = false;
+    }
+
+    #[test]
+    fn stale_power_snapshot_temp_cannot_loosen_the_journal() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = ConstraintFixture::new(&["long_term", "short_term"]);
+        let mut manager = fixture.manager();
+        // The broker's power.json snapshot leaves power.tmp at 0644 when its
+        // rename fails. The journal must neither reuse nor inherit that file.
+        let snapshot_temp = manager.journal.with_file_name("power.tmp");
+        fs::write(&snapshot_temp, "{}").unwrap();
+        fs::set_permissions(&snapshot_temp, fs::Permissions::from_mode(0o644)).unwrap();
+        let stale_lease_temp = manager.journal.with_extension("lease.tmp");
+        fs::write(&stale_lease_temp, "stale").unwrap();
+        fs::set_permissions(&stale_lease_temp, fs::Permissions::from_mode(0o644)).unwrap();
+        manager
+            .apply(&PowerConfig {
+                enabled: true,
+                pl1_w: Some(8),
+                pl2_w: Some(10),
+            })
+            .unwrap();
+        let mode = fs::metadata(&manager.journal).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(fs::read_to_string(&snapshot_temp).unwrap(), "{}");
+        manager.restore().unwrap();
+        assert_eq!(fixture.limits(), [12_000_000, 15_000_000]);
     }
 
     #[test]

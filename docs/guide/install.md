@@ -53,11 +53,9 @@ For immutable Fedora variants, use their own package-layering procedure.
 
 ## Install and start
 
-Leave the laptop in its ordinary working position. Run as your ordinary user:
-
-Use the single [installation command in the README](../../README.md#install).
-Its URL pins the reviewed bootstrap; it downloads the latest release and asks
-for sudo to install and start it. To inspect it first, save that URL with
+Leave the laptop in its ordinary working position. As your ordinary user, run
+the single [installation command in the README](../../README.md#install).
+It downloads the latest release and asks for sudo to install and start it. To inspect it first, save that URL with
 `curl -fsSL URL -o install.sh`, read `install.sh`, then run `sh install.sh`.
 See [installer trust](../../SECURITY.md#installer-trust) before running it.
 
@@ -74,8 +72,10 @@ The service initializes the supported base sensor automatically.
 
 ### Without fan control
 
-To let firmware manage the fan, download the script above and install without
-starting the service:
+To let firmware manage the fan, save the bootstrap from the
+[README install command](../../README.md#install) as `install.sh`, as described
+in [Install and start](#install-and-start). Then install without starting the
+service:
 
 ```sh
 sh install.sh --no-enable
@@ -92,9 +92,13 @@ sudo systemctl enable --now minibookx-ctl.service
 minibookx-ctl --doctor
 ```
 
-Tablet detection remains enabled. On updates, `--no-enable` preserves whether
-the service was enabled and running. Updating stops it for recovery and restarts
-it if it was running; this option is not a way to keep an active service stopped.
+Tablet detection remains enabled. Firmware fan mode is covered by software and
+VM tests but is not physically qualified; see
+[features and limits](../hardware/README.md#features-and-limits).
+
+On updates, `--no-enable` preserves whether the service was enabled and
+running. Updating stops it for recovery and restarts it if it was running; this
+option is not a way to keep an active service stopped.
 
 ## Check the result
 

@@ -336,6 +336,7 @@ mod tests {
         }
     }
     fn owner() -> u32 {
+        // SAFETY: geteuid has no arguments and cannot fail.
         unsafe { libc::geteuid() }
     }
     struct Fixture {

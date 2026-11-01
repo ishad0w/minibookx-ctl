@@ -2,7 +2,6 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import re
-import subprocess
 import sys
 import unicodedata
 import urllib.parse
@@ -53,36 +52,16 @@ def source_links(repo):
     return errors
 
 
-def bootstrap_pin(repo):
-    pins = re.findall(
-        r"https://raw\.githubusercontent\.com/ishad0w/minibookx-ctl/([0-9a-f]{40})/install\.sh",
-        (repo / "README.md").read_text(),
+BOOTSTRAP = "https://raw.githubusercontent.com/ishad0w/minibookx-ctl/main/install.sh"
+
+
+def bootstrap_url(repo):
+    """The README must run this repository's main-branch bootstrap, nothing else."""
+    urls = re.findall(
+        r"https://raw\.githubusercontent\.com/\S+", (repo / "README.md").read_text()
     )
-    if len(pins) != 1:
-        return ["README.md: require one canonical bootstrap commit pin"]
-    if not (repo / ".git").exists():
-        # Corresponding source archives have no Git metadata. CI must perform
-        # the ancestry/content check in its full-history checkout.
-        return []
-    pin = pins[0]
-    ancestor = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", pin, "HEAD"],
-        cwd=repo,
-        check=False,
-        capture_output=True,
-    )
-    if ancestor.returncode:
-        return [
-            "README.md: bootstrap pin must be an ancestor of HEAD (full history required)"
-        ]
-    contents = subprocess.run(
-        ["git", "show", pin + ":install.sh"],
-        cwd=repo,
-        check=False,
-        capture_output=True,
-    )
-    if contents.returncode or contents.stdout != (repo / "install.sh").read_bytes():
-        return ["README.md: pinned bootstrap differs from the reviewed install.sh"]
+    if urls != [BOOTSTRAP]:
+        return ["README.md: require exactly one bootstrap URL: " + BOOTSTRAP]
     return []
 
 
@@ -99,7 +78,7 @@ def main():
     ]
     for directory in ("docs", "packaging", "contrib"):
         paths.extend((REPO / directory).rglob("*.md"))
-    errors = source_links(REPO) + bootstrap_pin(REPO)
+    errors = source_links(REPO) + bootstrap_url(REPO)
     for path in sorted(set(paths)):
         text = path.read_text(encoding="utf-8")
         label = path.relative_to(REPO)

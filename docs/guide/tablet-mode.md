@@ -47,14 +47,23 @@ pacman -Si mutter extra/mutter
 ```
 
 If the default candidate lacks the fix and `extra/mutter` supplies a compatible
-fixed version, review a full update selecting that package:
+fixed version, review a full update selecting that package. The installed
+`gnome-shell` build must match the selected Mutter version; compare both
+before and after the update:
 
 ```sh
+pacman -Qi gnome-shell mutter
 sudo pacman -Syu extra/mutter
+pacman -Qi gnome-shell mutter
 ```
 
 This needs no AUR build or repository-priority change. Skip it if your installed
-package already contains the fix.
+package already contains the fix. To return to the CachyOS package, reinstall it
+from the repository that `pacman -Si mutter` lists first, usually `cachyos`:
+
+```sh
+sudo pacman -S cachyos/mutter
+```
 
 </details>
 
@@ -83,10 +92,12 @@ The [sensor reference](../hardware/tablet-sensors.md) explains these limits.
 ## If something does not work
 
 - **No tablet mode:** check `minibookx-ctl --doctor` and the service journal.
-  The service wakes the supported base sensor automatically. `Unavailable`
-  means a sensor or lid fault disabled detection. Read the journal error;
-  discovery retries with backoff and after resume. `RecoveryPending` means
-  restoration is still needed. Cooling continues if tablet OFF was confirmed.
+  The service wakes the supported base sensor automatically. Doctor warns
+  **Tablet detection unavailable** when a fault disabled detection or sensor
+  restoration is still pending; `minibookx-ctl --status` shows the reason as
+  `Unavailable` (sensor or lid fault) or `RecoveryPending` (restoration still
+  needed). Read the journal error; discovery retries with backoff and after
+  resume. Cooling continues if tablet OFF was confirmed.
 - **Input returns but the image stays sideways:** check both Mutter and the
   panel-orientation hint above.
 - **Input stays disabled:** return to an ordinary laptop angle, then hold still.

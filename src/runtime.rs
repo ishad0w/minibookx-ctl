@@ -209,18 +209,22 @@ impl State {
             if applied.emergency && !self.broker_emergency {
                 self.controller.observe_emergency(self.epoch.elapsed());
             }
+            let emergency_changed = self.broker_emergency != applied.emergency;
             self.broker_emergency = applied.emergency;
             self.last_ec_temp = applied.ec_temperature;
             self.last_rpm = applied.tach;
             self.tach_state = applied.tach_state;
-            let changed = self.applied != applied.raw;
-            if changed {
-                self.applied = applied.raw;
-            }
+            let previous = self.applied;
+            let changed = previous != applied.raw;
+            self.applied = applied.raw;
             if applied.changed {
                 self.writes += 1;
             }
-            if changed || applied.changed {
+            // Journal start, stop, a reached target and emergency changes,
+            // not every one-step ramp write.
+            if (changed && (previous == 0 || applied.raw == 0 || applied.raw == decision.raw_duty))
+                || emergency_changed
+            {
                 eprintln!(
                     "fan cpu_C={:.1} target_PWM={} applied_raw={} applied_PWM={:.1} broker_emergency={} duty_writes={}",
                     f64::from(cpu) / 1000.,

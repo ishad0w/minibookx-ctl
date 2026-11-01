@@ -1,7 +1,8 @@
 [package]
 name = "minibookx-ctl"
-version = "0.1.6"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.88"
 publish = false
 license = "Apache-2.0"
 description = "Bounded hardware control for the tested CHUWI MiniBook X U300 revision"
@@ -21,6 +22,10 @@ required-features = ["systemd-test-fixture"]
 libc = "=0.2.189"
 dbus = { version = "=0.9.12", features = ["stdfd"] }
 serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }
+
+[lints.clippy]
+# Every FFI or raw-descriptor block states the invariant it relies on.
+undocumented_unsafe_blocks = "warn"
 
 [profile.dev]
 # A forked child must never unwind through inherited parent-side FD owners.

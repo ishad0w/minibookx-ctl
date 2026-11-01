@@ -16,7 +16,7 @@ Changing a timeout does not make an unsupported refresh rate usable.
 |---|---|
 | [RFC artifact](ready-timeout-rfc.patch) | Based on Linux `32c52ec87d6245ee2d12ed5dd509e40062939b50`; apply/whitespace/checkpatch checks only |
 | Exact RFC build and boot | Not performed; no distribution/kernel combination is qualified for installation of this artifact |
-| Upstream failing baseline and full debug logs | Still needed |
+| Upstream failing baseline and full debug logs | Required before submission |
 
 No validated replacement i915 binary is shipped. Success with the documented
 60 Hz setup does not qualify this separate driver proposal.

@@ -7,12 +7,18 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: Publish this checked main commit as a release (bump the patch version first)
+        description: Publish this checked main commit as a release (bump the version first)
         type: boolean
         default: false
 
 permissions:
   contents: read
+
+# Explicit bash adds pipefail, so a failing command still fails when its
+# output is copied to a log with tee.
+defaults:
+  run:
+    shell: bash
 
 jobs:
   check-and-build:
@@ -22,28 +28,30 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 0
       - name: Install build and verification tools
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools build-essential pkg-config binutils libdbus-1-dev meson ninja-build shellcheck
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy --component rust-docs --target x86_64-unknown-linux-musl
           rustc -Vv
-          python3 -m pip install --user --break-system-packages -r requirements-dev.txt
+          python3 -m pip install --user --break-system-packages --require-hashes --only-binary=:all: -r requirements-dev.txt
+      # Logs stay outside the checkout: packaging requires a clean worktree.
       - name: Native checks
-        run: make check
+        run: |
+          mkdir -p "$RUNNER_TEMP/ci-logs"
+          make check 2>&1 | tee "$RUNNER_TEMP/ci-logs/make-check.log"
       - name: RustSec advisory check
         run: |
           cargo install cargo-audit --version 0.22.2 --locked
-          cargo audit --deny warnings
+          cargo audit --deny warnings 2>&1 | tee "$RUNNER_TEMP/ci-logs/cargo-audit.log"
       - name: Build and test fully static x86_64 Linux executable
-        run: make static-test
+        run: make static-test 2>&1 | tee "$RUNNER_TEMP/ci-logs/static-test.log"
       - name: Build the separate systemd VM fixture
-        run: make systemd-fixture
+        run: make systemd-fixture 2>&1 | tee "$RUNNER_TEMP/ci-logs/systemd-fixture.log"
       - name: Package identified binary, notices and corresponding sources
         run: |
-          make package
-          make verify-release COMMIT="$GITHUB_SHA"
+          { make package && make verify-release COMMIT="$GITHUB_SHA"; } 2>&1 \
+            | tee "$RUNNER_TEMP/ci-logs/package.log"
       - name: Upload checked artifacts from this run
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -57,6 +65,14 @@ jobs:
           name: systemd-fixture
           path: target/x86_64-unknown-linux-musl/release/minibookx-systemd-fixture
           if-no-files-found: error
+          retention-days: 14
+      - name: Upload check, test and packaging logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-check-and-build
+          path: ${{ runner.temp }}/ci-logs/
+          if-no-files-found: warn
           retention-days: 14
 
   distro-runtime:
@@ -84,9 +100,20 @@ jobs:
         env:
           DISTRO: ${{ matrix.distro }}
         run: |
-          make verify-release COMMIT="$GITHUB_SHA"
-          chmod 755 dist/minibookx-ctl-x86_64-linux
-          MINIBOOKX_TEST_BINARY=$(realpath dist/minibookx-ctl-x86_64-linux) make distros DISTROS="$DISTRO"
+          mkdir -p "$RUNNER_TEMP/ci-logs"
+          {
+            make verify-release COMMIT="$GITHUB_SHA"
+            chmod 755 dist/minibookx-ctl-x86_64-linux
+            MINIBOOKX_TEST_BINARY=$(realpath dist/minibookx-ctl-x86_64-linux) make distros DISTROS="$DISTRO"
+          } 2>&1 | tee "$RUNNER_TEMP/ci-logs/distro-$DISTRO.log"
+      - name: Upload distribution check log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-distro-${{ matrix.distro }}
+          path: ${{ runner.temp }}/ci-logs/
+          if-no-files-found: warn
+          retention-days: 14
 
   systemd-vm:
     needs: check-and-build
@@ -134,9 +161,32 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  publish:
+  # Signs SLSA build provenance for the checked files before publication. This
+  # job holds the signing permissions but no repository write token.
+  attest:
     if: github.repository == 'ishad0w/minibookx-ctl' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.publish
     needs: [check-and-build, distro-runtime, systemd-vm]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download this run's checked artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GH_HOST: github.com
+          RUN_ID: ${{ github.run_id }}
+        run: gh run download "$RUN_ID" --repo "$GH_REPO" --name linux-x86_64-musl --dir dist
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*
+
+  publish:
+    if: github.repository == 'ishad0w/minibookx-ctl' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.publish
+    needs: [check-and-build, distro-runtime, systemd-vm, attest]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     concurrency:

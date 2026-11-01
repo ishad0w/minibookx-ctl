@@ -29,7 +29,7 @@ Each named profile has these keys:
 | Key | Meaning | Accepted range |
 |---|---|---|
 | `curve` | `temperature_c:pwm_percent` pairs | 1–16 steps; ascending 20–100°C thresholds below `emergency_c`; nondecreasing 35–80% duty |
-| `hysteresis_c` | Margin below a threshold before its heat budget pauses | 1–15°C |
+| `hysteresis_c` | Margin below a threshold before its heat budget pauses and before speed can drop below that stage | 1–15°C |
 | `start_hold_s` | Accumulated heat before starting | 0–120 s |
 | `up_hold_s` | Accumulated heat before increasing speed | 0–120 s |
 | `down_hold_s` | Sustained cooling before reducing speed | 0–120 s |
@@ -41,11 +41,11 @@ Each named profile has these keys:
 Each curve threshold has a heat budget. Crossing it starts accumulation; the
 budget continues through its hysteresis band and pauses below that band. Only
 continuous cooling below the band for `down_hold_s` clears it. Short dips cannot
-keep postponing cooling. A paused budget resumes when the threshold is crossed
-again; returning only to the band interrupts the cooling reset. Once the start
-budget is earned, the fan starts at the current temperature's stage. Cooling
-requires both the hysteresis margin and cooling delay; stopping also respects
-minimum run time.
+keep postponing a fan start or speed increase. A paused budget resumes when the
+threshold is crossed again; returning only to the band interrupts the cooling
+reset. Once the start budget is earned, the fan starts at the current
+temperature's stage. Cooling requires both the hysteresis margin and cooling
+delay; stopping also respects minimum run time.
 The actual thresholds and delays come from the selected profile, so a short
 spike need not start a stopped fan.
 
@@ -55,7 +55,9 @@ running firmware duty until a cooling hold permits a lower stage. These holds
 apply to later temperature changes, not to withholding cooling at takeover.
 
 At `emergency_c`, policy requests approximately 80% duty. Release requires
-30 continuous seconds at least 5°C below that threshold. The broker has an
+30 continuous seconds at least 5°C below that threshold; the fan then runs at
+the highest curve step and lowers through the ordinary hysteresis, cooling hold
+and minimum run time. The broker has an
 independent 95°C override, released after 30 continuous seconds below 90°C.
 Sampling has latency; hardware thermal protection must remain enabled.
 [Architecture](../development/design.md#sampling-and-fan-decisions) describes
@@ -80,7 +82,7 @@ independent recovery can retry. sysfs cannot eliminate races with another writer
 does not change enable flags, time windows, MSRs, PL4, voltage or GPU frequency.
 Numeric readback does not prove actual power enforcement.
 
-Write/restoration has filesystem-fixture tests, but no live RAPL override cycle
-under the current unit has been qualified on the laptop. See
+Write/restoration has filesystem-fixture tests; physical qualification is
+listed in [features and limits](../hardware/README.md#features-and-limits). See
 [power recovery](../development/design.md#power-limit-recovery) and
 [diagnostic fields](diagnostics.md#reading-power-diagnostics).

@@ -79,7 +79,7 @@ test -f /tmp/minibookx-mock-active
 test -f /tmp/minibookx-mock-enabled
 cmp /tmp/invalid-installer-config /etc/minibookx-ctl/config.conf
 cmp /tmp/private-installer /usr/local/bin/minibookx-ctl
-if grep -Eq ' (stop|start|enable|disable|daemon-reload) ' /tmp/minibookx-systemctl-calls; then
+if grep -Eq ' (stop|start|enable|disable|daemon-reload)( |$)' /tmp/minibookx-systemctl-calls; then
     echo 'Invalid config caused a service mutation.' >&2
     exit 1
 fi

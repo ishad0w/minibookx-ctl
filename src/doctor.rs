@@ -9,16 +9,6 @@ use std::{
     path::Path,
 };
 
-macro_rules! doc_url {
-    ($path:literal) => {
-        concat!(
-            "https://github.com/ishad0w/minibookx-ctl/blob/v",
-            env!("CARGO_PKG_VERSION"),
-            "/docs/",
-            $path
-        )
-    };
-}
 #[path = "doctor_graphics.rs"]
 mod graphics;
 

@@ -26,8 +26,7 @@ status; an invalid or newer on-disk edit is not treated as an applied policy.
 An invalid reload keeps the previous settings. A changed `fan_control` requires
 a restart and causes the whole reload to be rejected until then.
 
-Report schema version 3 includes contextual availability and tablet recovery
-warnings. Documentation links are pinned to the executable's release version.
+Doctor and debug JSON reports carry `schema_version` 3. Documentation links are pinned to the executable's release version.
 
 Package profiles cover Debian 13, Ubuntu 24.04/26.04, Fedora 43/44 and
 Arch/CachyOS rolling releases. Another version of the same distribution uses

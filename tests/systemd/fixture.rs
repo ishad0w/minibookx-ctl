@@ -23,10 +23,13 @@ mod presets {
         let watchdog = std::path::Path::new("/run/minibookx-ctl/spoof-watchdog");
         if watchdog.exists() {
             let endpoint = std::fs::read_to_string("/run/minibookx-ctl/notify-endpoint")?;
+            // SAFETY: the policy child is single-threaded; nothing reads the
+            // environment concurrently.
             unsafe {
                 std::env::set_var("NOTIFY_SOCKET", endpoint);
             }
             let notify = super::systemd::Notifier::from_environment()?;
+            // SAFETY: as above.
             unsafe {
                 std::env::remove_var("NOTIFY_SOCKET");
             }
@@ -42,6 +45,8 @@ mod presets {
             // Simulate a compromised worker knowing the manager's endpoint.
             // NotifyAccess=main must reject it even without environment secrecy.
             let endpoint = std::fs::read_to_string("/run/minibookx-ctl/notify-endpoint")?;
+            // SAFETY: the policy child is single-threaded; nothing reads the
+            // environment concurrently.
             unsafe {
                 std::env::set_var("NOTIFY_SOCKET", endpoint);
             }
@@ -49,6 +54,7 @@ mod presets {
                 "MAINPID={}\nSTATUS=forged by worker\nWATCHDOG=1",
                 std::process::id()
             ))?;
+            // SAFETY: as above.
             unsafe {
                 std::env::remove_var("NOTIFY_SOCKET");
             }
@@ -73,6 +79,7 @@ fn count(operation: &str) -> io::Result<()> {
     use std::io::Write;
     // The broker has dropped DAC capabilities and cannot write in the worker's
     // directory. Each process records in its own writable ownership domain.
+    // SAFETY: geteuid has no arguments and cannot fail.
     let directory = if unsafe { libc::geteuid() } == 0 {
         ROOT.to_owned()
     } else {
@@ -242,7 +249,7 @@ mod hardware {
             fs::Permissions::from_mode(0o700),
         )?;
         recover_fan()?;
-        if let Err(error) = super::tablet::recover_sensor(Path::new(ROOT), None) {
+        if let Err(error) = super::tablet::recover_sensor(Path::new(ROOT)) {
             eprintln!("VM sensor recovery quarantined: {error}");
         }
         Ok(())
@@ -275,7 +282,7 @@ mod hardware {
     }
     pub fn recover() -> io::Result<()> {
         let fan = recover_fan();
-        let sensor = super::tablet::recover_sensor(Path::new(ROOT), None);
+        let sensor = super::tablet::recover_sensor(Path::new(ROOT));
         fan?;
         sensor?;
         eprintln!("VM_RECOVER completed");
@@ -444,8 +451,8 @@ mod tablet {
             }
         }
     }
-    pub fn recover_sensor(dir: &std::path::Path, expected: Option<&str>) -> io::Result<()> {
-        if let Some(lease) = sensor_power::Lease::read(dir, expected, 0)? {
+    pub fn recover_sensor(dir: &std::path::Path) -> io::Result<()> {
+        if let Some(lease) = sensor_power::Lease::read(dir, None, 0)? {
             lease.restore(&Sensor)?;
         }
         Ok(())
@@ -474,7 +481,9 @@ mod tablet {
             Ok(Self(file))
         }
         pub fn send(&mut self, tablet: bool) -> io::Result<()> {
-            writeln!(self.0, "{}", u8::from(tablet))?;
+            // The writer PID lets the guest prove which process sent OFF.
+            let line = format!("{} {}\n", u8::from(tablet), std::process::id());
+            self.0.write_all(line.as_bytes())?;
             self.0.flush()
         }
     }
@@ -487,6 +496,7 @@ fn run() -> io::Result<()> {
         return minibookx_ctl::install::check_config_stdin()
             .map_err(|e| io::Error::other(e.to_string()));
     }
+    // SAFETY: geteuid has no arguments and cannot fail.
     if unsafe { libc::geteuid() } != 0 {
         return Err(io::Error::other("fixture requires guest root"));
     }
@@ -494,7 +504,12 @@ fn run() -> io::Result<()> {
         Some("--install") => minibookx_ctl::install::run(true, std::env::args().skip(2))
             .map_err(|e| io::Error::other(e.to_string())),
         Some("--prepare") => hardware::prepare(),
-        Some("--recover") => hardware::recover(),
+        Some("--recover") => {
+            hardware::recover()?;
+            // Distinct from --prepare's recovery: proves ExecStopPost ran.
+            eprintln!("VM_EXECSTOPPOST recovery completed");
+            Ok(())
+        }
         Some("--daemon") => {
             // Only the guest test's candidate copy has this ELF trailer. Its
             // installer and recovery work, but startup must fail and roll back.
@@ -555,9 +570,41 @@ fn run() -> io::Result<()> {
                 .write(true)
                 .open("/dev/i2c-0")
             {
-                Err(e) if matches!(e.raw_os_error(), Some(libc::ENODEV | libc::ENXIO)) => Ok(()),
-                _ => Err(io::Error::other("I2C open did not reach the fake bus")),
+                Err(e) if matches!(e.raw_os_error(), Some(libc::ENODEV | libc::ENXIO)) => (),
+                _ => return Err(io::Error::other("I2C open did not reach the fake bus")),
             }
+            // Unit sandbox. perf_event_open is outside @system-service: the
+            // filter returns EPERM, while the kernel would reject NULL attr.
+            // SAFETY: the NULL attr is never dereferenced in user space; the
+            // filter or the kernel rejects it, and no descriptor is created.
+            let perf = unsafe {
+                libc::syscall(
+                    libc::SYS_perf_event_open,
+                    std::ptr::null::<u8>(),
+                    0,
+                    -1,
+                    -1,
+                    0,
+                )
+            };
+            if perf != -1 || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM) {
+                return Err(io::Error::other("system call filter is not active"));
+            }
+            // SAFETY: socket takes integers only.
+            let netlink =
+                unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0) };
+            if netlink >= 0 {
+                // SAFETY: closes the descriptor this probe has just created.
+                unsafe { libc::close(netlink) };
+                return Err(io::Error::other("netlink socket was not denied"));
+            }
+            if std::net::UdpSocket::bind("127.0.0.1:0").is_ok() {
+                return Err(io::Error::other("IP socket was not denied"));
+            }
+            if fs::write("/dev/shm/minibookx-probe", b"x").is_ok() {
+                return Err(io::Error::other("/dev/shm is writable"));
+            }
+            Ok(())
         }
         _ => Err(io::Error::other("fixture lifecycle command required")),
     }

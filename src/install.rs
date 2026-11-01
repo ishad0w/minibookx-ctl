@@ -5,6 +5,7 @@
 use crate::{
     paths::{BINARY, CONFIG, DOC_DIR as DOC, RUN_DIR, UNIT, UNIT_FILE},
     platform::system_tool,
+    process::{self, Failure},
 };
 use std::{
     error::Error,
@@ -20,7 +21,7 @@ use std::{
     },
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 include!(concat!(env!("OUT_DIR"), "/license_manifest.rs"));
@@ -62,9 +63,7 @@ pub fn check_config_stdin() -> Result<(), Box<dyn Error>> {
 fn check_config_reader(reader: impl Read) -> io::Result<()> {
     let mut text = String::new();
     reader.take(MAX_CONFIG + 1).read_to_string(&mut text)?;
-    let loaded = crate::presets::parse(text)?;
-    loaded.config.validate_for_hardware().map_err(refuse)?;
-    loaded.power.validate().map_err(refuse)
+    crate::presets::parse(text).map(drop)
 }
 
 #[derive(Default)]
@@ -519,93 +518,26 @@ fn execute(mut command: Command, capture: bool, timeout: Duration) -> io::Result
     if capture {
         command.stdout(Stdio::piped());
     }
-    let mut child = command.spawn()?;
-    let result = (|| {
-        for fd in [
-            child.stdout.as_ref().map(AsRawFd::as_raw_fd),
-            child.stderr.as_ref().map(AsRawFd::as_raw_fd),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            // SAFETY: the child owns this pipe descriptor. Nonblocking reads keep
-            // both output and inherited-pipe descendants inside the deadline.
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        let deadline = Instant::now() + timeout;
-        let mut output = Vec::new();
-        let mut stderr = Vec::new();
-        let mut eof = [!capture, false];
-        let mut status = None;
-        loop {
-            if Instant::now() >= deadline {
-                return Err(refuse(format!(
+    let output =
+        process::collect(command.spawn()?, timeout, MAX_COMMAND_OUTPUT).map_err(|failure| {
+            match failure {
+                Failure::Io(error) => error,
+                Failure::Timeout => refuse(format!(
                     "{program} timed out; installed files retained for recovery"
-                )));
+                )),
+                Failure::Oversized => refuse(format!("{program} output exceeded its size limit")),
             }
-            let streams: [Option<&mut dyn Read>; 2] = [
-                child.stdout.as_mut().map(|v| v as &mut dyn Read),
-                child.stderr.as_mut().map(|v| v as &mut dyn Read),
-            ];
-            for (index, stream) in streams.into_iter().enumerate() {
-                let Some(stream) = stream else { continue };
-                if eof[index] {
-                    continue;
-                }
-                // Bound work even if a child continuously floods its pipes.
-                for _ in 0..16 {
-                    let mut buffer = [0; MAX_COMMAND_OUTPUT + 1];
-                    match stream.read(&mut buffer) {
-                        Ok(0) => {
-                            eof[index] = true;
-                            break;
-                        }
-                        Ok(count) => {
-                            let bytes = if index == 0 { &mut output } else { &mut stderr };
-                            let remaining = MAX_COMMAND_OUTPUT - bytes.len();
-                            if index == 0 && count > remaining {
-                                return Err(refuse(format!(
-                                    "{program} output exceeded its size limit"
-                                )));
-                            }
-                            bytes.extend_from_slice(&buffer[..count.min(remaining)]);
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(error) => return Err(error),
-                    }
-                }
-            }
-            if status.is_none() {
-                status = child.try_wait()?;
-            }
-            if let Some(status) = status
-                && eof.into_iter().all(|v| v)
-            {
-                if !status.success() {
-                    let diagnostic = String::from_utf8_lossy(&stderr)
-                        .escape_default()
-                        .to_string();
-                    return Err(refuse(format!(
-                        "{program} failed ({status}); stderr: {diagnostic}"
-                    )));
-                }
-                return Ok(output);
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    })();
-    if result.is_err() {
-        // SAFETY: each command gets its own process group. Include descendants
-        // retaining the output pipe, even after its direct child has exited.
-        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
-        let _ = child.wait();
+        })?;
+    if !output.status.success() {
+        let diagnostic = String::from_utf8_lossy(&output.stderr)
+            .escape_default()
+            .to_string();
+        return Err(refuse(format!(
+            "{program} failed ({}); stderr: {diagnostic}",
+            output.status
+        )));
     }
-    result
+    Ok(output.stdout)
 }
 
 fn command(program: &Path, args: &[&str]) -> io::Result<()> {
@@ -613,7 +545,8 @@ fn command(program: &Path, args: &[&str]) -> io::Result<()> {
 }
 
 fn service_account() -> io::Result<Account> {
-    // Installer startup is single-threaded. Copy each NSS field before another lookup.
+    // SAFETY: static C name. Installer startup is single-threaded; each NSS
+    // field is copied before another lookup.
     let mut record = unsafe { libc::getpwnam(c"minibookx-ctl".as_ptr()) };
     if record.is_null() {
         let shell = system_tool("nologin")?;
@@ -726,6 +659,7 @@ fn sealed_snapshot(data: &[u8], executable: bool) -> io::Result<File> {
         )
     };
     if fd < 0 && executable && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+        // SAFETY: as above, without MFD_EXEC for kernels that reject it.
         fd = unsafe { libc::memfd_create(c"minibookx-installer-snapshot".as_ptr(), flags) };
     }
     if fd < 0 {
@@ -761,25 +695,26 @@ fn config_child_privileges(account: Account) -> io::Result<()> {
     };
     // Two Linux capability ABI v3 entries: effective/permitted/inheritable.
     let empty_capabilities = [0_u32; 6];
-    // SAFETY: this is the single exec child's setup. Mark all inherited extra
+    // SAFETY: this is the single exec child's setup. Each call takes integers
+    // or pointers to the live locals above. Mark all inherited extra
     // descriptors close-on-exec, including the image memfd and Command's error
     // pipe; the parser runs only after exec has closed them. The sealed config
     // snapshot is already installed as stdin by Command.
-    if unsafe {
+    let failed = unsafe {
         libc::syscall(
             libc::SYS_close_range,
             3_u32,
             u32::MAX,
             libc::CLOSE_RANGE_CLOEXEC,
-        )
-    } < 0
-        || unsafe { libc::setgroups(0, std::ptr::null()) } != 0
-        || unsafe { libc::setresgid(account.gid, account.gid, account.gid) } != 0
-        || unsafe { libc::setresuid(account.uid, account.uid, account.uid) } != 0
-        || unsafe { libc::syscall(libc::SYS_capset, &header, empty_capabilities.as_ptr()) } != 0
-        || unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0
-        || unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0
-    {
+        ) < 0
+            || libc::setgroups(0, std::ptr::null()) != 0
+            || libc::setresgid(account.gid, account.gid, account.gid) != 0
+            || libc::setresuid(account.uid, account.uid, account.uid) != 0
+            || libc::syscall(libc::SYS_capset, &header, empty_capabilities.as_ptr()) != 0
+            || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+            || libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0
+    };
+    if failed {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -916,6 +851,16 @@ fn bundled(binary: Vec<u8>, gid: u32) -> Vec<(String, Snapshot)> {
 }
 
 fn stopped(target: &Target, host: &mut impl Host) -> io::Result<()> {
+    // Refuse an unusable recovery executable before touching the service.
+    let binary = target.capture(BINARY)?;
+    if binary
+        .as_ref()
+        .is_some_and(|binary| binary.mode & 0o111 == 0 || !binary.data.starts_with(b"\x7fELF"))
+    {
+        return Err(refuse(
+            "installed recovery binary is not an executable ELF image",
+        ));
+    }
     for unit in [UNIT, RECOVERY_UNIT] {
         if host.state(unit)?.loaded {
             host.control(&["stop", unit])?;
@@ -924,12 +869,7 @@ fn stopped(target: &Target, host: &mut impl Host) -> io::Result<()> {
             }
         }
     }
-    if let Some(binary) = target.capture(BINARY)? {
-        if binary.mode & 0o111 == 0 || !binary.data.starts_with(b"\x7fELF") {
-            return Err(refuse(
-                "installed recovery binary is not an executable ELF image",
-            ));
-        }
+    if binary.is_some() {
         host.recover(&target.path(BINARY)?)?;
     }
     target.leases_clear()
@@ -994,9 +934,11 @@ fn apply(
     };
     let _lock = target.lock()?;
     if target.capture(PENDING)?.is_some() {
-        return Err(refuse(
-            "a legacy installer transaction is pending; follow docs/guide/troubleshooting.md#legacy-installer-transaction before continuing; do not remove its journal blindly",
-        ));
+        return Err(refuse(concat!(
+            "a legacy installer transaction is pending; follow ",
+            doc_url!("guide/troubleshooting.md#legacy-installer-transaction"),
+            " before continuing; do not remove its journal blindly"
+        )));
     }
     // Executed image is already trusted by the caller. Open it once with a size
     // bound; never execute content from the destination/config as installer code.
@@ -1059,7 +1001,24 @@ fn apply(
                 .gid = account.gid;
         }
         interrupted()?;
-        stopped(target, host)?;
+        if let Err(error) = stopped(target, host) {
+            // An update that stopped the previous controller but could not
+            // finish its recovery replaces nothing: start that controller
+            // again. Its own --prepare still refuses unresolved fan ownership.
+            // Removal leaves a stopped service for the administrator.
+            let stopped_by_us = state.active
+                && host
+                    .state(UNIT)
+                    .is_ok_and(|current| !current.active && !current.transitioning);
+            if !install || !stopped_by_us {
+                return Err(error);
+            }
+            let restart = match start_service(host) {
+                Ok(()) => "previous service restarted".to_owned(),
+                Err(restart) => format!("previous service restart failed: {restart}"),
+            };
+            return Err(refuse(format!("{error}; files retained; {restart}")));
+        }
     }
     if let Some(config) = config {
         let entry = files
@@ -1146,7 +1105,11 @@ fn apply(
                 if let Err(error) = host.control(&["daemon-reload"]) {
                     errors.push(error.to_string());
                 }
-                if let Err(error) = restore_enablement(host, state) {
+                // A unit that did not exist before has just been disabled and
+                // removed above; systemctl cannot disable it a second time.
+                if state.loaded
+                    && let Err(error) = restore_enablement(host, state)
+                {
                     errors.push(format!("enablement: {error}"));
                 }
                 if state.active && errors.is_empty() {

@@ -149,10 +149,11 @@ The response `FF FF FE FF` is not a reliable capacity ID. Correct exit requires
 finishing the transaction selectors, using `0xFC`, and checking ordinary EC
 operation and routing restoration independently of the captured bytes.
 
-Read-only flash operations still change the EC's execution state: normal
-temperature-policy scheduling is paused inside this service. It is not a
-background monitoring interface or a generic safe dump
-recipe. No raw reader or firmware image is shipped with the controller.
+Read-only flash operations still change the EC's execution state: while the
+EC firmware's PMC2 flash service runs, the EC pauses its normal
+temperature-policy scheduling. That firmware service is not part of
+minibookx-ctl, not a background monitoring interface and not a generic safe
+dump recipe. No raw reader or firmware image is shipped with the controller.
 
 ## References
 

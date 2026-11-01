@@ -102,10 +102,7 @@ impl Config {
     pub fn validate_for_hardware(&self) -> Result<(), String> {
         self.validate()?;
         if self.steps.iter().any(|s| s.pwm_percent < 35) {
-            return Err(
-                "live U300 control requires at least 35% PWM; lower values are simulation only"
-                    .into(),
-            );
+            return Err("live U300 control requires at least 35% PWM".into());
         }
         if self.emergency_mc > 95_000 {
             return Err(
@@ -387,27 +384,14 @@ impl Controller {
             } else {
                 let since = *self.emergency_cool_since.get_or_insert(now);
                 if now.saturating_sub(since) >= EMERGENCY_COOL_HOLD {
+                    // Leave the override at the highest curve step. Lower
+                    // steps then need the ordinary hysteresis, cooling hold
+                    // and minimum run time; one cool sample cannot stop a fan.
                     self.emergency = false;
                     self.takeover_pwm = None;
                     self.emergency_cool_since = None;
-                    self.level = self
-                        .config
-                        .steps
-                        .iter()
-                        .take_while(|s| temp_mc >= s.at_mc)
-                        .count();
+                    self.level = self.config.steps.len();
                     self.pending_down = None;
-                    if self.level == 0 {
-                        if self.on_long_enough(now) {
-                            self.on_since = None;
-                        } else {
-                            // The emergency cooling hold has already elapsed.
-                            // Finish minimum-on at the lowest quiet setting,
-                            // without requiring another whole cooling hold.
-                            self.level = 1;
-                            self.pending_down = Some((0, since));
-                        }
-                    }
                     self.heating.fill(HeatHold::default());
                 }
             }
@@ -772,12 +756,37 @@ mod tests {
 
     #[test]
     fn emergency_cooldown_is_continuous_and_has_five_degree_hysteresis() {
-        trace("0,95,95,80\n1,89,89,80\n29,90,90,80\n30,89,89,80\n59,89,89,80\n60,89,89,40");
+        trace("0,95,95,80\n1,89,89,80\n29,90,90,80\n30,89,89,80\n59,89,89,80\n60,89,89,70");
     }
 
     #[test]
-    fn emergency_release_respects_minimum_on_without_restarting_cooling_hold() {
-        trace("0,95,95,80\n1,40,40,80\n30,40,40,80\n31,40,40,35\n44,40,40,35\n45,40,40,0");
+    fn emergency_release_steps_down_through_the_ordinary_cooling_hold() {
+        trace(
+            "0,95,95,80\n1,40,40,80\n30,40,40,80\n31,40,40,70\n32,40,40,70\n61,40,40,70\n62,40,40,0",
+        );
+    }
+
+    #[test]
+    fn one_cool_sample_at_emergency_release_cannot_stop_a_loaded_fan() {
+        // Sampled after an emergency: the CPU stays loaded at 60-70 C, but the
+        // release sample happens to read 44 C (below Performance's 45 C band).
+        let document =
+            crate::presets::Document::parse(include_str!("../config/presets.conf")).unwrap();
+        let mut c =
+            Controller::new(document.config(crate::presets::Preset::Performance).clone()).unwrap();
+        for second in 0..50 {
+            at(&mut c, second, 60);
+        }
+        assert_eq!(at(&mut c, 50, 96).pwm_percent, 80);
+        for second in 51..81 {
+            assert_eq!(at(&mut c, second, 70).pwm_percent, 80);
+        }
+        for (second, temp) in [(81, 44), (82, 60), (83, 65), (90, 62), (120, 60)] {
+            assert!(
+                at(&mut c, second, temp).pwm_percent >= 35,
+                "stopped at {second}s"
+            );
+        }
     }
 
     #[test]
@@ -901,7 +910,7 @@ mod tests {
         assert_eq!(at(&mut c, 2, 94).pwm_percent, 80);
         assert_eq!(at(&mut c, 3, 89).pwm_percent, 80);
         assert_eq!(at(&mut c, 32, 89).pwm_percent, 80);
-        assert_eq!(at(&mut c, 33, 89).pwm_percent, 40);
+        assert_eq!(at(&mut c, 33, 89).pwm_percent, 70);
     }
 
     #[test]
@@ -938,7 +947,9 @@ mod tests {
         assert_eq!(at(&mut c, 0, 95).pwm_percent, 80);
         assert_eq!(at(&mut c, 1, 40).pwm_percent, 80);
         c.observe_emergency(Duration::from_secs(20));
-        assert_eq!(at(&mut c, 31, 40).pwm_percent, 35);
-        assert_eq!(at(&mut c, 45, 40).pwm_percent, 0);
+        // Released at 31 s (the latch was not restarted at 20 s).
+        assert_eq!(at(&mut c, 31, 40).pwm_percent, 70);
+        assert_eq!(at(&mut c, 45, 40).pwm_percent, 70);
+        assert_eq!(at(&mut c, 75, 40).pwm_percent, 0);
     }
 }

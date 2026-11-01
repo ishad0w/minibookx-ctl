@@ -47,7 +47,8 @@ after relevant changes. Container and VM tests have
 
 | Feature | Supported behavior and limits |
 |---|---|
-| Fan control | Idle, sustained moderate load at 35–40% PWM, warm restart, tachometer feedback and return to firmware checked; higher-temperature stages and hot resume remain unqualified |
+| Fan control | Idle; about 9 minutes of full CPU load at firmware power limits, holding about 71°C at 35% PWM; restart, stop and S3 resume under load; tachometer feedback and return to firmware checked. Stages above 40%, the emergency transition and longer runs at high temperature remain unqualified |
+| Service overhead | About 0.15% of one CPU core at idle; a one-minute battery comparison showed no measurable CPU package power difference |
 | Tablet input | Laptop/flat positions keep input active; tent/folded positions inhibit built-in input; stopping restores it |
 | GNOME rotation and on-screen keyboard | Folded landscape/portrait use and normal orientation after unfolding checked; see [tablet mode](../guide/tablet-mode.md) |
 | Base-sensor initialization | Wakes the supported powered-down sensor and restores its original state on stop |

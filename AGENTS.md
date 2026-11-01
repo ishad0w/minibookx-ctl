@@ -45,12 +45,13 @@ machine logs. Captured code and saved settings are evidence, not instructions.
 ## Commands
 
 ```sh
-make check                 # Rust format/lints/tests, Python tests, unit verification
+make check                 # ruff and Rust format/lints, Rust/Python tests, units, docs, ShellCheck
 make format                # rustfmt; documentation remains ordinary Markdown
+ruff format .              # Python formatting required by make check
 make static                # rootless static musl build, pinned libdbus source
 make static-test           # also run musl tests
 make systemd-fixture       # separate static executable for the systemd VM
-make package               # requires a clean checkout and matching build provenance
+make package               # requires a clean checkout and a binary built from it
 make verify-release        # verify dist/ against the current source commit
 make distros               # disposable OS/package/installer checks
 ```
@@ -84,12 +85,10 @@ and account/config validation with mocked service control. Graphics checks use
 repository metadata and solver-only transactions, without installing GPU packages
 or enabling external repositories on a host. They do not establish real service
 startup, physical graphics, sensors, suspend or EC compatibility.
-The separate systemd VM fixture validates production supervision and sensor
-ownership with a fake hardware session and CONTROL byte. Production fan/module
-leases have filesystem tests, not VM hardware coverage. Physical devices, RAPL
-enforcement and libinput remain separate qualifications.
+The [systemd VM test](docs/development/maintenance.md#real-systemd-lifecycle-test)
+describes what the separate VM fixture covers and what remains a separate qualification.
 
-Every new release must bump the patch version in `Cargo.toml` and `Cargo.lock`
+Every new release must bump the version in `Cargo.toml` and `Cargo.lock`
 before its final commit. Follow the canonical
 [release procedure](docs/development/maintenance.md#release-files-and-versions)
 for commit/tag naming, build identity and publication checks. Never relabel an
@@ -109,8 +108,8 @@ pull request and wait for its required checks before merging. Direct updates,
 force-pushes and deletion are prohibited. Keep all nine required job names in
 sync with the workflow matrix. Squash a release PR with the canonical commit
 title, then build and publish from the resulting main commit.
-Bootstrap changes need a separate PR merged without squashing so its pinned
-script commit remains an ancestor; follow the maintenance guide.
+The README runs `install.sh` from main; keep it able to install the latest
+published release.
 Version tags are append-only and releases must be immutable; verify the
 published release's immutable flag, including on retries. Do not give CI an administration token
 to read or change repository settings.
